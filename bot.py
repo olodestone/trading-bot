@@ -10,6 +10,9 @@ from performance import save_trade, check_trade_results, daily_report
 # ==============================
 # TELEGRAM
 # ==============================
+
+send_telegram("✅ Bot started successfully")
+
 import os
 
 TOKEN = os.getenv("TOKEN")
@@ -24,19 +27,18 @@ def send_telegram(msg):
         return
 
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+
     try:
-        requests.post(url, data={
+        response = requests.post(url, data={
             "chat_id": CHAT_ID,
             "text": msg
         })
+
+        if response.status_code != 200:
+            print("❌ Telegram failed:", response.text)
+
     except Exception as e:
         print("Telegram error:", e)
-
-    if not TOKEN or not CHAT_ID:
-     print("❌ Missing Telegram credentials")
-    return
-
-    send_telegram("✅ Bot is connected")
 
 # ==============================
 # EXCHANGES
