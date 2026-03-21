@@ -1,66 +1,42 @@
-import ccxt
-import pandas as pd
 import time
-import requests
+from strategy import get_signals
+from logger import log_trade
+from performance import update_performance
 import os
+import requests
 
-# ====== CONFIG ======
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# ====== TELEGRAM FUNCTION ======
-def send_telegram(message):
+def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {
-        "chat_id": CHAT_ID,
-        "text": message
-    }
-    requests.post(url, data=data)
+    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
 
-# ====== SIMPLE MARKET SCAN ======
-def scan_market():
-    exchange = ccxt.binance()
-    symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
-
-    signals = []
-
-    for symbol in symbols:
-        try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=50)
-            df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
-
-            last_close = df['close'].iloc[-1]
-            prev_close = df['close'].iloc[-2]
-
-            if last_close > prev_close:
-                signals.append(f"📈 BUY: {symbol}")
-            else:
-                signals.append(f"📉 SELL: {symbol}")
-
-        except Exception as e:
-            print(f"Error on {symbol}: {e}")
-
-    return signals
-
-# ====== MAIN LOOP ======
-def run_bot():
-    print("🚀 Bot is running...")
+def run():
+    print("🚀 Elite Bot Running...")
 
     while True:
-        try:
-            signals = scan_market()
+        signals = get_signals()
 
-            if signals:
-                message = "🔥 Trading Signals:\n\n" + "\n".join(signals)
-                print(message)
-                send_telegram(message)
+        if signals:
+            for s in signals:
+                msg = f"""
+🔥 ELITE TRADE
 
-            time.sleep(900)  # 15 minutes
+Pair: {s['pair']}
+Signal: {s['signal']}
+Entry: {s['entry']}
+SL: {s['sl']}
+TP: {s['tp']}
+RR: 1:{s['rr']}
+"""
+                print(msg)
+                send_telegram(msg)
+                log_trade(s)
 
-        except Exception as e:
-            print("Error:", e)
-            time.sleep(60)
+        update_performance()
 
-# ====== START ======
+        time.sleep(900)
+
 if __name__ == "__main__":
-    run_bot()
+    run()
