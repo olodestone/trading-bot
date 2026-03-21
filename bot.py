@@ -36,6 +36,8 @@ def send_telegram(msg):
      print("❌ Missing Telegram credentials")
     return
 
+    send_telegram("✅ Bot is connected")
+
 # ==============================
 # EXCHANGES
 # ==============================
