@@ -63,9 +63,9 @@ def generate_signal(df):
     bullish = last['close'] > last['ema50'] and last['rsi'] > 55
     bearish = last['close'] < last['ema50'] and last['rsi'] < 45
 
-    # ==========================
+    # ========================
     # BUY SETUP
-    # ==========================
+    # ========================
     if bullish:
         sl = swing_low          # 🔥 structure-based SL
         tp = swing_high         # 🔥 natural resistance
