@@ -16,6 +16,8 @@ TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 
+
+
 def send_telegram(msg):
     if not TOKEN or not CHAT_ID:
         print("❌ Missing Telegram credentials")
@@ -29,6 +31,10 @@ def send_telegram(msg):
         })
     except Exception as e:
         print("Telegram error:", e)
+
+    if not TOKEN or not CHAT_ID:
+     print("❌ Missing Telegram credentials")
+    return
 
 # ==============================
 # EXCHANGES
@@ -188,3 +194,5 @@ while True:
         last_report_day = today
 
     time.sleep(900)
+
+
