@@ -61,16 +61,28 @@ def get_price(symbol):
 # PAIR SCANNER
 # ==============================
 def get_pairs():
-    pairs = set()
+    pairs = []
+
     for ex in exchanges.values():
         try:
             markets = ex.load_markets()
-            for s in markets:
-                if "/USDT" in s:
-                    pairs.add(s)
+
+            for symbol, data in markets.items():
+                if "/USDT" in symbol:
+                    try:
+                        ticker = ex.fetch_ticker(symbol)
+
+                        # 🔥 Only high volume coins
+                        if ticker['quoteVolume'] and ticker['quoteVolume'] > 5_000_000:
+                            pairs.append(symbol)
+
+                    except:
+                        continue
+
         except:
             continue
-    return list(pairs)[:25]
+
+    return list(set(pairs))[:25]
 
 # ==============================
 # MAIN BOT
@@ -108,8 +120,7 @@ def run_bot():
 
         df_entry = apply_indicators(df_entry)
 
-        if not strong_momentum(df_entry):
-            continue
+        
 
         result = generate_signal(df_entry)
         if not result:

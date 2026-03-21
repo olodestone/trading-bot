@@ -54,21 +54,32 @@ def get_structure_levels(df):
 # ==============================
 # SIGNAL (DYNAMIC RR 🔥)
 # ==============================
+def high_volume(df):
+    volume_ma = df['volume'].rolling(20).mean()
+    last = df.iloc[-1]
+
+    return last['volume'] > (1.5 * volume_ma.iloc[-1])
+
+
 def generate_signal(df):
     last = df.iloc[-1]
-    entry = last['close']
+    prev = df.iloc[-2]
 
+    entry = last['close']
     swing_high, swing_low = get_structure_levels(df)
 
-    bullish = last['close'] > last['ema50'] and last['rsi'] > 55
-    bearish = last['close'] < last['ema50'] and last['rsi'] < 45
+    bullish = last['close'] > last['ema50'] > last['ema200'] and last['rsi'] > 55
+    bearish = last['close'] < last['ema50'] < last['ema200'] and last['rsi'] < 45
+
+    momentum = strong_momentum(df)
+    volume_ok = high_volume(df)
 
     # =======================
-    # BUY SETUP
+    # BUY
     # =======================
-    if bullish:
-        sl = swing_low          # 🔥 structure-based SL
-        tp = swing_high         # 🔥 natural resistance
+    if bullish and momentum and volume_ok:
+        sl = swing_low
+        tp = swing_high
 
         risk = entry - sl
         reward = tp - entry
@@ -76,13 +87,13 @@ def generate_signal(df):
         if risk <= 0 or reward <= 0:
             return None
 
-        rr = reward / risk
+        rr = round(reward / risk, 2)
         signal = "BUY"
 
-    # ==========================
-    # SELL SETUP
-    # ==========================
-    elif bearish:
+    # =======================
+    # SELL
+    # =======================
+    elif bearish and momentum and volume_ok:
         sl = swing_high
         tp = swing_low
 
@@ -92,16 +103,11 @@ def generate_signal(df):
         if risk <= 0 or reward <= 0:
             return None
 
-        rr = reward / risk
+        rr = round(reward / risk, 2)
         signal = "SELL"
 
     else:
         return None
 
-    rr = round(rr, 2)
-
-    # 🔥 ONLY TAKE HIGH-QUALITY TRADES
-    if rr < 3:
-        return None
-
+    # ✅ NO MORE RR FILTER
     return signal, entry, sl, tp, rr
