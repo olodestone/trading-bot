@@ -15,6 +15,9 @@ import os
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
+print("DEBUG TOKEN:", os.getenv("TOKEN"))
+print("DEBUG CHAT_ID:", os.getenv("CHAT_ID"))
+
 def send_telegram(msg):
     if not TOKEN or not CHAT_ID:
         print("❌ Missing Telegram credentials")
@@ -133,8 +136,10 @@ def run_bot():
 
     signals = sorted(signals, key=lambda x: x['rr'], reverse=True)[:5]
 
-    for s in signals:
-        msg = f"""
+for s in signals:
+    msg = f"""
+==============================
+
 🚀 ELITE SIGNAL
 
 Pair: {s['pair']}
@@ -146,11 +151,15 @@ SL: {round(s['sl'],4)}
 TP: {round(s['tp'],4)}
 
 RR: {s['rr']}
-"""
-        print(msg)
-        send_telegram(msg)
 
-        save_trade(s['pair'], s['signal'], s['entry'], s['sl'], s['tp'], s['rr'])
+==============================
+"""
+    print(msg)
+    send_telegram(msg)
+
+    save_trade(s['pair'], s['signal'], s['entry'], s['sl'], s['tp'], s['rr'])
+
+    time.sleep(0.5)
 
 # ==============================
 # LOOP
