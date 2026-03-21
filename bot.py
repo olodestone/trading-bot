@@ -11,8 +11,6 @@ from performance import save_trade, check_trade_results, daily_report
 # TELEGRAM
 # ==============================
 
-send_telegram("✅ Bot started successfully")
-
 import os
 
 TOKEN = os.getenv("TOKEN")
@@ -39,7 +37,7 @@ def send_telegram(msg):
 
     except Exception as e:
         print("Telegram error:", e)
-
+send_telegram("✅ Bot started successfully")
 # ==============================
 # EXCHANGES
 # ==============================
