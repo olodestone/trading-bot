@@ -1,12 +1,86 @@
-from strategy import generate_signal, strong_momentum, apply_indicators, get_trend
+import ccxt
+import pandas as pd
+import time
+import requests
+from datetime import datetime
+
+from strategy import apply_indicators, get_trend, strong_momentum, generate_signal
 from performance import save_trade, check_trade_results, daily_report
 
+# ==============================
+# TELEGRAM
+# ==============================
+import os
+
+TOKEN = os.getenv("TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+
+def send_telegram(msg):
+    if not TOKEN or not CHAT_ID:
+        print("❌ Missing Telegram credentials")
+        return
+
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    try:
+        requests.post(url, data={
+            "chat_id": CHAT_ID,
+            "text": msg
+        })
+    except Exception as e:
+        print("Telegram error:", e)
+
+# ==============================
+# EXCHANGES
+# ==============================
+exchanges = {
+    "kucoin": ccxt.kucoin({"enableRateLimit": True}),
+    "mexc": ccxt.mexc({"enableRateLimit": True})
+}
+
+# ==============================
+# FETCH DATA
+# ==============================
+def fetch_tf(symbol, tf):
+    for name, ex in exchanges.items():
+        try:
+            data = ex.fetch_ohlcv(symbol, tf, limit=100)
+            df = pd.DataFrame(data, columns=['time','open','high','low','close','volume'])
+            return df, name
+        except:
+            continue
+    return None, None
+
+def get_price(symbol):
+    df, _ = fetch_tf(symbol, "15m")
+    if df is None:
+        return None
+    return df.iloc[-1]['close']
+
+# ==============================
+# PAIR SCANNER
+# ==============================
+def get_pairs():
+    pairs = set()
+    for ex in exchanges.values():
+        try:
+            markets = ex.load_markets()
+            for s in markets:
+                if "/USDT" in s:
+                    pairs.add(s)
+        except:
+            continue
+    return list(pairs)[:25]
+
+# ==============================
+# MAIN BOT
+# ==============================
 def run_bot():
-    pairs = get_top_pairs()
+    print(f"\n🚀 Scan: {datetime.now()}\n")
+
+    pairs = get_pairs()
     signals = []
 
     for symbol in pairs:
-
         trends = []
 
         for tf in ["15m","1h","4h","1d"]:
@@ -20,7 +94,6 @@ def run_bot():
         if len(trends) < 4:
             continue
 
-        # 🔥 alignment
         if trends.count("bullish") >= 3:
             direction = "bullish"
         elif trends.count("bearish") >= 3:
@@ -28,7 +101,6 @@ def run_bot():
         else:
             continue
 
-        # entry tf
         df_entry, source = fetch_tf(symbol, "15m")
         if df_entry is None:
             continue
@@ -44,7 +116,6 @@ def run_bot():
 
         signal, entry, sl, tp, rr = result
 
-        # match direction
         if direction == "bullish" and signal != "BUY":
             continue
         if direction == "bearish" and signal != "SELL":
@@ -60,8 +131,10 @@ def run_bot():
             "rr": rr
         })
 
-        for s in signals:
-    msg = f"""
+    signals = sorted(signals, key=lambda x: x['rr'], reverse=True)[:5]
+
+    for s in signals:
+        msg = f"""
 🚀 ELITE SIGNAL
 
 Pair: {s['pair']}
@@ -74,29 +147,24 @@ TP: {round(s['tp'],4)}
 
 RR: {s['rr']}
 """
-    send_telegram(msg)
+        print(msg)
+        send_telegram(msg)
 
-    save_trade(
-        s['pair'],
-        s['signal'],
-        s['entry'],
-        s['sl'],
-        s['tp'],
-        s['rr']
-    )
+        save_trade(s['pair'], s['signal'], s['entry'], s['sl'], s['tp'], s['rr'])
 
-    last_report_day = None
+# ==============================
+# LOOP
+# ==============================
+last_report_day = None
 
 while True:
     run_bot()
 
-    # 🔥 track TP/SL
-    check_trade_results()
+    check_trade_results(get_price, send_telegram)
 
-    # 📊 daily report
     today = datetime.now().date()
     if last_report_day != today:
-        daily_report()
+        daily_report(send_telegram)
         last_report_day = today
 
     time.sleep(900)
