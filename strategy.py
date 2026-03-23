@@ -54,6 +54,35 @@ def high_volume(df):
 
 
 # ==============================
+# REVERSAL DETECTION (NEW 🔥)
+# ==============================
+def reversal_signal(df):
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    # RSI extremes (1H/15m will use this)
+    overbought = last['rsi'] > 70
+    oversold = last['rsi'] < 30
+
+    # Structure break (simple but effective)
+    bearish_break = last['close'] < prev['low']
+    bullish_break = last['close'] > prev['high']
+
+    # Volume spike
+    volume_ma = df['volume'].rolling(20).mean()
+    high_vol = last['volume'] > (1.5 * volume_ma.iloc[-1])
+
+    # SELL reversal
+    if overbought and bearish_break and high_vol:
+        return "SELL"
+
+    # BUY reversal
+    if oversold and bullish_break and high_vol:
+        return "BUY"
+
+    return None
+
+# ==============================
 # MARKET STRUCTURE
 # ==============================
 def get_structure_levels(df):
@@ -69,6 +98,40 @@ def get_structure_levels(df):
 # SIGNAL GENERATION (FINAL 🔥)
 # ==============================
 def generate_signal(df):
+
+    # =======================
+    # REVERSAL CHECK (FIRST)
+    # =======================
+    rev = reversal_signal(df)
+
+    if rev:
+        swing_high, swing_low = get_structure_levels(df)
+
+        entry = df.iloc[-1]['close']
+
+        if rev == "BUY":
+            sl = swing_low
+            tp = swing_high
+            risk = entry - sl
+            reward = tp - entry
+
+        else:  # SELL
+            sl = swing_high
+            tp = swing_low
+            risk = sl - entry
+            reward = entry - tp
+
+        if risk <= 0 or reward <= 0:
+            return None
+
+        rr = round(reward / risk, 2)
+
+        if rr < 1:
+            return None
+
+        # 🔥 Label it differently
+        return f"{rev}_REVERSAL", entry, sl, tp, rr
+
     last = df.iloc[-1]
 
     swing_high, swing_low = get_structure_levels(df)
