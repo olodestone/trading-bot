@@ -110,8 +110,9 @@ def run_bot():
         df_4h, _ = fetch_tf(symbol, "4h")
         df_1d, _ = fetch_tf(symbol, "1d")
 
-        if None in [df_15m, df_1h, df_4h, df_1d]:
-            continue
+        if any(x is None or x.empty for x in [df_15m, df_1h, df_4h, df_1d]):
+         print(f"⚠️ Skipping {symbol} (bad data)")
+        continue
 
         # Apply indicators
         df_15m = apply_indicators(df_15m)
