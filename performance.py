@@ -6,7 +6,16 @@ from datetime import datetime
 CSV_FILE = "performance.csv"
 
 # ==============================
-# INIT FILE
+# ENSURE FILE EXISTS (ADDED)
+# ==============================
+def ensure_csv():
+    if not os.path.exists(CSV_FILE):
+        with open(CSV_FILE, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["time","pair","signal","entry","sl","tp","rr","status"])
+
+# ==============================
+# INIT FILE (UNCHANGED)
 # ==============================
 if not os.path.exists(CSV_FILE):
     with open(CSV_FILE, "w", newline="") as f:
@@ -14,9 +23,11 @@ if not os.path.exists(CSV_FILE):
         writer.writerow(["time","pair","signal","entry","sl","tp","rr","status"])
 
 # ==============================
-# SAVE TRADE
+# SAVE TRADE (FIXED)
 # ==============================
 def save_trade(pair, signal, entry, sl, tp, rr):
+    ensure_csv()  # ✅ ADDED LINE (guarantees file exists)
+
     with open(CSV_FILE, "a", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -24,7 +35,7 @@ def save_trade(pair, signal, entry, sl, tp, rr):
         ])
 
 # ==============================
-# TP/SL CHECK
+# TP/SL CHECK (UNCHANGED)
 # ==============================
 def check_trade_results(fetch_price_func, send_telegram):
     df = pd.read_csv(CSV_FILE)
@@ -64,7 +75,7 @@ def check_trade_results(fetch_price_func, send_telegram):
         df.to_csv(CSV_FILE, index=False)
 
 # ==============================
-# DAILY REPORT (FIXED)
+# DAILY REPORT (UNCHANGED)
 # ==============================
 def daily_report(send_telegram):
     df = pd.read_csv(CSV_FILE)
