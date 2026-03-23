@@ -21,6 +21,9 @@ def apply_indicators(df):
 # TREND
 # ==============================
 def get_trend(df):
+    if len(df) < 2:
+        return "neutral"
+
     last = df.iloc[-1]
 
     if last['close'] > last['ema50'] > last['ema200'] and last['rsi'] > 55:
@@ -34,6 +37,9 @@ def get_trend(df):
 # MOMENTUM
 # ==============================
 def strong_momentum(df):
+    if len(df) < 2:
+        return False
+
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
@@ -44,78 +50,98 @@ def strong_momentum(df):
 
 
 # ==============================
-# VOLUME FILTER (IMPORTANT 🔥)
+# VOLUME FILTER
 # ==============================
 def high_volume(df):
     volume_ma = df['volume'].rolling(20).mean()
-    last = df.iloc[-1]
 
-    return last['volume'] > (1.3 * volume_ma.iloc[-1])  # slightly relaxed
+    if len(df) < 20 or pd.isna(volume_ma.iloc[-1]) or volume_ma.iloc[-1] == 0:
+        return False
+
+    last = df.iloc[-1]
+    return last['volume'] > (1.3 * volume_ma.iloc[-1])
 
 
 # ==============================
-# REVERSAL DETECTION (NEW 🔥)
+# REVERSAL DETECTION
 # ==============================
 def reversal_signal(df):
+    if len(df) < 20:
+        return None
+
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # RSI extremes (1H/15m will use this)
-    overbought = last['rsi'] > 70
-    oversold = last['rsi'] < 30
+    # Stronger RSI thresholds
+    overbought = last['rsi'] > 72
+    oversold = last['rsi'] < 28
 
-    # Structure break (simple but effective)
+    # Structure break
     bearish_break = last['close'] < prev['low']
     bullish_break = last['close'] > prev['high']
 
     # Volume spike
     volume_ma = df['volume'].rolling(20).mean()
+    if pd.isna(volume_ma.iloc[-1]) or volume_ma.iloc[-1] == 0:
+        return None
+
     high_vol = last['volume'] > (1.5 * volume_ma.iloc[-1])
 
-    # SELL reversal
     if overbought and bearish_break and high_vol:
         return "SELL"
 
-    # BUY reversal
     if oversold and bullish_break and high_vol:
         return "BUY"
 
     return None
 
+
 # ==============================
 # MARKET STRUCTURE
 # ==============================
 def get_structure_levels(df):
+    if len(df) < 20:
+        return None, None
+
     recent = df.tail(20)
-
-    swing_high = recent['high'].max()
-    swing_low = recent['low'].min()
-
-    return swing_high, swing_low
+    return recent['high'].max(), recent['low'].min()
 
 
 # ==============================
-# SIGNAL GENERATION (FINAL 🔥)
+# SIGNAL GENERATION
 # ==============================
 def generate_signal(df):
 
+    if len(df) < 50:
+        return None
+
+    last = df.iloc[-1]
+    swing_high, swing_low = get_structure_levels(df)
+
+    if swing_high is None or swing_low is None:
+        return None
+
     # =======================
-    # REVERSAL CHECK (FIRST)
+    # RANGE FILTER (avoid low RR zones)
+    # =======================
+    range_size = (swing_high - swing_low) / last['close']
+    if range_size < 0.01:
+        return None
+
+    # =======================
+    # REVERSAL FIRST
     # =======================
     rev = reversal_signal(df)
 
     if rev:
-        swing_high, swing_low = get_structure_levels(df)
-
-        entry = df.iloc[-1]['close']
+        entry = last['close']
 
         if rev == "BUY":
             sl = swing_low
             tp = swing_high
             risk = entry - sl
             reward = tp - entry
-
-        else:  # SELL
+        else:
             sl = swing_high
             tp = swing_low
             risk = sl - entry
@@ -129,13 +155,11 @@ def generate_signal(df):
         if rr < 1:
             return None
 
-        # 🔥 Label it differently
         return f"{rev}_REVERSAL", entry, sl, tp, rr
 
-    last = df.iloc[-1]
-
-    swing_high, swing_low = get_structure_levels(df)
-
+    # =======================
+    # TREND LOGIC (UNCHANGED CORE)
+    # =======================
     bullish = last['close'] > last['ema50'] > last['ema200'] and last['rsi'] > 55
     bearish = last['close'] < last['ema50'] < last['ema200'] and last['rsi'] < 45
 
@@ -143,16 +167,12 @@ def generate_signal(df):
     volume_ok = high_volume(df)
 
     # =======================
-    # BUY SETUP
+    # BUY
     # =======================
     if bullish and momentum and volume_ok:
 
-        # 🔥 Better entry (pullback style)
         entry = (last['close'] + last['ema50']) / 2
-
         sl = swing_low
-
-        # 🔥 Slight TP extension
         tp = swing_high * 1.005
 
         risk = entry - sl
@@ -163,23 +183,18 @@ def generate_signal(df):
 
         rr = round(reward / risk, 2)
 
-        # 🔥 Avoid useless trades
         if rr < 1:
             return None
 
-        signal = "BUY"
+        return "BUY", entry, sl, tp, rr
 
     # =======================
-    # SELL SETUP
+    # SELL
     # =======================
     elif bearish and momentum and volume_ok:
 
-        # 🔥 Better entry (pullback style)
         entry = (last['close'] + last['ema50']) / 2
-
         sl = swing_high
-
-        # 🔥 Slight TP extension
         tp = swing_low * 0.995
 
         risk = sl - entry
@@ -190,13 +205,9 @@ def generate_signal(df):
 
         rr = round(reward / risk, 2)
 
-        # 🔥 Avoid useless trades
         if rr < 1:
             return None
 
-        signal = "SELL"
+        return "SELL", entry, sl, tp, rr
 
-    else:
-        return None
-
-    return signal, entry, sl, tp, rr
+    return None
