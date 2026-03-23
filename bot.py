@@ -45,7 +45,7 @@ spot_exchange = ccxt.kucoin({"enableRateLimit": True})
 futures_exchange = ccxt.mexc({"enableRateLimit": True})
 
 # ==============================
-# FETCH DATA (UPDATED)
+# FETCH DATA
 # ==============================
 def fetch_tf(symbol, tf, market_type):
     try:
@@ -67,7 +67,7 @@ def get_price(symbol, market_type):
     return df.iloc[-1]['close']
 
 # ==============================
-# PAIR SCANNER (SEPARATED)
+# PAIR SCANNER
 # ==============================
 def get_pairs():
     pairs = []
@@ -150,7 +150,8 @@ def run_bot():
             "entry": entry,
             "sl": sl,
             "tp": tp,
-            "rr": rr
+            "rr": rr,
+            "market_type": market_type   # ✅ added for correct price tracking
         })
 
     # Sort best trades
@@ -189,7 +190,11 @@ last_report_day = None
 while True:
     run_bot()
 
-    check_trade_results(lambda s: get_price(s[0], "spot"), send_telegram)
+    # ✅ FIXED: now uses correct market type (spot/futures)
+    check_trade_results(
+        lambda s: get_price(s[0], s[1]),
+        send_telegram
+    )
 
     today = datetime.now().date()
     if last_report_day != today:

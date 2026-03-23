@@ -16,7 +16,7 @@ def apply_indicators(df):
     return df
 
 # ==============================
-# HELPER FILTERS (FIXED)
+# HELPER FILTERS
 # ==============================
 def is_spike(df):
     if len(df) < 20:
@@ -165,6 +165,8 @@ def generate_signal(df):
         return None
 
     last = df.iloc[-1]
+    prev = df.iloc[-2]
+
     swing_high, swing_low = get_structure_levels(df)
 
     if swing_high is None or swing_low is None:
@@ -176,7 +178,15 @@ def generate_signal(df):
 
     rev = reversal_signal(df)
 
+    # ==============================
+    # REVERSAL ENTRY FIX (confirmation)
+    # ==============================
     if rev:
+        if rev == "BUY" and last['close'] <= prev['high']:
+            return None
+        if rev == "SELL" and last['close'] >= prev['low']:
+            return None
+
         entry = last['close']
 
         if rev == "BUY":
@@ -190,7 +200,7 @@ def generate_signal(df):
             risk = sl - entry
             reward = entry - tp
 
-        if risk <= 0 or reward <= 0:
+        if risk <= 0 or reward <= 0 or abs(entry - sl) / entry < 0.002:
             return None
 
         rr = round(reward / risk, 2)
@@ -206,16 +216,22 @@ def generate_signal(df):
     momentum = strong_momentum(df)
     volume_ok = high_volume(df)
 
+    # ==============================
+    # TREND ENTRY FIX (pullback + confirmation)
+    # ==============================
     if bullish and momentum and volume_ok:
 
-        entry = (last['close'] + last['ema50']) / 2
+        if last['close'] <= prev['high']:
+            return None
+
+        entry = last['ema50']   # ✅ pullback entry
         sl = swing_low
         tp = swing_high * 1.005
 
         risk = entry - sl
         reward = tp - entry
 
-        if risk <= 0 or reward <= 0:
+        if risk <= 0 or reward <= 0 or abs(entry - sl) / entry < 0.002:
             return None
 
         rr = round(reward / risk, 2)
@@ -227,14 +243,17 @@ def generate_signal(df):
 
     elif bearish and momentum and volume_ok:
 
-        entry = (last['close'] + last['ema50']) / 2
+        if last['close'] >= prev['low']:
+            return None
+
+        entry = last['ema50']   # ✅ pullback entry
         sl = swing_high
         tp = swing_low * 0.995
 
         risk = sl - entry
         reward = entry - tp
 
-        if risk <= 0 or reward <= 0:
+        if risk <= 0 or reward <= 0 or abs(entry - sl) / entry < 0.002:
             return None
 
         rr = round(reward / risk, 2)
@@ -256,7 +275,6 @@ def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d):
     if signal is None:
         return None
 
-    # Smart filters
     if is_spike(df_15m):
         return None
 
