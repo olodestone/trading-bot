@@ -54,7 +54,8 @@ def fetch_tf(symbol, tf):
             data = ex.fetch_ohlcv(symbol, tf, limit=100)
             df = pd.DataFrame(data, columns=['time','open','high','low','close','volume'])
             return df, name
-        except:
+        except Exception as e:
+            print(f"{name} failed for {symbol}: {e}")
             continue
     return None, None
 
@@ -110,9 +111,10 @@ def run_bot():
         df_4h, _ = fetch_tf(symbol, "4h")
         df_1d, _ = fetch_tf(symbol, "1d")
 
+        # ✅ FIXED DATA CHECK
         if any(x is None or x.empty for x in [df_15m, df_1h, df_4h, df_1d]):
-         print(f"⚠️ Skipping {symbol} (bad data)")
-        continue
+            print(f"⚠️ Skipping {symbol} (bad data)")
+            continue
 
         # Apply indicators
         df_15m = apply_indicators(df_15m)
@@ -129,6 +131,10 @@ def run_bot():
             continue
 
         signal, entry, sl, tp, rr = result
+
+        # Extra safety
+        if entry == sl or entry == tp:
+            continue
 
         signals.append({
             "pair": symbol,
