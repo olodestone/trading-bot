@@ -4,20 +4,17 @@ import time
 import requests
 from datetime import datetime
 
-from strategy import apply_indicators, get_trend, strong_momentum, generate_signal
+# ✅ UPDATED IMPORT
+from strategy import apply_indicators, generate_filtered_signal
 from performance import save_trade, check_trade_results, daily_report
 
 # ==============================
 # TELEGRAM
 # ==============================
-
 import os
 
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-
-
-
 
 def send_telegram(msg):
     if not TOKEN or not CHAT_ID:
@@ -37,7 +34,9 @@ def send_telegram(msg):
 
     except Exception as e:
         print("Telegram error:", e)
+
 send_telegram("✅ Bot started successfully")
+
 # ==============================
 # EXCHANGES
 # ==============================
@@ -102,44 +101,33 @@ def run_bot():
     signals = []
 
     for symbol in pairs:
-        trends = []
 
-        for tf in ["15m","1h","4h","1d"]:
-            df, source = fetch_tf(symbol, tf)
-            if df is None:
-                break
+        # ==============================
+        # FETCH ALL TIMEFRAMES
+        # ==============================
+        df_15m, source = fetch_tf(symbol, "15m")
+        df_1h, _ = fetch_tf(symbol, "1h")
+        df_4h, _ = fetch_tf(symbol, "4h")
+        df_1d, _ = fetch_tf(symbol, "1d")
 
-            df = apply_indicators(df)
-            trends.append(get_trend(df))
-
-        if len(trends) < 4:
+        if None in [df_15m, df_1h, df_4h, df_1d]:
             continue
 
-        if trends.count("bullish") >= 3:
-            direction = "bullish"
-        elif trends.count("bearish") >= 3:
-            direction = "bearish"
-        else:
-            continue
+        # Apply indicators
+        df_15m = apply_indicators(df_15m)
+        df_1h = apply_indicators(df_1h)
+        df_4h = apply_indicators(df_4h)
+        df_1d = apply_indicators(df_1d)
 
-        df_entry, source = fetch_tf(symbol, "15m")
-        if df_entry is None:
-            continue
+        # ==============================
+        # NEW HTF FILTERED SIGNAL
+        # ==============================
+        result = generate_filtered_signal(df_15m, df_1h, df_4h, df_1d)
 
-        df_entry = apply_indicators(df_entry)
-
-        
-
-        result = generate_signal(df_entry)
         if not result:
             continue
 
         signal, entry, sl, tp, rr = result
-
-        if direction == "bullish" and signal != "BUY":
-            continue
-        if direction == "bearish" and signal != "SELL":
-            continue
 
         signals.append({
             "pair": symbol,
@@ -151,10 +139,11 @@ def run_bot():
             "rr": rr
         })
 
-    # 🔥 SORT + LIMIT
+    # ==============================
+    # SORT + LIMIT
+    # ==============================
     signals = sorted(signals, key=lambda x: x['rr'], reverse=True)[:5]
 
-    # 🔥 THIS MUST BE INSIDE THE FUNCTION
     for s in signals:
         msg = f"""
 ==============================
@@ -196,5 +185,3 @@ while True:
         last_report_day = today
 
     time.sleep(900)
-
-
