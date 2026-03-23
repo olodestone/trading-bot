@@ -15,6 +15,46 @@ def apply_indicators(df):
 
     return df
 
+# ==============================
+# HELPER FILTERS (FIXED)
+# ==============================
+def is_spike(df):
+    if len(df) < 20:
+        return False
+
+    last = df.iloc[-1]
+    candle_size = abs(last['close'] - last['open'])
+    avg_size = (df['high'] - df['low']).rolling(20).mean().iloc[-1]
+    volume_ma = df['volume'].rolling(20).mean().iloc[-1]
+
+    if avg_size == 0 or volume_ma == 0:
+        return False
+
+    return candle_size > (2 * avg_size) and last['volume'] > (2 * volume_ma)
+
+
+def is_overextended(df):
+    if len(df) < 50:
+        return False
+
+    last = df.iloc[-1]
+    distance = abs(last['close'] - last['ema50']) / last['close']
+
+    return distance > 0.015
+
+
+def recent_spike(df):
+    if len(df) < 5:
+        return False
+
+    recent = df.tail(3)
+
+    for i in range(len(recent)):
+        sub_df = df.iloc[:-(len(recent)-i)]
+        if is_spike(sub_df):
+            return True
+
+    return False
 
 # ==============================
 # TREND
@@ -31,9 +71,8 @@ def get_trend(df):
         return "bearish"
     return "neutral"
 
-
 # ==============================
-# MULTI TIMEFRAME TREND ✅ FIXED POSITION
+# MULTI TIMEFRAME TREND
 # ==============================
 def get_htf_trend(df_1h, df_4h, df_1d):
 
@@ -50,7 +89,6 @@ def get_htf_trend(df_1h, df_4h, df_1d):
     else:
         return None
 
-
 # ==============================
 # MOMENTUM
 # ==============================
@@ -66,7 +104,6 @@ def strong_momentum(df):
         (last['close'] < prev['close'] and last['volume'] > prev['volume'])
     )
 
-
 # ==============================
 # VOLUME FILTER
 # ==============================
@@ -79,9 +116,8 @@ def high_volume(df):
     last = df.iloc[-1]
     return last['volume'] > (1.3 * volume_ma.iloc[-1])
 
-
 # ==============================
-# REVERSAL DETECTION
+# REVERSAL
 # ==============================
 def reversal_signal(df):
     if len(df) < 20:
@@ -110,9 +146,8 @@ def reversal_signal(df):
 
     return None
 
-
 # ==============================
-# MARKET STRUCTURE
+# STRUCTURE
 # ==============================
 def get_structure_levels(df):
     if len(df) < 20:
@@ -121,9 +156,8 @@ def get_structure_levels(df):
     recent = df.tail(20)
     return recent['high'].max(), recent['low'].min()
 
-
 # ==============================
-# SIGNAL GENERATION (UNCHANGED)
+# SIGNAL
 # ==============================
 def generate_signal(df):
 
@@ -161,7 +195,7 @@ def generate_signal(df):
 
         rr = round(reward / risk, 2)
 
-        if rr < 1:
+        if rr < 1.5:
             return None
 
         return f"{rev}_REVERSAL", entry, sl, tp, rr
@@ -186,7 +220,7 @@ def generate_signal(df):
 
         rr = round(reward / risk, 2)
 
-        if rr < 1:
+        if rr < 1.5:
             return None
 
         return "BUY", entry, sl, tp, rr
@@ -205,16 +239,15 @@ def generate_signal(df):
 
         rr = round(reward / risk, 2)
 
-        if rr < 1:
+        if rr < 1.5:
             return None
 
         return "SELL", entry, sl, tp, rr
 
     return None
 
-
 # ==============================
-# FINAL SIGNAL WITH HTF FILTER ✅ FIXED POSITION
+# FINAL FILTERED SIGNAL
 # ==============================
 def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d):
 
@@ -223,15 +256,23 @@ def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d):
     if signal is None:
         return None
 
+    # Smart filters
+    if is_spike(df_15m):
+        return None
+
+    if recent_spike(df_15m):
+        return None
+
+    if is_overextended(df_15m):
+        return None
+
     signal_type, entry, sl, tp, rr = signal
 
     htf_trend = get_htf_trend(df_1h, df_4h, df_1d)
 
-    # REVERSALS → always allowed
     if "REVERSAL" in signal_type:
         return signal
 
-    # TREND TRADES → must match HTF
     if htf_trend is None:
         return None
 
