@@ -16,285 +16,152 @@ def apply_indicators(df):
     return df
 
 # ==============================
-# HELPER FILTERS
+# MARKET CONDITION (NEW)
 # ==============================
-def is_spike(df):
-    if len(df) < 20:
-        return False
-
-    last = df.iloc[-1]
-    candle_size = abs(last['close'] - last['open'])
-    avg_size = (df['high'] - df['low']).rolling(20).mean().iloc[-1]
-    volume_ma = df['volume'].rolling(20).mean().iloc[-1]
-
-    if avg_size == 0 or volume_ma == 0:
-        return False
-
-    return candle_size > (2 * avg_size) and last['volume'] > (2 * volume_ma)
-
-
-def is_overextended(df):
-    if len(df) < 50:
-        return False
-
-    last = df.iloc[-1]
-    distance = abs(last['close'] - last['ema50']) / last['close']
-
-    return distance > 0.015
-
-
-def recent_spike(df):
-    if len(df) < 5:
-        return False
-
-    recent = df.tail(3)
-
-    for i in range(len(recent)):
-        sub_df = df.iloc[:-(len(recent)-i)]
-        if is_spike(sub_df):
-            return True
-
-    return False
-
-# ==============================
-# TREND
-# ==============================
-def get_trend(df):
-    if len(df) < 2:
-        return "neutral"
-
-    last = df.iloc[-1]
-
-    if last['close'] > last['ema50'] > last['ema200'] and last['rsi'] > 55:
-        return "bullish"
-    elif last['close'] < last['ema50'] < last['ema200'] and last['rsi'] < 45:
-        return "bearish"
-    return "neutral"
-
-# ==============================
-# MULTI TIMEFRAME TREND
-# ==============================
-def get_htf_trend(df_1h, df_4h, df_1d):
-
-    trend_1h = get_trend(df_1h)
-    trend_4h = get_trend(df_4h)
-    trend_1d = get_trend(df_1d)
-
-    trends = [trend_1h, trend_4h, trend_1d]
-
-    if trends.count("bullish") >= 2:
-        return "BUY"
-    elif trends.count("bearish") >= 2:
-        return "SELL"
-    else:
-        return None
-
-# ==============================
-# MOMENTUM
-# ==============================
-def strong_momentum(df):
-    if len(df) < 2:
-        return False
-
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    return (
-        (last['close'] > prev['close'] and last['volume'] > prev['volume']) or
-        (last['close'] < prev['close'] and last['volume'] > prev['volume'])
-    )
-
-# ==============================
-# VOLUME FILTER
-# ==============================
-def high_volume(df):
-    volume_ma = df['volume'].rolling(20).mean()
-
-    if len(df) < 20 or pd.isna(volume_ma.iloc[-1]) or volume_ma.iloc[-1] == 0:
-        return False
-
-    last = df.iloc[-1]
-    return last['volume'] > (1.3 * volume_ma.iloc[-1])
-
-# ==============================
-# REVERSAL
-# ==============================
-def reversal_signal(df):
-    if len(df) < 20:
-        return None
-
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    overbought = last['rsi'] > 72
-    oversold = last['rsi'] < 28
-
-    bearish_break = last['close'] < prev['low']
-    bullish_break = last['close'] > prev['high']
-
-    volume_ma = df['volume'].rolling(20).mean()
-    if pd.isna(volume_ma.iloc[-1]) or volume_ma.iloc[-1] == 0:
-        return None
-
-    high_vol = last['volume'] > (1.5 * volume_ma.iloc[-1])
-
-    if overbought and bearish_break and high_vol:
-        return "SELL"
-
-    if oversold and bullish_break and high_vol:
-        return "BUY"
-
-    return None
+def is_trending(df):
+    recent = df.tail(30)
+    range_size = (recent['high'].max() - recent['low'].min()) / recent['close'].iloc[-1]
+    return range_size > 0.015  # avoid choppy markets
 
 # ==============================
 # STRUCTURE
 # ==============================
-def get_structure_levels(df):
-    if len(df) < 20:
-        return None, None
+def structure_bias(df):
+    highs = df['high'].rolling(5).max()
+    lows = df['low'].rolling(5).min()
 
-    recent = df.tail(20)
-    return recent['high'].max(), recent['low'].min()
+    last_high = highs.iloc[-1]
+    prev_high = highs.iloc[-5]
+
+    last_low = lows.iloc[-1]
+    prev_low = lows.iloc[-5]
+
+    if last_high > prev_high and last_low > prev_low:
+        return "bullish"
+
+    if last_high < prev_high and last_low < prev_low:
+        return "bearish"
+
+    return "neutral"
 
 # ==============================
-# SIGNAL
+# HTF DIRECTION
 # ==============================
-def generate_signal(df):
+def get_htf_bias(df_1h, df_4h, df_1d):
 
-    if len(df) < 50:
-        return None
+    trends = [
+        structure_bias(df_1h),
+        structure_bias(df_4h),
+        structure_bias(df_1d)
+    ]
+
+    if trends.count("bullish") >= 2:
+        return "BUY"
+
+    if trends.count("bearish") >= 2:
+        return "SELL"
+
+    return None
+
+# ==============================
+# HTF REVERSAL DETECTION
+# ==============================
+def detect_htf_reversal(df_4h, df_1d):
+
+    trend_4h = structure_bias(df_4h)
+    trend_1d = structure_bias(df_1d)
+
+    # weakening condition
+    if trend_1d == "bullish" and trend_4h == "bearish":
+        return "SELL"
+
+    if trend_1d == "bearish" and trend_4h == "bullish":
+        return "BUY"
+
+    return None
+
+# ==============================
+# ENTRY LOGIC (SMART)
+# ==============================
+def entry_signal(df, direction):
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    swing_high, swing_low = get_structure_levels(df)
+    swing_high = df['high'].tail(20).max()
+    swing_low = df['low'].tail(20).min()
 
-    if swing_high is None or swing_low is None:
-        return None
+    # tolerance zone (improves fill rate)
+    tolerance = 0.002
 
-    range_size = (swing_high - swing_low) / last['close']
-    if range_size < 0.01:
-        return None
+    # BUY
+    if direction == "BUY":
 
-    rev = reversal_signal(df)
-
-    # ==============================
-    # REVERSAL ENTRY FIX (confirmation)
-    # ==============================
-    if rev:
-        if rev == "BUY" and last['close'] <= prev['high']:
-            return None
-        if rev == "SELL" and last['close'] >= prev['low']:
-            return None
-
-        entry = last['close']
-
-        if rev == "BUY":
-            sl = swing_low
-            tp = swing_high
-            risk = entry - sl
-            reward = tp - entry
-        else:
-            sl = swing_high
-            tp = swing_low
-            risk = sl - entry
-            reward = entry - tp
-
-        if risk <= 0 or reward <= 0 or abs(entry - sl) / entry < 0.002:
-            return None
-
-        rr = round(reward / risk, 2)
-
-        if rr < 1.5:
-            return None
-
-        return f"{rev}_REVERSAL", entry, sl, tp, rr
-
-    bullish = last['close'] > last['ema50'] > last['ema200'] and last['rsi'] > 55
-    bearish = last['close'] < last['ema50'] < last['ema200'] and last['rsi'] < 45
-
-    momentum = strong_momentum(df)
-    volume_ok = high_volume(df)
-
-    # ==============================
-    # TREND ENTRY FIX (pullback + confirmation)
-    # ==============================
-    if bullish and momentum and volume_ok:
-
+        # breakout confirmation
         if last['close'] <= prev['high']:
             return None
 
-        entry = last['ema50']   # ✅ pullback entry
+        entry = last['ema50']
+
+        if abs(last['close'] - entry) / entry > 0.02:
+            return None
+
         sl = swing_low
-        tp = swing_high * 1.005
+        tp = swing_high
 
         risk = entry - sl
         reward = tp - entry
 
-        if risk <= 0 or reward <= 0 or abs(entry - sl) / entry < 0.002:
-            return None
-
-        rr = round(reward / risk, 2)
-
-        if rr < 1.5:
-            return None
-
-        return "BUY", entry, sl, tp, rr
-
-    elif bearish and momentum and volume_ok:
+    # SELL
+    elif direction == "SELL":
 
         if last['close'] >= prev['low']:
             return None
 
-        entry = last['ema50']   # ✅ pullback entry
+        entry = last['ema50']
+
+        if abs(last['close'] - entry) / entry > 0.02:
+            return None
+
         sl = swing_high
-        tp = swing_low * 0.995
+        tp = swing_low
 
         risk = sl - entry
         reward = entry - tp
 
-        if risk <= 0 or reward <= 0 or abs(entry - sl) / entry < 0.002:
-            return None
+    else:
+        return None
 
-        rr = round(reward / risk, 2)
+    if risk <= 0 or reward <= 0:
+        return None
 
-        if rr < 1.5:
-            return None
+    rr = round(reward / risk, 2)
 
-        return "SELL", entry, sl, tp, rr
+    # avoid trash trades but not strict
+    if rr < 1.2:
+        return None
 
-    return None
+    return direction, entry, sl, tp, rr
 
 # ==============================
-# FINAL FILTERED SIGNAL
+# FINAL SIGNAL
 # ==============================
 def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d):
 
-    signal = generate_signal(df_15m)
-
-    if signal is None:
+    # skip bad market
+    if not is_trending(df_4h):
         return None
 
-    if is_spike(df_15m):
+    # check reversal first
+    reversal = detect_htf_reversal(df_4h, df_1d)
+
+    if reversal:
+        return entry_signal(df_15m, reversal)
+
+    # normal trend
+    bias = get_htf_bias(df_1h, df_4h, df_1d)
+
+    if not bias:
         return None
 
-    if recent_spike(df_15m):
-        return None
-
-    if is_overextended(df_15m):
-        return None
-
-    signal_type, entry, sl, tp, rr = signal
-
-    htf_trend = get_htf_trend(df_1h, df_4h, df_1d)
-
-    if "REVERSAL" in signal_type:
-        return signal
-
-    if htf_trend is None:
-        return None
-
-    if signal_type == htf_trend:
-        return signal
-
-    return None
+    return entry_signal(df_15m, bias)
