@@ -3,16 +3,17 @@ import pandas as pd
 import time
 import requests
 from datetime import datetime
+import os
 
-# ✅ UPDATED IMPORT
+# ==============================
+# IMPORT STRATEGY
+# ==============================
 from strategy import apply_indicators, generate_filtered_signal
 from performance import save_trade, check_trade_results, daily_report
 
 # ==============================
 # TELEGRAM
 # ==============================
-import os
-
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
@@ -38,59 +39,70 @@ def send_telegram(msg):
 send_telegram("✅ Bot started successfully")
 
 # ==============================
-# EXCHANGES
+# EXCHANGES (SEPARATED)
 # ==============================
-exchanges = {
-    "kucoin": ccxt.kucoin({"enableRateLimit": True}),
-    "mexc": ccxt.mexc({"enableRateLimit": True})
-}
+spot_exchange = ccxt.kucoin({"enableRateLimit": True})
+futures_exchange = ccxt.mexc({"enableRateLimit": True})
 
 # ==============================
-# FETCH DATA
+# FETCH DATA (UPDATED)
 # ==============================
-def fetch_tf(symbol, tf):
-    for name, ex in exchanges.items():
-        try:
-            data = ex.fetch_ohlcv(symbol, tf, limit=100)
-            df = pd.DataFrame(data, columns=['time','open','high','low','close','volume'])
-            return df, name
-        except Exception as e:
-            print(f"{name} failed for {symbol}: {e}")
-            continue
-    return None, None
+def fetch_tf(symbol, tf, market_type):
+    try:
+        ex = spot_exchange if market_type == "spot" else futures_exchange
 
-def get_price(symbol):
-    df, _ = fetch_tf(symbol, "15m")
+        data = ex.fetch_ohlcv(symbol, tf, limit=100)
+        df = pd.DataFrame(data, columns=['time','open','high','low','close','volume'])
+
+        return df, ex.id
+
+    except Exception as e:
+        print(f"{market_type} fetch failed for {symbol}: {e}")
+        return None, None
+
+def get_price(symbol, market_type):
+    df, _ = fetch_tf(symbol, "15m", market_type)
     if df is None:
         return None
     return df.iloc[-1]['close']
 
 # ==============================
-# PAIR SCANNER
+# PAIR SCANNER (SEPARATED)
 # ==============================
 def get_pairs():
     pairs = []
 
-    for ex in exchanges.values():
-        try:
-            markets = ex.load_markets()
+    # ===== KUCOIN SPOT =====
+    try:
+        markets = spot_exchange.load_markets()
 
-            for symbol, data in markets.items():
-                if "/USDT" in symbol:
-                    try:
-                        ticker = ex.fetch_ticker(symbol)
+        for symbol in markets:
+            if "/USDT" in symbol and ":" not in symbol:
+                try:
+                    ticker = spot_exchange.fetch_ticker(symbol)
+                    if ticker['quoteVolume'] and ticker['quoteVolume'] > 5_000_000:
+                        pairs.append((symbol, "spot"))
+                except:
+                    continue
+    except:
+        pass
 
-                        # 🔥 Only high volume coins
-                        if ticker['quoteVolume'] and ticker['quoteVolume'] > 5_000_000:
-                            pairs.append(symbol)
+    # ===== MEXC FUTURES =====
+    try:
+        markets = futures_exchange.load_markets()
 
-                    except:
-                        continue
+        for symbol in markets:
+            if "/USDT:USDT" in symbol:
+                try:
+                    ticker = futures_exchange.fetch_ticker(symbol)
+                    if ticker['quoteVolume'] and ticker['quoteVolume'] > 5_000_000:
+                        pairs.append((symbol, "futures"))
+                except:
+                    continue
+    except:
+        pass
 
-        except:
-            continue
-
-    return list(set(pairs))[:25]
+    return pairs[:25]
 
 # ==============================
 # MAIN BOT
@@ -101,30 +113,26 @@ def run_bot():
     pairs = get_pairs()
     signals = []
 
-    for symbol in pairs:
+    for symbol, market_type in pairs:
 
-        # ==============================
-        # FETCH ALL TIMEFRAMES
-        # ==============================
-        df_15m, source = fetch_tf(symbol, "15m")
-        df_1h, _ = fetch_tf(symbol, "1h")
-        df_4h, _ = fetch_tf(symbol, "4h")
-        df_1d, _ = fetch_tf(symbol, "1d")
+        # Fetch all TFs
+        df_15m, source = fetch_tf(symbol, "15m", market_type)
+        df_1h, _ = fetch_tf(symbol, "1h", market_type)
+        df_4h, _ = fetch_tf(symbol, "4h", market_type)
+        df_1d, _ = fetch_tf(symbol, "1d", market_type)
 
-        # ✅ FIXED DATA CHECK
+        # Data check
         if any(x is None or x.empty for x in [df_15m, df_1h, df_4h, df_1d]):
-            print(f"⚠️ Skipping {symbol} (bad data)")
+            print(f"⚠️ Skipping {symbol} ({market_type})")
             continue
 
-        # Apply indicators
+        # Indicators
         df_15m = apply_indicators(df_15m)
         df_1h = apply_indicators(df_1h)
         df_4h = apply_indicators(df_4h)
         df_1d = apply_indicators(df_1d)
 
-        # ==============================
-        # NEW HTF FILTERED SIGNAL
-        # ==============================
+        # Strategy
         result = generate_filtered_signal(df_15m, df_1h, df_4h, df_1d)
 
         if not result:
@@ -132,7 +140,6 @@ def run_bot():
 
         signal, entry, sl, tp, rr = result
 
-        # Extra safety
         if entry == sl or entry == tp:
             continue
 
@@ -146,9 +153,7 @@ def run_bot():
             "rr": rr
         })
 
-    # ==============================
-    # SORT + LIMIT
-    # ==============================
+    # Sort best trades
     signals = sorted(signals, key=lambda x: x['rr'], reverse=True)[:5]
 
     for s in signals:
@@ -184,7 +189,7 @@ last_report_day = None
 while True:
     run_bot()
 
-    check_trade_results(get_price, send_telegram)
+    check_trade_results(lambda s: get_price(s[0], "spot"), send_telegram)
 
     today = datetime.now().date()
     if last_report_day != today:
