@@ -77,7 +77,7 @@ def get_pairs():
     except Exception as e:
         print("Futures error:", e)
 
-    return pairs[:25]
+    return pairs[:15]
 
 # ==============================
 # MAIN SCAN
@@ -90,6 +90,7 @@ def run_bot():
     signals = []
 
     for symbol, market_type in pairs:
+        time.sleep(0.3)  # prevents MEXC rate limit
 
         df_15m, source = fetch_tf(symbol, "15m", market_type)
         df_1h, _ = fetch_tf(symbol, "1h", market_type)
