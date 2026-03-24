@@ -3,51 +3,72 @@ import csv
 import os
 from datetime import datetime
 
-CSV_FILE = "performance.csv"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CSV_FILE = os.path.join(BASE_DIR, "performance.csv")
 
 # ==============================
-# ENSURE FILE EXISTS (ADDED)
+# ENSURE FILE EXISTS
 # ==============================
 def ensure_csv():
     if not os.path.exists(CSV_FILE):
         with open(CSV_FILE, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["time","pair","signal","entry","sl","tp","rr","status"])
+            writer.writerow([
+                "time","pair","signal","entry","sl","tp","rr","status","market_type"
+            ])
+
+# Run once on import
+ensure_csv()
 
 # ==============================
-# INIT FILE (UNCHANGED)
+# SAVE TRADE (UPDATED)
 # ==============================
-if not os.path.exists(CSV_FILE):
-    with open(CSV_FILE, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["time","pair","signal","entry","sl","tp","rr","status"])
-
-# ==============================
-# SAVE TRADE (FIXED)
-# ==============================
-def save_trade(pair, signal, entry, sl, tp, rr):
-    ensure_csv()  # ✅ ADDED LINE (guarantees file exists)
+def save_trade(pair, signal, entry, sl, tp, rr, market_type):
+    ensure_csv()
 
     with open(CSV_FILE, "a", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
-            datetime.utcnow(), pair, signal, entry, sl, tp, rr, "OPEN"
+            datetime.utcnow(),
+            pair,
+            signal,
+            entry,
+            sl,
+            tp,
+            rr,
+            "OPEN",
+            market_type
         ])
 
 # ==============================
-# TP/SL CHECK (UNCHANGED)
+# TP/SL CHECK (FIXED)
 # ==============================
 def check_trade_results(fetch_price_func, send_telegram):
+    ensure_csv()
+
     df = pd.read_csv(CSV_FILE)
+
+    if df.empty:
+        return
+
     updated = False
 
     for i, row in df.iterrows():
+
         if row['status'] != "OPEN":
             continue
 
-        price = fetch_price_func(row['pair'])
+        try:
+            price = fetch_price_func(row['pair'], row['market_type'])
+        except Exception as e:
+            print(f"Price fetch error: {row['pair']} -> {e}")
+            continue
+
         if price is None:
             continue
+
+        # DEBUG (you can remove later)
+        print(f"Checking {row['pair']} | Price: {price}")
 
         if row['signal'] == "BUY":
             if price >= row['tp']:
@@ -60,7 +81,7 @@ def check_trade_results(fetch_price_func, send_telegram):
                 send_telegram(f"❌ SL HIT: {row['pair']}")
                 updated = True
 
-        else:
+        elif row['signal'] == "SELL":
             if price <= row['tp']:
                 df.at[i, 'status'] = "WIN"
                 send_telegram(f"✅ TP HIT: {row['pair']}")
@@ -75,12 +96,18 @@ def check_trade_results(fetch_price_func, send_telegram):
         df.to_csv(CSV_FILE, index=False)
 
 # ==============================
-# DAILY REPORT (UNCHANGED)
+# DAILY REPORT
 # ==============================
 def daily_report(send_telegram):
+    ensure_csv()
+
     df = pd.read_csv(CSV_FILE)
 
-    df['time'] = pd.to_datetime(df['time'])
+    if df.empty:
+        send_telegram("📊 DAILY REPORT\n\nNo trades yet.")
+        return
+
+    df['time'] = pd.to_datetime(df['time'], errors='coerce')
     today = datetime.utcnow().date()
 
     df_today = df[df['time'].dt.date == today]

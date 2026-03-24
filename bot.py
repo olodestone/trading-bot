@@ -11,31 +11,51 @@ from performance import save_trade, check_trade_results, daily_report
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
+# ==============================
+# TELEGRAM
+# ==============================
 def send_telegram(msg):
     if not TOKEN or not CHAT_ID:
+        print("⚠️ Telegram not configured")
         return
 
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+    try:
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+    except Exception as e:
+        print("Telegram error:", e)
 
+# ==============================
+# EXCHANGES
+# ==============================
 spot_exchange = ccxt.kucoin({"enableRateLimit": True})
 futures_exchange = ccxt.mexc({"enableRateLimit": True})
 
+# ==============================
+# FETCH DATA
+# ==============================
 def fetch_tf(symbol, tf, market_type):
     try:
         ex = spot_exchange if market_type == "spot" else futures_exchange
         data = ex.fetch_ohlcv(symbol, tf, limit=100)
         df = pd.DataFrame(data, columns=['time','open','high','low','close','volume'])
         return df, ex.id
-    except:
+    except Exception as e:
+        print(f"Fetch error {symbol} {tf}: {e}")
         return None, None
 
+# ==============================
+# GET PRICE (USED BY PERFORMANCE)
+# ==============================
 def get_price(symbol, market_type):
     df, _ = fetch_tf(symbol, "15m", market_type)
-    if df is None:
+    if df is None or df.empty:
         return None
     return df.iloc[-1]['close']
 
+# ==============================
+# GET PAIRS
+# ==============================
 def get_pairs():
     pairs = []
 
@@ -43,22 +63,25 @@ def get_pairs():
         for symbol in spot_exchange.load_markets():
             if "/USDT" in symbol and ":" not in symbol:
                 ticker = spot_exchange.fetch_ticker(symbol)
-                if ticker['quoteVolume'] and ticker['quoteVolume'] > 5_000_000:
+                if ticker.get('quoteVolume') and ticker['quoteVolume'] > 5_000_000:
                     pairs.append((symbol, "spot"))
-    except:
-        pass
+    except Exception as e:
+        print("Spot error:", e)
 
     try:
         for symbol in futures_exchange.load_markets():
             if "/USDT:USDT" in symbol:
                 ticker = futures_exchange.fetch_ticker(symbol)
-                if ticker['quoteVolume'] and ticker['quoteVolume'] > 5_000_000:
+                if ticker.get('quoteVolume') and ticker['quoteVolume'] > 5_000_000:
                     pairs.append((symbol, "futures"))
-    except:
-        pass
+    except Exception as e:
+        print("Futures error:", e)
 
     return pairs[:25]
 
+# ==============================
+# MAIN SCAN
+# ==============================
 def run_bot():
 
     print(f"\n🚀 Scan: {datetime.now()}\n")
@@ -99,6 +122,7 @@ def run_bot():
             "market_type": market_type
         })
 
+    # Pick top RR trades
     signals = sorted(signals, key=lambda x: x['rr'], reverse=True)[:5]
 
     for s in signals:
@@ -116,25 +140,42 @@ RR: {s['rr']}
         print(msg)
         send_telegram(msg)
 
-        save_trade(s['pair'], s['signal'], s['entry'], s['sl'], s['tp'], s['rr'])
+        # ✅ FIXED (added market_type)
+        save_trade(
+            s['pair'],
+            s['signal'],
+            s['entry'],
+            s['sl'],
+            s['tp'],
+            s['rr'],
+            s['market_type']
+        )
 
+# ==============================
+# LOOP
+# ==============================
 def main():
     last_report_day = None
 
     while True:
         run_bot()
 
+        # ✅ FIXED (no lambda anymore)
         check_trade_results(
-            lambda s: get_price(s[0], s[1]),
+            get_price,
             send_telegram
         )
 
+        # Better timing control (optional tweak later)
         today = datetime.now().date()
         if last_report_day != today:
             daily_report(send_telegram)
             last_report_day = today
 
-        time.sleep(900)
+        time.sleep(900)  # 15 minutes
 
+# ==============================
+# START
+# ==============================
 if __name__ == "__main__":
     main()
