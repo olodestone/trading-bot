@@ -3,8 +3,8 @@ import csv
 import os
 from datetime import datetime
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CSV_FILE = os.path.join(BASE_DIR, "performance.csv")
+# ✅ FORCE LOCAL FILE (same folder as bot.py)
+CSV_FILE = os.path.join(os.getcwd(), "performance.csv")
 
 # ==============================
 # ENSURE FILE EXISTS
@@ -16,12 +16,10 @@ def ensure_csv():
             writer.writerow([
                 "time","pair","signal","entry","sl","tp","rr","status","market_type"
             ])
-
-# Run once on import
-ensure_csv()
+        print(f"✅ CSV CREATED AT: {CSV_FILE}")
 
 # ==============================
-# SAVE TRADE (UPDATED)
+# SAVE TRADE
 # ==============================
 def save_trade(pair, signal, entry, sl, tp, rr, market_type):
     ensure_csv()
@@ -41,7 +39,7 @@ def save_trade(pair, signal, entry, sl, tp, rr, market_type):
         ])
 
 # ==============================
-# TP/SL CHECK (FIXED)
+# TP/SL CHECK
 # ==============================
 def check_trade_results(fetch_price_func, send_telegram):
     ensure_csv()
@@ -67,7 +65,6 @@ def check_trade_results(fetch_price_func, send_telegram):
         if price is None:
             continue
 
-        # DEBUG (you can remove later)
         print(f"Checking {row['pair']} | Price: {price}")
 
         if row['signal'] == "BUY":

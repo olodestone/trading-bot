@@ -201,9 +201,11 @@ RR: {s['rr']}
 # LOOP
 # ==============================
 def main():
-    ensure_csv()  # 🔥 FORCE CREATE FILE
-
     
+    ensure_csv()
+
+    print("📁 CSV FILE LOCATION:", os.path.join(os.getcwd(), "performance.csv"))
+
     last_report_day = None
 
     while True:
