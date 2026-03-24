@@ -7,6 +7,7 @@ import os
 
 from strategy import apply_indicators, generate_filtered_signal
 from performance import save_trade, check_trade_results, daily_report
+from performance import save_trade, check_trade_results, daily_report, ensure_csv
 
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -200,6 +201,9 @@ RR: {s['rr']}
 # LOOP
 # ==============================
 def main():
+    ensure_csv()  # 🔥 FORCE CREATE FILE
+
+    
     last_report_day = None
 
     while True:
