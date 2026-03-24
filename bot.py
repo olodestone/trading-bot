@@ -31,6 +31,10 @@ def send_telegram(msg):
 spot_exchange = ccxt.kucoin({"enableRateLimit": True})
 futures_exchange = ccxt.mexc({"enableRateLimit": True})
 
+# ✅ LOAD MARKETS ONCE (IMPORTANT)
+SPOT_MARKETS = spot_exchange.load_markets()
+FUTURES_MARKETS = futures_exchange.load_markets()
+
 # ==============================
 # FETCH DATA
 # ==============================
@@ -45,7 +49,7 @@ def fetch_tf(symbol, tf, market_type):
         return None, None
 
 # ==============================
-# GET PRICE (USED BY PERFORMANCE)
+# GET PRICE
 # ==============================
 def get_price(symbol, market_type):
     df, _ = fetch_tf(symbol, "15m", market_type)
@@ -54,30 +58,63 @@ def get_price(symbol, market_type):
     return df.iloc[-1]['close']
 
 # ==============================
-# GET PAIRS
+# ENTRY CHECK (FIXED POSITION)
+# ==============================
+def entry_hit(symbol, market_type, entry, direction):
+    price = get_price(symbol, market_type)
+
+    if price is None:
+        return False
+
+    tolerance = 0.002
+
+    if direction == "BUY":
+        return price <= entry * (1 + tolerance)
+
+    elif direction == "SELL":
+        return price >= entry * (1 - tolerance)
+
+    return False
+
+# ==============================
+# GET PAIRS (OPTIMIZED)
 # ==============================
 def get_pairs():
     pairs = []
 
     try:
-        for symbol in spot_exchange.load_markets():
+        for symbol in SPOT_MARKETS:
             if "/USDT" in symbol and ":" not in symbol:
-                ticker = spot_exchange.fetch_ticker(symbol)
-                if ticker.get('quoteVolume') and ticker['quoteVolume'] > 5_000_000:
+
+                df, _ = fetch_tf(symbol, "1h", "spot")
+                time.sleep(0.2)
+
+                if df is None or df.empty:
+                    continue
+
+                if df['volume'].iloc[-1] > 1000:
                     pairs.append((symbol, "spot"))
+
     except Exception as e:
         print("Spot error:", e)
 
     try:
-        for symbol in futures_exchange.load_markets():
+        for symbol in FUTURES_MARKETS:
             if "/USDT:USDT" in symbol:
-                ticker = futures_exchange.fetch_ticker(symbol)
-                if ticker.get('quoteVolume') and ticker['quoteVolume'] > 5_000_000:
+
+                df, _ = fetch_tf(symbol, "1h", "futures")
+                time.sleep(0.5)
+
+                if df is None or df.empty:
+                    continue
+
+                if df['volume'].iloc[-1] > 1000:
                     pairs.append((symbol, "futures"))
+
     except Exception as e:
         print("Futures error:", e)
 
-    return pairs[:15]
+    return pairs[:12]
 
 # ==============================
 # MAIN SCAN
@@ -90,7 +127,7 @@ def run_bot():
     signals = []
 
     for symbol, market_type in pairs:
-        time.sleep(0.3)  # prevents MEXC rate limit
+        time.sleep(0.3)
 
         df_15m, source = fetch_tf(symbol, "15m", market_type)
         df_1h, _ = fetch_tf(symbol, "1h", market_type)
@@ -123,7 +160,6 @@ def run_bot():
             "market_type": market_type
         })
 
-    # Pick top RR trades
     signals = sorted(signals, key=lambda x: x['rr'], reverse=True)[:5]
 
     for s in signals:
@@ -139,18 +175,26 @@ TP: {round(s['tp'],4)}
 RR: {s['rr']}
 """
         print(msg)
-        send_telegram(msg)
 
-        # ✅ FIXED (added market_type)
-        save_trade(
-            s['pair'],
-            s['signal'],
-            s['entry'],
-            s['sl'],
-            s['tp'],
-            s['rr'],
-            s['market_type']
-        )
+        # ✅ ENTRY CONFIRMATION (NEW LOGIC)
+        if entry_hit(s['pair'], s['market_type'], s['entry'], s['signal']):
+
+            print(f"✅ ENTRY HIT: {s['pair']}")
+
+            send_telegram(msg)
+
+            save_trade(
+                s['pair'],
+                s['signal'],
+                s['entry'],
+                s['sl'],
+                s['tp'],
+                s['rr'],
+                s['market_type']
+            )
+
+        else:
+            print(f"⏳ Waiting for entry: {s['pair']}")
 
 # ==============================
 # LOOP
@@ -161,19 +205,17 @@ def main():
     while True:
         run_bot()
 
-        # ✅ FIXED (no lambda anymore)
         check_trade_results(
             get_price,
             send_telegram
         )
 
-        # Better timing control (optional tweak later)
         today = datetime.now().date()
         if last_report_day != today:
             daily_report(send_telegram)
             last_report_day = today
 
-        time.sleep(900)  # 15 minutes
+        time.sleep(900)
 
 # ==============================
 # START
