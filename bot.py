@@ -177,12 +177,15 @@ RR: {s['rr']}
 """
         print(msg)
 
-        # ✅ ENTRY CONFIRMATION (NEW LOGIC)
+# 🔥 ALWAYS SEND SIGNAL (NEW)
+        send_telegram("🚀 SIGNAL (waiting for entry)\n" + msg)
+
+# THEN check entry
         if entry_hit(s['pair'], s['market_type'], s['entry'], s['signal']):
 
             print(f"✅ ENTRY HIT: {s['pair']}")
 
-            send_telegram(msg)
+            send_telegram("✅ ENTRY HIT\n" + msg)
 
             save_trade(
                 s['pair'],
