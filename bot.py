@@ -6,7 +6,7 @@ from datetime import datetime
 import os
 
 from strategy import apply_indicators, generate_filtered_signal
-from performance import save_trade, check_trade_results, daily_report
+
 from performance import save_trade, check_trade_results, daily_report, ensure_csv
 
 TOKEN = os.getenv("TOKEN")
@@ -53,6 +53,12 @@ def fetch_tf(symbol, tf, market_type):
 # GET PRICE
 # ==============================
 # ONLY showing CHANGED parts (rest stays exactly same)
+
+def get_price(symbol, market_type):
+    df, _ = fetch_tf(symbol, "15m", market_type)
+    if df is None or df.empty:
+        return None
+    return df.iloc[-1]['close']
 
 # ==============================
 # ENTRY CHECK (UPDATED)
