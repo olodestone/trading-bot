@@ -13,15 +13,18 @@ def apply_indicators(df):
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
 
+    # 🔥 NEW (reversal strength)
+    df['vol_ma'] = df['volume'].rolling(20).mean()
+
     return df
 
 # ==============================
-# MARKET CONDITION (NEW)
+# MARKET CONDITION
 # ==============================
 def is_trending(df):
     recent = df.tail(30)
     range_size = (recent['high'].max() - recent['low'].min()) / recent['close'].iloc[-1]
-    return range_size > 0.015  # avoid choppy markets
+    return range_size > 0.015
 
 # ==============================
 # STRUCTURE
@@ -64,65 +67,56 @@ def get_htf_bias(df_1h, df_4h, df_1d):
     return None
 
 # ==============================
-# HTF REVERSAL DETECTION
+# HTF REVERSAL DETECTION (UPGRADED)
 # ==============================
 def detect_htf_reversal(df_4h, df_1d):
 
     trend_4h = structure_bias(df_4h)
     trend_1d = structure_bias(df_1d)
 
-    # weakening condition
-    if trend_1d == "bullish" and trend_4h == "bearish":
-        return "SELL"
+    last = df_4h.iloc[-1]
 
+    # SELL reversal
+    if trend_1d == "bullish" and trend_4h == "bearish":
+        if last['rsi'] > 70 and last['volume'] > last['vol_ma']:
+            return "SELL"
+
+    # BUY reversal
     if trend_1d == "bearish" and trend_4h == "bullish":
-        return "BUY"
+        if last['rsi'] < 30 and last['volume'] > last['vol_ma']:
+            return "BUY"
 
     return None
 
 # ==============================
-# ENTRY LOGIC (SMART)
+# ENTRY LOGIC (UNCHANGED CORE)
 # ==============================
 def entry_signal(df, direction):
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    swing_high = df['high'].tail(20).max()
-    swing_low = df['low'].tail(20).min()
+    swing_high = df['high'].tail(30).max()
+    swing_low = df['low'].tail(30).min()
 
-    # tolerance zone (improves fill rate)
-    tolerance = 0.002
-
-    # BUY
     if direction == "BUY":
 
-        # breakout confirmation
         if last['close'] <= prev['high']:
             return None
 
         entry = last['ema50']
-
-        if abs(last['close'] - entry) / entry > 0.02:
-            return None
-
         sl = swing_low
         tp = swing_high
 
         risk = entry - sl
         reward = tp - entry
 
-    # SELL
     elif direction == "SELL":
 
         if last['close'] >= prev['low']:
             return None
 
         entry = last['ema50']
-
-        if abs(last['close'] - entry) / entry > 0.02:
-            return None
-
         sl = swing_high
         tp = swing_low
 
@@ -135,33 +129,41 @@ def entry_signal(df, direction):
     if risk <= 0 or reward <= 0:
         return None
 
-    rr = round(reward / risk, 2)
-
-    # avoid trash trades but not strict
-    if rr < 1.2:
+    if abs(entry - sl) / entry < 0.003:
         return None
 
-    return direction, entry, sl, tp, rr
+    if abs(tp - entry) / entry < 0.004:
+        return None
+
+    rr = round(reward / risk, 2)
+
+    if rr < 1.5:
+        return None
+
+    return direction, entry, sl, tp, rr, "trend"
 
 # ==============================
-# FINAL SIGNAL
+# FINAL SIGNAL (UPDATED)
 # ==============================
 def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d):
 
-    # skip bad market
     if not is_trending(df_4h):
         return None
 
-    # check reversal first
     reversal = detect_htf_reversal(df_4h, df_1d)
 
     if reversal:
-        return entry_signal(df_15m, reversal)
+        result = entry_signal(df_15m, reversal)
+        if result:
+            direction, entry, sl, tp, rr, _ = result
+            return direction, entry, sl, tp, rr, "reversal"
 
-    # normal trend
     bias = get_htf_bias(df_1h, df_4h, df_1d)
 
     if not bias:
         return None
 
-    return entry_signal(df_15m, bias)
+    result = entry_signal(df_15m, bias)
+    if result:
+        direction, entry, sl, tp, rr, _ = result
+        return direction, entry, sl, tp, rr, "trend"

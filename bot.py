@@ -52,28 +52,49 @@ def fetch_tf(symbol, tf, market_type):
 # ==============================
 # GET PRICE
 # ==============================
-def get_price(symbol, market_type):
+# ONLY showing CHANGED parts (rest stays exactly same)
+
+# ==============================
+# ENTRY CHECK (UPDATED)
+# ==============================
+def entry_hit(symbol, market_type, entry, direction, trade_type):
+
     df, _ = fetch_tf(symbol, "15m", market_type)
+
     if df is None or df.empty:
-        return None
-    return df.iloc[-1]['close']
-
-# ==============================
-# ENTRY CHECK (FIXED POSITION)
-# ==============================
-def entry_hit(symbol, market_type, entry, direction):
-    price = get_price(symbol, market_type)
-
-    if price is None:
         return False
 
-    tolerance = 0.002
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
 
-    if direction == "BUY":
-        return price <= entry * (1 + tolerance)
+    tolerance = 0.003
+    price = last['close']
 
-    elif direction == "SELL":
-        return price >= entry * (1 - tolerance)
+    # TREND
+    if trade_type == "trend":
+
+        if direction == "BUY":
+            return price <= entry * (1 + tolerance)
+
+        elif direction == "SELL":
+            return price >= entry * (1 - tolerance)
+
+    # REVERSAL (STRICT)
+    elif trade_type == "reversal":
+
+        if direction == "BUY":
+            return (
+                price <= entry * (1 + tolerance)
+                and last['close'] > prev['high']
+                and last['close'] > last['open']
+            )
+
+        elif direction == "SELL":
+            return (
+                price >= entry * (1 - tolerance)
+                and last['close'] < prev['low']
+                and last['close'] < last['open']
+            )
 
     return False
 
@@ -148,7 +169,7 @@ def run_bot():
         if not result:
             continue
 
-        signal, entry, sl, tp, rr = result
+        signal, entry, sl, tp, rr, trade_type = result
 
         signals.append({
             "pair": symbol,
@@ -158,7 +179,8 @@ def run_bot():
             "sl": sl,
             "tp": tp,
             "rr": rr,
-            "market_type": market_type
+            "market_type": market_type,
+            "trade_type": trade_type,
         })
 
     signals = sorted(signals, key=lambda x: x['rr'], reverse=True)[:5]
@@ -169,11 +191,11 @@ def run_bot():
 
 Pair: {s['pair']}
 Signal: {s['signal']}
-
-Entry: {round(s['entry'],4)}
-SL: {round(s['sl'],4)}
-TP: {round(s['tp'],4)}
+Entry: {round(s['entry'],6)}
+SL: {round(s['sl'],6)}
+TP: {round(s['tp'],6)}
 RR: {s['rr']}
+Trade Type: {s['trade_type']}
 """
         print(msg)
 
@@ -181,7 +203,7 @@ RR: {s['rr']}
         send_telegram("🚀 SIGNAL (waiting for entry)\n" + msg)
 
 # THEN check entry
-        if entry_hit(s['pair'], s['market_type'], s['entry'], s['signal']):
+        if entry_hit(s['pair'], s['market_type'], s['entry'], s['signal'], s['trade_type']):
 
             print(f"✅ ENTRY HIT: {s['pair']}")
 
