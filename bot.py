@@ -177,7 +177,7 @@ def get_pairs():
             if "/USDT" in symbol and ":" not in symbol:
 
                 df = get_cached_tf(symbol, "1h", "spot")
-                time.sleep(1.2)
+                time.sleep(0.8)
 
                 if df is None or df.empty or len(df) < 3:
                     continue
@@ -193,7 +193,7 @@ def get_pairs():
             if "/USDT:USDT" in symbol:
 
                 df = get_cached_tf(symbol, "1h", "futures")
-                time.sleep(1.2)
+                time.sleep(0.8)
 
                 if df is None or df.empty or len(df) < 3:
                     continue
