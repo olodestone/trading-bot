@@ -43,16 +43,24 @@ SPOT_MARKETS = spot_exchange.load_markets()
 FUTURES_MARKETS = futures_exchange.load_markets()
 
 # ==============================
-# CACHE (NEW)
+# CACHE
 # ==============================
 HTF_CACHE = {}
 HTF_LAST_UPDATE = {}
 
-def get_htf(symbol, tf, market_type):
+def get_cached_tf(symbol, tf, market_type):
     key = f"{symbol}_{tf}_{market_type}"
     now = time.time()
 
-    refresh_time = 14400 if tf == "4h" else 86400
+    # 🔥 Optimized refresh timing
+    if tf == "1h":
+        refresh_time = 900      # 15 mins (NOT 1h)
+    elif tf == "4h":
+        refresh_time = 14400
+    elif tf == "1d":
+        refresh_time = 86400
+    else:
+        refresh_time = 0
 
     if key in HTF_CACHE and (now - HTF_LAST_UPDATE[key] < refresh_time):
         return HTF_CACHE[key]
@@ -66,7 +74,7 @@ def get_htf(symbol, tf, market_type):
     return df
 
 # ==============================
-# DUPLICATE FILTER (NEW)
+# DUPLICATE FILTER
 # ==============================
 last_signals = {}
 
@@ -80,31 +88,33 @@ def is_new_signal(pair, signal, entry):
     return True
 
 # ==============================
-# FETCH DATA
+# FETCH DATA WITH TIMEOUT
 # ==============================
-
-
 def timeout_handler(signum, frame):
     raise Exception("Timeout")
 
 def fetch_tf(symbol, tf, market_type):
     ex = spot_exchange if market_type == "spot" else futures_exchange
 
-    for i in range(3):  # retry 3 times
+    for i in range(2):
         try:
-            # ⛔ START timeout
             signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(10)  # max 10 seconds per request
+            signal.alarm(10)
 
             data = ex.fetch_ohlcv(symbol, tf, limit=100)
 
-            signal.alarm(0)  # ⛔ STOP timeout
+            signal.alarm(0)
 
             df = pd.DataFrame(data, columns=['time','open','high','low','close','volume'])
             return df, ex.id
 
         except Exception as e:
-            signal.alarm(0)  # ensure alarm is cleared
+            signal.alarm(0)
+
+            if "429" in str(e):
+                print("⚠️ Rate limit hit, cooling down...")
+                time.sleep(10)
+
             print(f"Fetch retry {i+1} {symbol} {tf}: {e}")
             time.sleep(2)
 
@@ -121,11 +131,9 @@ def get_price(symbol, market_type):
     return df.iloc[-1]['close']
 
 # ==============================
-# ENTRY CHECK
+# ENTRY CHECK (FIXED - NO EXTRA API CALL)
 # ==============================
-def entry_hit(symbol, market_type, entry, direction, trade_type):
-
-    df, _ = fetch_tf(symbol, "15m", market_type)
+def entry_hit(df, entry, direction, trade_type):
 
     if df is None or df.empty or len(df) < 2:
         return False
@@ -168,14 +176,14 @@ def get_pairs():
         for symbol in SPOT_MARKETS:
             if "/USDT" in symbol and ":" not in symbol:
 
-                df, _ = fetch_tf(symbol, "1h", "spot")
-                time.sleep(0.8)
+                df = get_cached_tf(symbol, "1h", "spot")
+                time.sleep(1.2)
 
                 if df is None or df.empty or len(df) < 3:
-                   continue
+                    continue
 
                 if df['volume'].tail(3).mean() > 5000:
-                        pairs.append((symbol, "spot"))
+                    pairs.append((symbol, "spot"))
 
     except Exception as e:
         print("Spot error:", e)
@@ -184,8 +192,8 @@ def get_pairs():
         for symbol in FUTURES_MARKETS:
             if "/USDT:USDT" in symbol:
 
-                df, _ = fetch_tf(symbol, "1h", "futures")
-                time.sleep(0.8)
+                df = get_cached_tf(symbol, "1h", "futures")
+                time.sleep(1.2)
 
                 if df is None or df.empty or len(df) < 3:
                     continue
@@ -196,7 +204,7 @@ def get_pairs():
     except Exception as e:
         print("Futures error:", e)
 
-    return pairs[:12]
+    return pairs[:8]
 
 # ==============================
 # MAIN SCAN
@@ -209,14 +217,13 @@ def run_bot():
     signals = []
 
     for symbol, market_type in pairs:
-        time.sleep(1.2)
+        time.sleep(1.5)
 
         df_15m, source = fetch_tf(symbol, "15m", market_type)
-        df_1h, _ = fetch_tf(symbol, "1h", market_type)
 
-        # ✅ USING CACHE
-        df_4h = get_htf(symbol, "4h", market_type)
-        df_1d = get_htf(symbol, "1d", market_type)
+        df_1h = get_cached_tf(symbol, "1h", market_type)
+        df_4h = get_cached_tf(symbol, "4h", market_type)
+        df_1d = get_cached_tf(symbol, "1d", market_type)
 
         if any(x is None or x.empty for x in [df_15m, df_1h, df_4h, df_1d]):
             continue
@@ -243,13 +250,13 @@ def run_bot():
             "rr": rr,
             "market_type": market_type,
             "trade_type": trade_type,
+            "df_15m": df_15m
         })
 
     signals = sorted(signals, key=lambda x: x['rr'], reverse=True)[:5]
 
     for s in signals:
 
-        # ✅ DUPLICATE FILTER
         if not is_new_signal(s['pair'], s['signal'], s['entry']):
             continue
 
@@ -264,11 +271,11 @@ TP: {round(s['tp'],6)}
 RR: {s['rr']}
 Trade Type: {s['trade_type']}
 """
-        print(msg)
 
+        print(msg)
         send_telegram("🚀 SIGNAL (waiting for entry)\n" + msg)
 
-        if entry_hit(s['pair'], s['market_type'], s['entry'], s['signal'], s['trade_type']):
+        if entry_hit(s['df_15m'], s['entry'], s['signal'], s['trade_type']):
 
             print(f"✅ ENTRY HIT: {s['pair']}")
             send_telegram("✅ ENTRY HIT\n" + msg)
@@ -282,7 +289,6 @@ Trade Type: {s['trade_type']}
                 s['rr'],
                 s['market_type']
             )
-
         else:
             print(f"⏳ Waiting for entry: {s['pair']}")
 
@@ -290,9 +296,8 @@ Trade Type: {s['trade_type']}
 # LOOP
 # ==============================
 def main():
-    
-    ensure_csv()
 
+    ensure_csv()
     print("📁 CSV FILE LOCATION:", os.path.join(os.getcwd(), "performance.csv"))
 
     last_report_day = None
@@ -311,7 +316,9 @@ def main():
             send_csv(TOKEN, CHAT_ID)
             last_report_day = today
 
-        time.sleep(900)  # 15 minutes
+        print("⏳ Sleeping for 15 minutes...")
+        time.sleep(900)
+        print("🔄 Next scan starting...")
 
 # ==============================
 # START
