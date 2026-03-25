@@ -4,6 +4,7 @@ import time
 import requests
 from datetime import datetime
 import os
+import signal
 
 from strategy import apply_indicators, generate_filtered_signal
 from performance import save_trade, check_trade_results, daily_report, ensure_csv
@@ -81,16 +82,29 @@ def is_new_signal(pair, signal, entry):
 # ==============================
 # FETCH DATA
 # ==============================
+
+
+def timeout_handler(signum, frame):
+    raise Exception("Timeout")
+
 def fetch_tf(symbol, tf, market_type):
     ex = spot_exchange if market_type == "spot" else futures_exchange
 
     for i in range(3):  # retry 3 times
         try:
+            # ⛔ START timeout
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(10)  # max 10 seconds per request
+
             data = ex.fetch_ohlcv(symbol, tf, limit=100)
+
+            signal.alarm(0)  # ⛔ STOP timeout
+
             df = pd.DataFrame(data, columns=['time','open','high','low','close','volume'])
             return df, ex.id
 
         except Exception as e:
+            signal.alarm(0)  # ensure alarm is cleared
             print(f"Fetch retry {i+1} {symbol} {tf}: {e}")
             time.sleep(2)
 
