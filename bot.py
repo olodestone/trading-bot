@@ -6,7 +6,6 @@ from datetime import datetime
 import os
 
 from strategy import apply_indicators, generate_filtered_signal
-
 from performance import save_trade, check_trade_results, daily_report, ensure_csv
 from performance import send_csv
 
@@ -30,12 +29,51 @@ def send_telegram(msg):
 # ==============================
 # EXCHANGES
 # ==============================
-spot_exchange = ccxt.kucoin({"enableRateLimit": True})
+spot_exchange = ccxt.kucoin({
+    "enableRateLimit": True,
+    "rateLimit": 1200,
+})
 futures_exchange = ccxt.mexc({"enableRateLimit": True})
 
-# ✅ LOAD MARKETS ONCE (IMPORTANT)
 SPOT_MARKETS = spot_exchange.load_markets()
 FUTURES_MARKETS = futures_exchange.load_markets()
+
+# ==============================
+# CACHE (NEW)
+# ==============================
+HTF_CACHE = {}
+HTF_LAST_UPDATE = {}
+
+def get_htf(symbol, tf, market_type):
+    key = f"{symbol}_{tf}_{market_type}"
+    now = time.time()
+
+    refresh_time = 14400 if tf == "4h" else 86400
+
+    if key in HTF_CACHE and (now - HTF_LAST_UPDATE[key] < refresh_time):
+        return HTF_CACHE[key]
+
+    df, _ = fetch_tf(symbol, tf, market_type)
+
+    if df is not None:
+        HTF_CACHE[key] = df
+        HTF_LAST_UPDATE[key] = now
+
+    return df
+
+# ==============================
+# DUPLICATE FILTER (NEW)
+# ==============================
+last_signals = {}
+
+def is_new_signal(pair, signal, entry):
+    key = f"{pair}_{signal}_{round(entry,6)}"
+
+    if key in last_signals:
+        return False
+
+    last_signals[key] = time.time()
+    return True
 
 # ==============================
 # FETCH DATA
@@ -53,8 +91,6 @@ def fetch_tf(symbol, tf, market_type):
 # ==============================
 # GET PRICE
 # ==============================
-# ONLY showing CHANGED parts (rest stays exactly same)
-
 def get_price(symbol, market_type):
     df, _ = fetch_tf(symbol, "15m", market_type)
     if df is None or df.empty:
@@ -62,7 +98,7 @@ def get_price(symbol, market_type):
     return df.iloc[-1]['close']
 
 # ==============================
-# ENTRY CHECK (UPDATED)
+# ENTRY CHECK
 # ==============================
 def entry_hit(symbol, market_type, entry, direction, trade_type):
 
@@ -77,25 +113,19 @@ def entry_hit(symbol, market_type, entry, direction, trade_type):
     tolerance = 0.003
     price = last['close']
 
-    # TREND
     if trade_type == "trend":
-
         if direction == "BUY":
             return price <= entry * (1 + tolerance)
-
         elif direction == "SELL":
             return price >= entry * (1 - tolerance)
 
-    # REVERSAL (STRICT)
     elif trade_type == "reversal":
-
         if direction == "BUY":
             return (
                 price <= entry * (1 + tolerance)
                 and last['close'] > prev['high']
                 and last['close'] > last['open']
             )
-
         elif direction == "SELL":
             return (
                 price >= entry * (1 - tolerance)
@@ -106,7 +136,7 @@ def entry_hit(symbol, market_type, entry, direction, trade_type):
     return False
 
 # ==============================
-# GET PAIRS (OPTIMIZED)
+# GET PAIRS
 # ==============================
 def get_pairs():
     pairs = []
@@ -116,7 +146,7 @@ def get_pairs():
             if "/USDT" in symbol and ":" not in symbol:
 
                 df, _ = fetch_tf(symbol, "1h", "spot")
-                time.sleep(0.2)
+                time.sleep(0.8)
 
                 if df is None or df.empty:
                     continue
@@ -132,7 +162,7 @@ def get_pairs():
             if "/USDT:USDT" in symbol:
 
                 df, _ = fetch_tf(symbol, "1h", "futures")
-                time.sleep(0.5)
+                time.sleep(0.8)
 
                 if df is None or df.empty:
                     continue
@@ -156,12 +186,14 @@ def run_bot():
     signals = []
 
     for symbol, market_type in pairs:
-        time.sleep(0.3)
+        time.sleep(1.2)
 
         df_15m, source = fetch_tf(symbol, "15m", market_type)
         df_1h, _ = fetch_tf(symbol, "1h", market_type)
-        df_4h, _ = fetch_tf(symbol, "4h", market_type)
-        df_1d, _ = fetch_tf(symbol, "1d", market_type)
+
+        # ✅ USING CACHE
+        df_4h = get_htf(symbol, "4h", market_type)
+        df_1d = get_htf(symbol, "1d", market_type)
 
         if any(x is None or x.empty for x in [df_15m, df_1h, df_4h, df_1d]):
             continue
@@ -193,6 +225,11 @@ def run_bot():
     signals = sorted(signals, key=lambda x: x['rr'], reverse=True)[:5]
 
     for s in signals:
+
+        # ✅ DUPLICATE FILTER
+        if not is_new_signal(s['pair'], s['signal'], s['entry']):
+            continue
+
         msg = f"""
 🚀 ELITE SIGNAL
 
@@ -206,14 +243,11 @@ Trade Type: {s['trade_type']}
 """
         print(msg)
 
-# 🔥 ALWAYS SEND SIGNAL (NEW)
         send_telegram("🚀 SIGNAL (waiting for entry)\n" + msg)
 
-# THEN check entry
         if entry_hit(s['pair'], s['market_type'], s['entry'], s['signal'], s['trade_type']):
 
             print(f"✅ ENTRY HIT: {s['pair']}")
-
             send_telegram("✅ ENTRY HIT\n" + msg)
 
             save_trade(
@@ -254,7 +288,7 @@ def main():
             send_csv(TOKEN, CHAT_ID)
             last_report_day = today
 
-        time.sleep(900)
+        time.sleep(1200)  # ✅ 20 minutes
 
 # ==============================
 # START
