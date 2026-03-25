@@ -173,11 +173,11 @@ def get_pairs():
     pairs = []
 
     try:
-        for symbol in SPOT_MARKETS:
+        for symbol in list(SPOT_MARKETS)[:40]:
             if "/USDT" in symbol and ":" not in symbol:
 
                 df = get_cached_tf(symbol, "1h", "spot")
-                time.sleep(0.8)
+                time.sleep(0.6)
 
                 if df is None or df.empty or len(df) < 3:
                     continue
@@ -189,11 +189,12 @@ def get_pairs():
         print("Spot error:", e)
 
     try:
-        for symbol in FUTURES_MARKETS:
+        for symbol in list(FUTURES_MARKETS)[:40]:
+        
             if "/USDT:USDT" in symbol:
 
                 df = get_cached_tf(symbol, "1h", "futures")
-                time.sleep(0.8)
+                time.sleep(0.6)
 
                 if df is None or df.empty or len(df) < 3:
                     continue
