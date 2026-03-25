@@ -288,7 +288,7 @@ def main():
             send_csv(TOKEN, CHAT_ID)
             last_report_day = today
 
-        time.sleep(1200)  # ✅ 20 minutes
+        time.sleep(900)  # 15 minutes
 
 # ==============================
 # START
