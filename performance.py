@@ -130,3 +130,22 @@ Win Rate: {round(winrate,2)}%
 """
 
     send_telegram(msg)
+
+
+import requests
+
+def send_csv(token, chat_id):
+    if not os.path.exists(CSV_FILE):
+        print("CSV not found")
+        return
+
+    url = f"https://api.telegram.org/bot{token}/sendDocument"
+
+    with open(CSV_FILE, "rb") as f:
+        requests.post(
+            url,
+            files={"document": f},
+            data={"chat_id": chat_id}
+        )
+
+    print("📁 CSV sent to Telegram")

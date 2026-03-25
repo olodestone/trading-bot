@@ -8,6 +8,7 @@ import os
 from strategy import apply_indicators, generate_filtered_signal
 
 from performance import save_trade, check_trade_results, daily_report, ensure_csv
+from performance import send_csv
 
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -250,6 +251,7 @@ def main():
         today = datetime.now().date()
         if last_report_day != today:
             daily_report(send_telegram)
+            send_csv(TOKEN, CHAT_ID)
             last_report_day = today
 
         time.sleep(900)
