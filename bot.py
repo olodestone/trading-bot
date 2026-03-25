@@ -35,6 +35,9 @@ spot_exchange = ccxt.kucoin({
 })
 futures_exchange = ccxt.mexc({"enableRateLimit": True})
 
+spot_exchange.options['adjustForTimeDifference'] = True
+futures_exchange.options['adjustForTimeDifference'] = True
+
 SPOT_MARKETS = spot_exchange.load_markets()
 FUTURES_MARKETS = futures_exchange.load_markets()
 
@@ -79,14 +82,20 @@ def is_new_signal(pair, signal, entry):
 # FETCH DATA
 # ==============================
 def fetch_tf(symbol, tf, market_type):
-    try:
-        ex = spot_exchange if market_type == "spot" else futures_exchange
-        data = ex.fetch_ohlcv(symbol, tf, limit=100)
-        df = pd.DataFrame(data, columns=['time','open','high','low','close','volume'])
-        return df, ex.id
-    except Exception as e:
-        print(f"Fetch error {symbol} {tf}: {e}")
-        return None, None
+    ex = spot_exchange if market_type == "spot" else futures_exchange
+
+    for i in range(3):  # retry 3 times
+        try:
+            data = ex.fetch_ohlcv(symbol, tf, limit=100)
+            df = pd.DataFrame(data, columns=['time','open','high','low','close','volume'])
+            return df, ex.id
+
+        except Exception as e:
+            print(f"Fetch retry {i+1} {symbol} {tf}: {e}")
+            time.sleep(2)
+
+    print(f"❌ Final fetch fail {symbol} {tf}")
+    return None, None
 
 # ==============================
 # GET PRICE
@@ -104,7 +113,7 @@ def entry_hit(symbol, market_type, entry, direction, trade_type):
 
     df, _ = fetch_tf(symbol, "15m", market_type)
 
-    if df is None or df.empty:
+    if df is None or df.empty or len(df) < 2:
         return False
 
     last = df.iloc[-1]
@@ -148,11 +157,11 @@ def get_pairs():
                 df, _ = fetch_tf(symbol, "1h", "spot")
                 time.sleep(0.8)
 
-                if df is None or df.empty:
-                    continue
+                if df is None or df.empty or len(df) < 3:
+                   continue
 
-                if df['volume'].iloc[-1] > 1000:
-                    pairs.append((symbol, "spot"))
+                if df['volume'].tail(3).mean() > 5000:
+                        pairs.append((symbol, "spot"))
 
     except Exception as e:
         print("Spot error:", e)
@@ -164,10 +173,10 @@ def get_pairs():
                 df, _ = fetch_tf(symbol, "1h", "futures")
                 time.sleep(0.8)
 
-                if df is None or df.empty:
+                if df is None or df.empty or len(df) < 3:
                     continue
 
-                if df['volume'].iloc[-1] > 1000:
+                if df['volume'].tail(3).mean() > 5000:
                     pairs.append((symbol, "futures"))
 
     except Exception as e:
