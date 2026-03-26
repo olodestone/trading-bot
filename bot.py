@@ -148,6 +148,23 @@ def entry_hit(df, entry, direction, trade_type):
 
     return False
 
+
+def is_not_late_entry(df, entry, direction):
+    if df is None or df.empty:
+        return False
+
+    last = df.iloc[-1]
+    price = last['close']
+
+    max_distance = 0.004  # 0.4% (tweakable)
+
+    distance = abs(price - entry) / entry
+
+    if distance > max_distance:
+        return False
+
+    return True    
+
 # ==============================
 # GET PAIRS
 # ==============================
@@ -182,14 +199,28 @@ def check_pending_trades():
 
         df, _ = fetch_tf(symbol, "15m", market_type)
 
+        # 🔥 Safety check
+        if df is None or df.empty:
+            updated.append(trade)
+            continue
+
         # 🔥 Expiry (24h)
         if datetime.now() - trade['time'] > timedelta(hours=24):
             print(f"❌ Expired: {symbol}")
             continue
 
         if entry_hit(df, trade['entry'], trade['signal'], trade['trade_type']):
+
+            # 🔥 Block late entries FIRST
+            if not is_not_late_entry(df, trade['entry'], trade['signal']):
+                print(f"⚠️ Skipped late entry: {symbol} (price moved too far)")
+                continue
+
+            # ✅ Valid entry
             print(f"✅ ENTRY HIT (DELAYED): {symbol}")
-            send_telegram(f"✅ ENTRY HIT\n{symbol}\nEntry: {trade['entry']}\nRR: {trade['rr']}")
+            send_telegram(
+                f"✅ ENTRY HIT\n{symbol}\nEntry: {trade['entry']}\nRR: {trade['rr']}"
+            )
 
             save_trade(
                 trade['pair'],
@@ -200,6 +231,7 @@ def check_pending_trades():
                 trade['rr'],
                 trade['market_type']
             )
+
         else:
             updated.append(trade)
 
