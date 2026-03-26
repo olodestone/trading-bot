@@ -267,6 +267,17 @@ Trade Type: {trade_type}
     # 🔥 CHECK PENDING EVERY SCAN
     check_pending_trades()
 
+    # ==============================
+# GET PRICE (FIX)
+# ==============================
+def get_price(symbol, market_type):
+    df, _ = fetch_tf(symbol, "15m", market_type)
+
+    if df is None or df.empty:
+        return None
+
+    return df.iloc[-1]['close']
+
 # ==============================
 # LOOP
 # ==============================
