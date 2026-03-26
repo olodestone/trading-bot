@@ -189,7 +189,7 @@ def check_pending_trades():
 
         if entry_hit(df, trade['entry'], trade['signal'], trade['trade_type']):
             print(f"✅ ENTRY HIT (DELAYED): {symbol}")
-            send_telegram(f"✅ ENTRY HIT\n{symbol}")
+            send_telegram(f"✅ ENTRY HIT\n{symbol}\nEntry: {trade['entry']}\nRR: {trade['rr']}")
 
             save_trade(
                 trade['pair'],
@@ -267,8 +267,8 @@ Trade Type: {trade_type}
     # 🔥 CHECK PENDING EVERY SCAN
     check_pending_trades()
 
-    # ==============================
-# GET PRICE (FIX)
+# ==============================
+# GET PRICE (FIX - CORRECT POSITION)
 # ==============================
 def get_price(symbol, market_type):
     df, _ = fetch_tf(symbol, "15m", market_type)
@@ -276,7 +276,7 @@ def get_price(symbol, market_type):
     if df is None or df.empty:
         return None
 
-    return df.iloc[-1]['close']
+    return df.iloc[-1]['close']  
 
 # ==============================
 # LOOP
