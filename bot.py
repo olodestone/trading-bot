@@ -2,7 +2,7 @@ import ccxt
 import pandas as pd
 import time
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import signal
 
@@ -20,7 +20,6 @@ def send_telegram(msg):
     if not TOKEN or not CHAT_ID:
         print("⚠️ Telegram not configured")
         return
-
     try:
         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
         requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
@@ -30,10 +29,7 @@ def send_telegram(msg):
 # ==============================
 # EXCHANGES
 # ==============================
-spot_exchange = ccxt.kucoin({
-    "enableRateLimit": True,
-    "rateLimit": 1200,
-})
+spot_exchange = ccxt.kucoin({"enableRateLimit": True, "rateLimit": 1200})
 futures_exchange = ccxt.mexc({"enableRateLimit": True})
 
 spot_exchange.options['adjustForTimeDifference'] = True
@@ -52,9 +48,8 @@ def get_cached_tf(symbol, tf, market_type):
     key = f"{symbol}_{tf}_{market_type}"
     now = time.time()
 
-    # 🔥 Optimized refresh timing
     if tf == "1h":
-        refresh_time = 900      # 15 mins (NOT 1h)
+        refresh_time = 900
     elif tf == "4h":
         refresh_time = 14400
     elif tf == "1d":
@@ -74,21 +69,24 @@ def get_cached_tf(symbol, tf, market_type):
     return df
 
 # ==============================
+# PENDING TRADES
+# ==============================
+pending_trades = []
+
+# ==============================
 # DUPLICATE FILTER
 # ==============================
 last_signals = {}
 
 def is_new_signal(pair, signal, entry):
     key = f"{pair}_{signal}_{round(entry,6)}"
-
     if key in last_signals:
         return False
-
     last_signals[key] = time.time()
     return True
 
 # ==============================
-# FETCH DATA WITH TIMEOUT
+# FETCH
 # ==============================
 def timeout_handler(signum, frame):
     raise Exception("Timeout")
@@ -102,7 +100,6 @@ def fetch_tf(symbol, tf, market_type):
             signal.alarm(10)
 
             data = ex.fetch_ohlcv(symbol, tf, limit=100)
-
             signal.alarm(0)
 
             df = pd.DataFrame(data, columns=['time','open','high','low','close','volume'])
@@ -110,7 +107,6 @@ def fetch_tf(symbol, tf, market_type):
 
         except Exception as e:
             signal.alarm(0)
-
             if "429" in str(e):
                 print("⚠️ Rate limit hit, cooling down...")
                 time.sleep(10)
@@ -118,48 +114,34 @@ def fetch_tf(symbol, tf, market_type):
             print(f"Fetch retry {i+1} {symbol} {tf}: {e}")
             time.sleep(2)
 
-    print(f"❌ Final fetch fail {symbol} {tf}")
     return None, None
 
 # ==============================
-# GET PRICE
-# ==============================
-def get_price(symbol, market_type):
-    df, _ = fetch_tf(symbol, "15m", market_type)
-    if df is None or df.empty:
-        return None
-    return df.iloc[-1]['close']
-
-# ==============================
-# ENTRY CHECK (FIXED - NO EXTRA API CALL)
+# ENTRY CHECK (HIGH/LOW FIX)
 # ==============================
 def entry_hit(df, entry, direction, trade_type):
-
     if df is None or df.empty or len(df) < 2:
         return False
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    tolerance = 0.003
-    price = last['close']
-
     if trade_type == "trend":
         if direction == "BUY":
-            return price <= entry * (1 + tolerance)
+            return last['low'] <= entry
         elif direction == "SELL":
-            return price >= entry * (1 - tolerance)
+            return last['high'] >= entry
 
     elif trade_type == "reversal":
         if direction == "BUY":
             return (
-                price <= entry * (1 + tolerance)
+                last['low'] <= entry
                 and last['close'] > prev['high']
                 and last['close'] > last['open']
             )
         elif direction == "SELL":
             return (
-                price >= entry * (1 - tolerance)
+                last['high'] >= entry
                 and last['close'] < prev['low']
                 and last['close'] < last['open']
             )
@@ -172,45 +154,62 @@ def entry_hit(df, entry, direction, trade_type):
 def get_pairs():
     pairs = []
 
-    try:
-        for symbol in list(SPOT_MARKETS)[:40]:
-            if "/USDT" in symbol and ":" not in symbol:
+    for symbol in list(SPOT_MARKETS)[:40]:
+        if "/USDT" in symbol and ":" not in symbol:
+            df = get_cached_tf(symbol, "1h", "spot")
+            if df is not None and df['volume'].tail(3).mean() > 5000:
+                pairs.append((symbol, "spot"))
 
-                df = get_cached_tf(symbol, "1h", "spot")
-                time.sleep(0.6)
-
-                if df is None or df.empty or len(df) < 3:
-                    continue
-
-                if df['volume'].tail(3).mean() > 5000:
-                    pairs.append((symbol, "spot"))
-
-    except Exception as e:
-        print("Spot error:", e)
-
-    try:
-        for symbol in list(FUTURES_MARKETS)[:40]:
-        
-            if "/USDT:USDT" in symbol:
-
-                df = get_cached_tf(symbol, "1h", "futures")
-                time.sleep(0.6)
-
-                if df is None or df.empty or len(df) < 3:
-                    continue
-
-                if df['volume'].tail(3).mean() > 5000:
-                    pairs.append((symbol, "futures"))
-
-    except Exception as e:
-        print("Futures error:", e)
+    for symbol in list(FUTURES_MARKETS)[:40]:
+        if "/USDT:USDT" in symbol:
+            df = get_cached_tf(symbol, "1h", "futures")
+            if df is not None and df['volume'].tail(3).mean() > 5000:
+                pairs.append((symbol, "futures"))
 
     return pairs[:8]
+
+# ==============================
+# CHECK PENDING TRADES
+# ==============================
+def check_pending_trades():
+    global pending_trades
+
+    updated = []
+
+    for trade in pending_trades:
+        symbol = trade['pair']
+        market_type = trade['market_type']
+
+        df, _ = fetch_tf(symbol, "15m", market_type)
+
+        # 🔥 Expiry (24h)
+        if datetime.now() - trade['time'] > timedelta(hours=24):
+            print(f"❌ Expired: {symbol}")
+            continue
+
+        if entry_hit(df, trade['entry'], trade['signal'], trade['trade_type']):
+            print(f"✅ ENTRY HIT (DELAYED): {symbol}")
+            send_telegram(f"✅ ENTRY HIT\n{symbol}")
+
+            save_trade(
+                trade['pair'],
+                trade['signal'],
+                trade['entry'],
+                trade['sl'],
+                trade['tp'],
+                trade['rr'],
+                trade['market_type']
+            )
+        else:
+            updated.append(trade)
+
+    pending_trades = updated
 
 # ==============================
 # MAIN SCAN
 # ==============================
 def run_bot():
+    global pending_trades
 
     print(f"\n🚀 Scan: {datetime.now()}\n")
 
@@ -218,10 +217,7 @@ def run_bot():
     signals = []
 
     for symbol, market_type in pairs:
-        time.sleep(1.5)
-
         df_15m, source = fetch_tf(symbol, "15m", market_type)
-
         df_1h = get_cached_tf(symbol, "1h", market_type)
         df_4h = get_cached_tf(symbol, "4h", market_type)
         df_1d = get_cached_tf(symbol, "1d", market_type)
@@ -235,15 +231,29 @@ def run_bot():
         df_1d = apply_indicators(df_1d)
 
         result = generate_filtered_signal(df_15m, df_1h, df_4h, df_1d)
-
         if not result:
             continue
 
         signal, entry, sl, tp, rr, trade_type = result
 
-        signals.append({
+        if not is_new_signal(symbol, signal, entry):
+            continue
+
+        msg = f"""
+🚀 ELITE SIGNAL
+Pair: {symbol}
+Signal: {signal}
+Entry: {entry}
+SL: {sl}
+TP: {tp}
+RR: {rr}
+Trade Type: {trade_type}
+"""
+
+        send_telegram(msg)
+
+        pending_trades.append({
             "pair": symbol,
-            "exchange": source,
             "signal": signal,
             "entry": entry,
             "sl": sl,
@@ -251,65 +261,23 @@ def run_bot():
             "rr": rr,
             "market_type": market_type,
             "trade_type": trade_type,
-            "df_15m": df_15m
+            "time": datetime.now()
         })
 
-    signals = sorted(signals, key=lambda x: x['rr'], reverse=True)[:5]
-
-    for s in signals:
-
-        if not is_new_signal(s['pair'], s['signal'], s['entry']):
-            continue
-
-        msg = f"""
-🚀 ELITE SIGNAL
-
-Pair: {s['pair']}
-Signal: {s['signal']}
-Entry: {round(s['entry'],6)}
-SL: {round(s['sl'],6)}
-TP: {round(s['tp'],6)}
-RR: {s['rr']}
-Trade Type: {s['trade_type']}
-"""
-
-        print(msg)
-        send_telegram("🚀 SIGNAL (waiting for entry)\n" + msg)
-
-        if entry_hit(s['df_15m'], s['entry'], s['signal'], s['trade_type']):
-
-            print(f"✅ ENTRY HIT: {s['pair']}")
-            send_telegram("✅ ENTRY HIT\n" + msg)
-
-            save_trade(
-                s['pair'],
-                s['signal'],
-                s['entry'],
-                s['sl'],
-                s['tp'],
-                s['rr'],
-                s['market_type']
-            )
-        else:
-            print(f"⏳ Waiting for entry: {s['pair']}")
+    # 🔥 CHECK PENDING EVERY SCAN
+    check_pending_trades()
 
 # ==============================
 # LOOP
 # ==============================
 def main():
-
     ensure_csv()
-    print("📁 CSV FILE LOCATION:", os.path.join(os.getcwd(), "performance.csv"))
-
     last_report_day = None
 
     while True:
         run_bot()
 
-        check_trade_results(
-            get_price,
-            send_telegram
-        )
+        check_trade_results(get_price, send_telegram)
 
         today = datetime.now().date()
         if last_report_day != today:
@@ -319,7 +287,6 @@ def main():
 
         print("⏳ Sleeping for 15 minutes...")
         time.sleep(900)
-        print("🔄 Next scan starting...")
 
 # ==============================
 # START
