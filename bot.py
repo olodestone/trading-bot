@@ -268,6 +268,11 @@ def run_bot():
 
         signal, entry, sl, tp, rr, trade_type = result
 
+        # 🔥 BLOCK MULTIPLE TRADES PER PAIR
+        if any(t['pair'] == symbol for t in pending_trades):
+            print(f"⚠️ Skipping {symbol} (already has active trade)")
+            continue
+
         if not is_new_signal(symbol, signal, entry):
             continue
 
