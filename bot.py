@@ -43,6 +43,8 @@ FUTURES_MARKETS = futures_exchange.load_markets()
 # ==============================
 HTF_CACHE = {}
 HTF_LAST_UPDATE = {}
+PRICE_CACHE = {}
+MARKET_DATA = {}
 
 def get_cached_tf(symbol, tf, market_type):
     key = f"{symbol}_{tf}_{market_type}"
@@ -92,6 +94,12 @@ def timeout_handler(signum, frame):
     raise Exception("Timeout")
 
 def fetch_tf(symbol, tf, market_type):
+    key = f"{symbol}_{tf}_{market_type}"
+
+    # ✅ RETURN FROM CACHE (NO DUPLICATE CALLS)
+    if key in MARKET_DATA:
+        return MARKET_DATA[key]
+
     ex = spot_exchange if market_type == "spot" else futures_exchange
 
     for i in range(2):
@@ -103,6 +111,10 @@ def fetch_tf(symbol, tf, market_type):
             signal.alarm(0)
 
             df = pd.DataFrame(data, columns=['time','open','high','low','close','volume'])
+
+            # ✅ SAVE TO CACHE
+            MARKET_DATA[key] = (df, ex.id)
+
             return df, ex.id
 
         except Exception as e:
@@ -183,7 +195,7 @@ def get_pairs():
             if df is not None and df['volume'].tail(3).mean() > 5000:
                 pairs.append((symbol, "futures"))
 
-    return pairs[:8]
+    return pairs[:12]
 
 # ==============================
 # CHECK PENDING TRADES
@@ -197,7 +209,20 @@ def check_pending_trades():
         symbol = trade['pair']
         market_type = trade['market_type']
 
-        df, _ = fetch_tf(symbol, "15m", market_type)
+        price = get_price(symbol, market_type)
+
+        if price is None:
+            updated.append(trade)
+            continue
+
+# recreate minimal df-like structure for logic
+        key = f"{symbol}_15m_{market_type}"
+
+        if key not in MARKET_DATA:
+            updated.append(trade)
+            continue
+
+        df, _ = MARKET_DATA[key]
 
         # 🔥 Safety check
         if df is None or df.empty:
@@ -240,13 +265,15 @@ def check_pending_trades():
 # ==============================
 # MAIN SCAN
 # ==============================
+# ==============================
+# MAIN SCAN
+# ==============================
 def run_bot():
     global pending_trades
 
     print(f"\n🚀 Scan: {datetime.now()}\n")
 
     pairs = get_pairs()
-    signals = []
 
     for symbol, market_type in pairs:
         df_15m, source = fetch_tf(symbol, "15m", market_type)
@@ -268,10 +295,21 @@ def run_bot():
 
         signal, entry, sl, tp, rr, trade_type = result
 
-        # 🔥 BLOCK MULTIPLE TRADES PER PAIR
+        # 🔥 BLOCK if already pending
         if any(t['pair'] == symbol for t in pending_trades):
-            print(f"⚠️ Skipping {symbol} (already has active trade)")
+            print(f"⚠️ Skipping {symbol} (already has pending trade)")
             continue
+
+        # 🔥 BLOCK if already active in performance.csv
+        try:
+            df_perf = pd.read_csv("performance.csv")
+            active_pairs = df_perf[df_perf["status"] == "open"]["pair"].values
+
+            if symbol in active_pairs:
+                print(f"⚠️ Skipping {symbol} (already active trade)")
+                continue
+        except:
+            pass
 
         if not is_new_signal(symbol, signal, entry):
             continue
@@ -308,12 +346,17 @@ Trade Type: {trade_type}
 # GET PRICE (FIX - CORRECT POSITION)
 # ==============================
 def get_price(symbol, market_type):
-    df, _ = fetch_tf(symbol, "15m", market_type)
+    key = f"{symbol}_15m_{market_type}"
+
+    if key not in MARKET_DATA:
+        return None
+
+    df, _ = MARKET_DATA[key]
 
     if df is None or df.empty:
         return None
 
-    return df.iloc[-1]['close']  
+    return df.iloc[-1]['close']
 
 # ==============================
 # LOOP
@@ -322,7 +365,12 @@ def main():
     ensure_csv()
     last_report_day = None
 
+    global PRICE_CACHE, MARKET_DATA
+
     while True:
+        MARKET_DATA = {}   # 🔥 reset per cycle
+        PRICE_CACHE = {}
+
         run_bot()
 
         check_trade_results(get_price, send_telegram)
