@@ -253,9 +253,9 @@ def get_price(symbol, market_type):
 # ==============================
 def momentum_score(symbol, market_type):
     """
-    Score = ATR% * avg_volume (last 3 candles on 1h).
-    High score = high volatility + high liquidity = best trading candidates.
-    Minimum volume threshold filters illiquid pairs.
+    Score = ATR% * USDT volume (last 3 candles on 1h).
+    Volume is USDT-denominated to filter micro-caps with large coin supply
+    but negligible real liquidity (e.g. BTT, WIN, MTV).
     """
     df = get_cached_tf(symbol, "1h", market_type)
     if df is None or len(df) < 20:
@@ -265,8 +265,8 @@ def momentum_score(symbol, market_type):
     if close <= 0:
         return 0
 
-    vol_avg = df['volume'].tail(3).mean()
-    if vol_avg < 8000:  # minimum liquidity gate
+    vol_avg_usdt = df['volume'].tail(3).mean() * close
+    if vol_avg_usdt < 500_000:  # $500K USDT per candle minimum
         return 0
 
     hl = df['high'] - df['low']
@@ -276,7 +276,7 @@ def momentum_score(symbol, market_type):
     atr = tr.rolling(14).mean().iloc[-1]
 
     atr_pct = (atr / close) * 100
-    return atr_pct * vol_avg
+    return atr_pct * vol_avg_usdt
 
 
 def get_pairs():
