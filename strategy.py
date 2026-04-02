@@ -185,6 +185,43 @@ def is_engulfing(df, direction):
 
 
 # ==============================
+# STRUCTURE LEVELS
+# ==============================
+def swing_highs(df, order=2):
+    """Candles where high is greater than `order` neighbours on each side."""
+    highs = df['high'].values
+    result = []
+    for i in range(order, len(highs) - order):
+        if all(highs[i] > highs[i - j] for j in range(1, order + 1)) and \
+           all(highs[i] > highs[i + j] for j in range(1, order + 1)):
+            result.append(highs[i])
+    return result
+
+
+def swing_lows(df, order=2):
+    """Candles where low is less than `order` neighbours on each side."""
+    lows = df['low'].values
+    result = []
+    for i in range(order, len(lows) - order):
+        if all(lows[i] < lows[i - j] for j in range(1, order + 1)) and \
+           all(lows[i] < lows[i + j] for j in range(1, order + 1)):
+            result.append(lows[i])
+    return result
+
+
+def nearest_resistance(df_1h, entry):
+    """Nearest swing high above entry on the 1h chart — used as TP target."""
+    levels = [h for h in swing_highs(df_1h) if h > entry * 1.001]
+    return min(levels) if levels else None
+
+
+def nearest_support(df_1h, entry):
+    """Nearest swing low below entry on the 1h chart — used as TP target."""
+    levels = [l for l in swing_lows(df_1h) if l < entry * 0.999]
+    return max(levels) if levels else None
+
+
+# ==============================
 # TREND ENTRY SIGNAL
 # ==============================
 def entry_signal_trend(df_15m, df_1h, direction):
@@ -196,18 +233,29 @@ def entry_signal_trend(df_15m, df_1h, direction):
         return None
 
     if direction == "BUY":
-        if last['ema9'] < last['ema21']:        # LTF uptrend required
+        if last['ema9'] < last['ema21']:            # LTF uptrend required
             return None
-        if last['stoch_k'] > 72:                # Skip overbought entries
+        if last['stoch_k'] > 72:                    # Skip overbought entries
             return None
-        if last_1h['macd_hist'] <= 0:           # 1h MACD must be bullish
+        if last_1h['macd_hist'] <= 0:               # 1h MACD must be bullish
             return None
         if last['volume'] < last['vol_ma'] * 1.15:  # Volume confirmation
             return None
 
         entry = last['close']
-        sl = entry - (1.5 * atr)
-        tp = entry + (3.5 * atr)                # ~2.33 RR
+
+        # SL: below the recent structural swing low (last 20 candles on 15m)
+        # with a 0.3 ATR buffer so we don't sit right at the level
+        sl = df_15m['low'].tail(20).min() - (0.3 * atr)
+        risk = entry - sl
+        if risk <= 0:
+            return None
+
+        # TP: nearest resistance the market has already shown on 1h
+        tp = nearest_resistance(df_1h, entry)
+        if tp is None:
+            return None
+        reward = tp - entry
 
     elif direction == "SELL":
         if last['ema9'] > last['ema21']:
@@ -220,16 +268,23 @@ def entry_signal_trend(df_15m, df_1h, direction):
             return None
 
         entry = last['close']
-        sl = entry + (1.5 * atr)
-        tp = entry - (3.5 * atr)
+
+        # SL: above the recent structural swing high (last 20 candles on 15m)
+        sl = df_15m['high'].tail(20).max() + (0.3 * atr)
+        risk = sl - entry
+        if risk <= 0:
+            return None
+
+        # TP: nearest support the market has already shown on 1h
+        tp = nearest_support(df_1h, entry)
+        if tp is None:
+            return None
+        reward = entry - tp
 
     else:
         return None
 
-    risk = abs(entry - sl)
-    reward = abs(tp - entry)
-
-    if risk <= 0 or reward <= 0:
+    if reward <= 0:
         return None
 
     rr = round(reward / risk, 2)
@@ -245,7 +300,8 @@ def entry_signal_trend(df_15m, df_1h, direction):
 def entry_signal_reversal(df_15m, df_1h, direction):
     """
     Reversal entries require engulfing pattern + extreme StochRSI + strong volume.
-    Tighter SL multiplier (1.2x ATR) for better RR.
+    SL is placed behind the engulfing candle itself — the candle defines the
+    invalidation point. TP is the nearest structural level on 1h.
     """
     if not is_engulfing(df_15m, direction):
         return None
@@ -257,14 +313,24 @@ def entry_signal_reversal(df_15m, df_1h, direction):
         return None
 
     if direction == "BUY":
-        if last['stoch_k'] > 35:               # Must come from oversold
+        if last['stoch_k'] > 35:                    # Must come from oversold
             return None
         if last['volume'] < last['vol_ma'] * 1.3:
             return None
 
         entry = last['close']
-        sl = entry - (1.2 * atr)
-        tp = entry + (3.0 * atr)               # 2.5 RR
+
+        # SL: below the engulfing candle's low — that candle IS the reversal,
+        # if price trades below it the setup is invalidated
+        sl = last['low'] - (0.3 * atr)
+        risk = entry - sl
+        if risk <= 0:
+            return None
+
+        tp = nearest_resistance(df_1h, entry)
+        if tp is None:
+            return None
+        reward = tp - entry
 
     elif direction == "SELL":
         if last['stoch_k'] < 65:
@@ -273,16 +339,22 @@ def entry_signal_reversal(df_15m, df_1h, direction):
             return None
 
         entry = last['close']
-        sl = entry + (1.2 * atr)
-        tp = entry - (3.0 * atr)
+
+        # SL: above the engulfing candle's high
+        sl = last['high'] + (0.3 * atr)
+        risk = sl - entry
+        if risk <= 0:
+            return None
+
+        tp = nearest_support(df_1h, entry)
+        if tp is None:
+            return None
+        reward = entry - tp
 
     else:
         return None
 
-    risk = abs(entry - sl)
-    reward = abs(tp - entry)
-
-    if risk <= 0 or reward <= 0:
+    if reward <= 0:
         return None
 
     rr = round(reward / risk, 2)
