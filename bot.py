@@ -9,8 +9,9 @@ from strategy import apply_indicators, generate_filtered_signal
 from performance import (
     save_trade, check_trade_results, daily_report,
     ensure_csv, save_pending_trades, load_pending_trades,
+    get_daily_losses, get_engine, TRADES_TABLE,
 )
-from logger import send_telegram, send_csv, TOKEN, CHAT_ID
+from logger import send_telegram, send_csv, get_updates, TOKEN, CHAT_ID
 
 
 # ==============================
@@ -24,6 +25,24 @@ futures_exchange.options['adjustForTimeDifference'] = True
 
 SPOT_MARKETS = spot_exchange.load_markets()
 FUTURES_MARKETS = futures_exchange.load_markets()
+
+MARKET_REFRESH_INTERVAL = 86400  # 24 hours
+last_market_refresh = time.time()
+
+
+# ==============================
+# MARKET REFRESH
+# ==============================
+def refresh_markets_if_needed():
+    global SPOT_MARKETS, FUTURES_MARKETS, last_market_refresh
+    if time.time() - last_market_refresh > MARKET_REFRESH_INTERVAL:
+        try:
+            SPOT_MARKETS = spot_exchange.load_markets()
+            FUTURES_MARKETS = futures_exchange.load_markets()
+            last_market_refresh = time.time()
+            print("🔄 Markets refreshed")
+        except Exception as e:
+            print(f"Market refresh error: {e}")
 
 
 # ==============================
@@ -54,15 +73,112 @@ def get_cached_tf(symbol, tf, market_type):
 # PENDING TRADES + DEDUP
 # ==============================
 pending_trades = []
-last_signals = {}
+last_signals = {}  # key: "pair_signal_date" → True
 
 
-def is_new_signal(pair, sig, entry):
-    key = f"{pair}_{sig}_{round(entry, 6)}"
+def is_new_signal(pair, sig):
+    today = str(datetime.now().date())
+    key = f"{pair}_{sig}_{today}"
     if key in last_signals:
         return False
-    last_signals[key] = time.time()
+    last_signals[key] = True
     return True
+
+
+def prune_last_signals():
+    """Remove entries from previous days."""
+    today = str(datetime.now().date())
+    stale = [k for k in last_signals if not k.endswith(today)]
+    for k in stale:
+        del last_signals[k]
+
+
+# ==============================
+# CAPACITY + DAILY LOSS GUARDS
+# ==============================
+MAX_CONCURRENT = 5
+MAX_DAILY_LOSSES = 3
+
+
+def at_max_capacity():
+    open_count = 0
+    try:
+        engine = get_engine()
+        df = pd.read_sql(
+            f"SELECT COUNT(*) as cnt FROM {TRADES_TABLE} WHERE status = 'OPEN'", engine
+        )
+        open_count = int(df['cnt'].iloc[0])
+    except Exception:
+        pass
+    return len(pending_trades) + open_count >= MAX_CONCURRENT
+
+
+def daily_loss_limit_hit():
+    return get_daily_losses() >= MAX_DAILY_LOSSES
+
+
+# ==============================
+# TELEGRAM COMMAND HANDLING
+# ==============================
+last_update_id = 0
+
+
+def check_telegram_commands():
+    global pending_trades, last_update_id
+    updates = get_updates(last_update_id + 1)
+    for update in updates:
+        last_update_id = update["update_id"]
+        msg = update.get("message", {})
+        text = msg.get("text", "").strip()
+        chat = str(msg.get("chat", {}).get("id", ""))
+
+        if chat != str(CHAT_ID):
+            continue  # ignore messages from other chats
+
+        if text == "/status":
+            _handle_status()
+        elif text == "/help":
+            send_telegram(
+                "📖 Commands:\n"
+                "/status — open & pending trades\n"
+                "/cancel SYMBOL — remove pending signal\n"
+                "/help — this message"
+            )
+        elif text.startswith("/cancel "):
+            symbol = text.split(" ", 1)[1].strip().upper()
+            _handle_cancel(symbol)
+
+
+def _handle_status():
+    try:
+        engine = get_engine()
+        df = pd.read_sql(
+            f"SELECT pair, signal, entry, rr FROM {TRADES_TABLE} WHERE status = 'OPEN'", engine
+        )
+        open_list = (
+            "\n".join(f"  {r['pair']} {r['signal']} @ {r['entry']:.6f} RR:{r['rr']}"
+                      for _, r in df.iterrows())
+            or "  None"
+        )
+        pend_list = (
+            "\n".join(f"  {t['pair']} {t['signal']} @ {t['entry']:.6f}"
+                      for t in pending_trades)
+            or "  None"
+        )
+        send_telegram(f"📊 STATUS\n\nOpen:\n{open_list}\n\nPending:\n{pend_list}")
+    except Exception as e:
+        send_telegram(f"Status error: {e}")
+
+
+def _handle_cancel(symbol):
+    global pending_trades
+    before = len(pending_trades)
+    pending_trades = [t for t in pending_trades if t['pair'] != symbol]
+    if len(pending_trades) < before:
+        save_pending_trades(pending_trades)
+        send_telegram(f"✅ Cancelled pending: {symbol}")
+    else:
+        send_telegram(f"⚠️ No pending trade for: {symbol}")
 
 
 # ==============================
@@ -261,8 +377,16 @@ def check_pending_trades():
 def run_bot():
     global pending_trades
 
+    prune_last_signals()
+
+    if at_max_capacity():
+        print(f"⚠️ Max concurrent trades ({MAX_CONCURRENT}) reached, skipping scan")
+        check_pending_trades()
+        return
+
     print(f"\n🚀 Scan: {datetime.now()}\n")
 
+    refresh_markets_if_needed()
     pairs = get_pairs()
 
     for symbol, market_type in pairs:
@@ -295,8 +419,6 @@ def run_bot():
 
         # Skip if already active in DB
         try:
-            from performance import get_engine, TRADES_TABLE
-            import sqlalchemy
             engine = get_engine()
             active = pd.read_sql(
                 f"SELECT pair FROM {TRADES_TABLE} WHERE status = 'OPEN' AND pair = %(pair)s",
@@ -308,7 +430,7 @@ def run_bot():
         except Exception:
             pass
 
-        if not is_new_signal(symbol, sig, entry):
+        if not is_new_signal(symbol, sig):
             continue
 
         msg = f"""
@@ -358,7 +480,13 @@ def main():
             MARKET_DATA = {}
             PRICE_CACHE = {}
 
-            run_bot()
+            check_telegram_commands()
+
+            if daily_loss_limit_hit():
+                print(f"🛑 Daily loss limit ({MAX_DAILY_LOSSES}) hit — skipping new signals")
+            else:
+                run_bot()
+
             check_trade_results(get_price, send_telegram)
 
             today = datetime.now().date()

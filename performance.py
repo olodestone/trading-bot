@@ -121,21 +121,32 @@ def load_pending_trades():
 
 
 # ==============================
+# DAILY LOSS COUNT
+# ==============================
+def get_daily_losses():
+    engine = get_engine()
+    try:
+        df = pd.read_sql(f"SELECT time, status FROM {TRADES_TABLE}", engine)
+        df['time'] = pd.to_datetime(df['time'], errors='coerce')
+        today = datetime.utcnow().date()
+        return len(df[(df['time'].dt.date == today) & (df['status'] == 'LOSS')])
+    except Exception:
+        return 0
+
+
+# ==============================
 # TP/SL + BREAKEVEN + TRAILING
 # ==============================
 def check_trade_results(fetch_price_func, send_telegram):
     ensure_csv()
     engine = get_engine()
-    df = pd.read_sql(f"SELECT * FROM {TRADES_TABLE}", engine)
+    df = pd.read_sql(f"SELECT * FROM {TRADES_TABLE} WHERE status = 'OPEN'", engine)
     if df.empty:
         return
 
-    updated = False
+    updates = []  # list of (row_time, row_pair, changes_dict)
 
-    for i, row in df.iterrows():
-        if row['status'] != "OPEN":
-            continue
-
+    for _, row in df.iterrows():
         try:
             price = fetch_price_func(row['pair'], row['market_type'])
         except Exception as e:
@@ -154,63 +165,64 @@ def check_trade_results(fetch_price_func, send_telegram):
         be_activated = bool(row['be_activated'])
         risk = abs(entry - sl)
         sig = row['signal']
+        changes = {}
 
         if sig == "BUY":
             if not be_activated and price >= entry + risk:
-                df.at[i, 'trail_sl'] = entry
-                df.at[i, 'be_activated'] = True
+                changes['trail_sl'] = entry
+                changes['be_activated'] = True
                 trail_sl = entry
                 be_activated = True
-                updated = True
                 send_telegram(f"🔒 BE ACTIVATED: {row['pair']} @ {entry:.6f}")
 
             elif be_activated and price >= entry + 2 * risk:
                 new_trail = price - (1.2 * risk)
                 if new_trail > trail_sl:
-                    df.at[i, 'trail_sl'] = round(new_trail, 8)
+                    changes['trail_sl'] = round(new_trail, 8)
                     trail_sl = new_trail
-                    updated = True
 
             if price <= trail_sl:
-                status = "BE_WIN" if be_activated else "LOSS"
-                df.at[i, 'status'] = status
+                changes['status'] = "BE_WIN" if be_activated else "LOSS"
                 label = "🔒 TRAIL CLOSED" if be_activated else "❌ SL HIT"
                 send_telegram(f"{label}: {row['pair']}")
-                updated = True
             elif price >= tp:
-                df.at[i, 'status'] = "WIN"
+                changes['status'] = "WIN"
                 send_telegram(f"✅ TP HIT: {row['pair']}")
-                updated = True
 
         elif sig == "SELL":
             if not be_activated and price <= entry - risk:
-                df.at[i, 'trail_sl'] = entry
-                df.at[i, 'be_activated'] = True
+                changes['trail_sl'] = entry
+                changes['be_activated'] = True
                 trail_sl = entry
                 be_activated = True
-                updated = True
                 send_telegram(f"🔒 BE ACTIVATED: {row['pair']} @ {entry:.6f}")
 
             elif be_activated and price <= entry - 2 * risk:
                 new_trail = price + (1.2 * risk)
                 if new_trail < trail_sl:
-                    df.at[i, 'trail_sl'] = round(new_trail, 8)
+                    changes['trail_sl'] = round(new_trail, 8)
                     trail_sl = new_trail
-                    updated = True
 
             if price >= trail_sl:
-                status = "BE_WIN" if be_activated else "LOSS"
-                df.at[i, 'status'] = status
+                changes['status'] = "BE_WIN" if be_activated else "LOSS"
                 label = "🔒 TRAIL CLOSED" if be_activated else "❌ SL HIT"
                 send_telegram(f"{label}: {row['pair']}")
-                updated = True
             elif price <= tp:
-                df.at[i, 'status'] = "WIN"
+                changes['status'] = "WIN"
                 send_telegram(f"✅ TP HIT: {row['pair']}")
-                updated = True
 
-    if updated:
-        df.to_sql(TRADES_TABLE, engine, if_exists="replace", index=False)
+        if changes:
+            updates.append((str(row['time']), row['pair'], changes))
+
+    if updates:
+        with engine.connect() as conn:
+            for row_time, row_pair, changes in updates:
+                set_clause = ", ".join(f"{k} = :{k}" for k in changes)
+                conn.execute(
+                    text(f"UPDATE {TRADES_TABLE} SET {set_clause} WHERE time = :t AND pair = :p"),
+                    {**changes, "t": row_time, "p": row_pair}
+                )
+            conn.commit()
 
 
 # ==============================

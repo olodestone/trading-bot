@@ -44,3 +44,19 @@ def send_csv(token, chat_id):
         print("📁 CSV sent to Telegram")
     except Exception as e:
         print("send_csv error:", e)
+
+
+# ==============================
+# POLL FOR INCOMING COMMANDS
+# ==============================
+def get_updates(offset):
+    if not TOKEN:
+        return []
+    try:
+        url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
+        resp = requests.get(url, params={"offset": offset, "timeout": 0}, timeout=10)
+        data = resp.json()
+        return data.get("result", []) if data.get("ok") else []
+    except Exception as e:
+        print(f"getUpdates error: {e}")
+        return []
