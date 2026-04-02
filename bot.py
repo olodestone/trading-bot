@@ -182,6 +182,22 @@ def _handle_cancel(symbol):
 
 
 # ==============================
+# PRICE FORMATTER
+# ==============================
+def _fmt_price(p):
+    if p >= 1000:
+        return f"{p:,.2f}"
+    elif p >= 1:
+        return f"{p:.4f}"
+    elif p >= 0.01:
+        return f"{p:.6f}"
+    elif p >= 0.0001:
+        return f"{p:.8f}"
+    else:
+        return f"{p:.10f}"
+
+
+# ==============================
 # FETCH
 # ==============================
 def timeout_handler(signum, frame):
@@ -357,8 +373,18 @@ def check_pending_trades():
                 continue
 
             print(f"✅ ENTRY HIT: {symbol}")
+            direction = "LONG" if trade['signal'] == "BUY" else "SHORT"
+            market_label = "Spot" if trade['market_type'] == "spot" else "Futures"
             send_telegram(
-                f"✅ ENTRY HIT\n{symbol}\nEntry: {trade['entry']:.6f}\nRR: {trade['rr']}"
+                f"✅ ENTRY TRIGGERED\n"
+                f"{'─' * 22}\n"
+                f"{symbol}  {direction}  [{market_label}]\n\n"
+                f"Entry   {_fmt_price(trade['entry'])}\n"
+                f"SL      {_fmt_price(trade['sl'])}\n"
+                f"TP      {_fmt_price(trade['tp'])}\n"
+                f"RR      1 : {trade['rr']}\n"
+                f"{'─' * 22}\n"
+                f"🔔 Trade is now live. Managing SL/TP."
             )
             save_trade(
                 trade['pair'], trade['signal'], trade['entry'],
@@ -433,17 +459,27 @@ def run_bot():
         if not is_new_signal(symbol, sig):
             continue
 
-        msg = f"""
-🎯 SIGNAL
-Pair:   {symbol}
-Signal: {sig}
-Entry:  {entry:.6f}
-SL:     {sl:.6f}
-TP:     {tp:.6f}
-RR:     {rr}
-Type:   {trade_type}
-ATR:    {atr:.6f}
-"""
+        sl_pct = abs(sl - entry) / entry * 100
+        tp_pct = abs(tp - entry) / entry * 100
+        direction = "🟢 LONG" if sig == "BUY" else "🔴 SHORT"
+        exchange = "KuCoin" if market_type == "spot" else "MEXC"
+        market_label = f"{'Spot' if market_type == 'spot' else 'Futures'} · {exchange}"
+        now_str = datetime.utcnow().strftime("%d %b %Y · %H:%M UTC")
+
+        msg = (
+            f"{'─' * 22}\n"
+            f"{direction}  [{trade_type.upper()}]\n"
+            f"{'─' * 22}\n"
+            f"Pair    {symbol}\n"
+            f"Market  {market_label}\n"
+            f"Time    {now_str}\n\n"
+            f"Entry   {_fmt_price(entry)}\n"
+            f"SL      {_fmt_price(sl)}  (▼ {sl_pct:.2f}%)\n"
+            f"TP      {_fmt_price(tp)}  (▲ {tp_pct:.2f}%)\n"
+            f"RR      1 : {rr}\n"
+            f"{'─' * 22}\n"
+            f"⏳ Pending — waiting for entry to trigger"
+        )
         print(msg)
         send_telegram(msg)
 

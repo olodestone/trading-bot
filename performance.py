@@ -5,6 +5,19 @@ from sqlalchemy import create_engine, text
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
+
+def _fmt(p):
+    if p >= 1000:
+        return f"{p:,.2f}"
+    elif p >= 1:
+        return f"{p:.4f}"
+    elif p >= 0.01:
+        return f"{p:.6f}"
+    elif p >= 0.0001:
+        return f"{p:.8f}"
+    else:
+        return f"{p:.10f}"
+
 TRADES_TABLE = "trades"
 PENDING_TABLE = "pending_trades"
 
@@ -167,13 +180,20 @@ def check_trade_results(fetch_price_func, send_telegram):
         sig = row['signal']
         changes = {}
 
+        pair = row['pair']
+        direction = "LONG" if sig == "BUY" else "SHORT"
+
         if sig == "BUY":
             if not be_activated and price >= entry + risk:
                 changes['trail_sl'] = entry
                 changes['be_activated'] = True
                 trail_sl = entry
                 be_activated = True
-                send_telegram(f"🔒 BE ACTIVATED: {row['pair']} @ {entry:.6f}")
+                send_telegram(
+                    f"🔒 BREAKEVEN SET\n"
+                    f"{pair}  {direction}\n"
+                    f"SL moved to entry @ {_fmt(entry)}"
+                )
 
             elif be_activated and price >= entry + 2 * risk:
                 new_trail = price - (1.2 * risk)
@@ -183,11 +203,26 @@ def check_trade_results(fetch_price_func, send_telegram):
 
             if price <= trail_sl:
                 changes['status'] = "BE_WIN" if be_activated else "LOSS"
-                label = "🔒 TRAIL CLOSED" if be_activated else "❌ SL HIT"
-                send_telegram(f"{label}: {row['pair']}")
+                if be_activated:
+                    send_telegram(
+                        f"🔒 TRAIL STOP CLOSED\n"
+                        f"{pair}  {direction}\n"
+                        f"Exit @ {_fmt(price)}  (protected by BE)"
+                    )
+                else:
+                    send_telegram(
+                        f"❌ STOP LOSS HIT\n"
+                        f"{pair}  {direction}\n"
+                        f"Exit @ {_fmt(price)}"
+                    )
             elif price >= tp:
                 changes['status'] = "WIN"
-                send_telegram(f"✅ TP HIT: {row['pair']}")
+                pnl_pct = abs(tp - entry) / entry * 100
+                send_telegram(
+                    f"✅ TAKE PROFIT HIT\n"
+                    f"{pair}  {direction}\n"
+                    f"Exit @ {_fmt(tp)}  (+{pnl_pct:.2f}%)  RR 1:{row['rr']}"
+                )
 
         elif sig == "SELL":
             if not be_activated and price <= entry - risk:
@@ -195,7 +230,11 @@ def check_trade_results(fetch_price_func, send_telegram):
                 changes['be_activated'] = True
                 trail_sl = entry
                 be_activated = True
-                send_telegram(f"🔒 BE ACTIVATED: {row['pair']} @ {entry:.6f}")
+                send_telegram(
+                    f"🔒 BREAKEVEN SET\n"
+                    f"{pair}  {direction}\n"
+                    f"SL moved to entry @ {_fmt(entry)}"
+                )
 
             elif be_activated and price <= entry - 2 * risk:
                 new_trail = price + (1.2 * risk)
@@ -205,11 +244,26 @@ def check_trade_results(fetch_price_func, send_telegram):
 
             if price >= trail_sl:
                 changes['status'] = "BE_WIN" if be_activated else "LOSS"
-                label = "🔒 TRAIL CLOSED" if be_activated else "❌ SL HIT"
-                send_telegram(f"{label}: {row['pair']}")
+                if be_activated:
+                    send_telegram(
+                        f"🔒 TRAIL STOP CLOSED\n"
+                        f"{pair}  {direction}\n"
+                        f"Exit @ {_fmt(price)}  (protected by BE)"
+                    )
+                else:
+                    send_telegram(
+                        f"❌ STOP LOSS HIT\n"
+                        f"{pair}  {direction}\n"
+                        f"Exit @ {_fmt(price)}"
+                    )
             elif price <= tp:
                 changes['status'] = "WIN"
-                send_telegram(f"✅ TP HIT: {row['pair']}")
+                pnl_pct = abs(tp - entry) / entry * 100
+                send_telegram(
+                    f"✅ TAKE PROFIT HIT\n"
+                    f"{pair}  {direction}\n"
+                    f"Exit @ {_fmt(tp)}  (+{pnl_pct:.2f}%)  RR 1:{row['rr']}"
+                )
 
         if changes:
             updates.append((str(row['time']), row['pair'], changes))
