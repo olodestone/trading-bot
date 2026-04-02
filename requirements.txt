@@ -1,0 +1,6 @@
+ccxt
+pandas
+numpy
+requests
+psycopg2-binary
+sqlalchemy
