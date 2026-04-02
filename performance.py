@@ -280,6 +280,83 @@ def check_trade_results(fetch_price_func, send_telegram):
 
 
 # ==============================
+# EXPECTANCY HELPER
+# ==============================
+def _expectancy(wins, losses, avg_rr):
+    """
+    Expectancy = (win_rate * avg_RR) - (loss_rate * 1.0)
+    Positive = system has edge. Units are R (multiples of risk).
+    Example: 0.5 means for every $1 risked, expect $0.50 profit on average.
+    """
+    total = wins + losses
+    if total == 0 or avg_rr == 0:
+        return 0.0
+    wr = wins / total
+    lr = losses / total
+    return round((wr * avg_rr) - (lr * 1.0), 3)
+
+
+# ==============================
+# STATS SUMMARY (for /stats command)
+# ==============================
+def get_stats_summary():
+    """Returns a formatted string with all-time performance stats."""
+    try:
+        engine = get_engine()
+        df = pd.read_sql(f"SELECT * FROM {TRADES_TABLE}", engine)
+    except Exception as e:
+        return f"Stats error: {e}"
+
+    if df.empty:
+        return "📈 STATS\n\nNo closed trades yet. Keep watching signals."
+
+    wins = len(df[df['status'] == "WIN"])
+    be_wins = len(df[df['status'] == "BE_WIN"])
+    losses = len(df[df['status'] == "LOSS"])
+    total_closed = wins + be_wins + losses
+
+    if total_closed == 0:
+        return "📈 STATS\n\nNo closed trades yet."
+
+    win_rate = (wins + be_wins) / total_closed * 100
+    avg_rr = df[df['status'] == "WIN"]['rr'].mean() if wins > 0 else 0.0
+    best_rr = df[df['status'] == "WIN"]['rr'].max() if wins > 0 else 0.0
+    expectancy = _expectancy(wins + be_wins, losses, avg_rr)
+
+    # Streak calculation
+    closed_df = df[df['status'].isin(["WIN", "BE_WIN", "LOSS"])].copy()
+    closed_df['time'] = pd.to_datetime(closed_df['time'], errors='coerce')
+    closed_df = closed_df.sort_values('time')
+    results = closed_df['status'].apply(lambda s: "W" if s in ("WIN", "BE_WIN") else "L").tolist()
+
+    cur_streak = 1 if results else 0
+    for i in range(len(results) - 1, 0, -1):
+        if results[i] == results[i - 1]:
+            cur_streak += 1
+        else:
+            break
+    streak_label = f"{cur_streak}W" if results and results[-1] in ("W",) else f"{cur_streak}L" if results else "—"
+
+    edge_note = "✅ Positive edge" if expectancy > 0 else "⚠️ No edge yet — keep tracking"
+
+    return (
+        f"📈 ALL-TIME STATS\n"
+        f"{'─' * 22}\n"
+        f"Trades   {total_closed} closed\n"
+        f"W: {wins}  BE: {be_wins}  L: {losses}\n"
+        f"Win Rate {win_rate:.1f}%\n"
+        f"Avg RR   {avg_rr:.2f}\n"
+        f"Best RR  {best_rr:.2f}\n"
+        f"{'─' * 22}\n"
+        f"Expectancy  {expectancy:+.3f}R\n"
+        f"{edge_note}\n"
+        f"Streak   {streak_label}\n"
+        f"{'─' * 22}\n"
+        f"ℹ️ Need 30+ trades for reliable stats."
+    )
+
+
+# ==============================
 # DAILY REPORT
 # ==============================
 def daily_report(send_telegram):
@@ -309,6 +386,8 @@ def daily_report(send_telegram):
     all_losses = len(df[df['status'] == "LOSS"])
     all_closed = all_wins + all_be + all_losses
     all_wr = ((all_wins + all_be) / all_closed * 100) if all_closed > 0 else 0
+    all_avg_rr = df[df['status'] == "WIN"]['rr'].mean() if all_wins > 0 else 0.0
+    all_expectancy = _expectancy(all_wins + all_be, all_losses, all_avg_rr)
 
     msg = f"""
 📊 DAILY REPORT ({today})
@@ -322,5 +401,6 @@ Today:
 All-Time:
   W: {all_wins}  BE: {all_be}  L: {all_losses}
   Win Rate: {round(all_wr, 1)}%
+  Expectancy: {all_expectancy:+.3f}R  {"✅ edge" if all_expectancy > 0 else "❌ no edge yet"}
 """
     send_telegram(msg)

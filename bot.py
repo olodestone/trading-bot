@@ -9,7 +9,7 @@ from strategy import apply_indicators, generate_filtered_signal
 from performance import (
     save_trade, check_trade_results, daily_report,
     ensure_csv, save_pending_trades, load_pending_trades,
-    get_daily_losses, get_engine, TRADES_TABLE,
+    get_daily_losses, get_engine, TRADES_TABLE, get_stats_summary,
 )
 from logger import send_telegram, send_csv, get_updates, TOKEN, CHAT_ID
 
@@ -99,6 +99,14 @@ def prune_last_signals():
 MAX_CONCURRENT = 5
 MAX_DAILY_LOSSES = 3
 
+# ==============================
+# POSITION SIZING CONFIG
+# Set ACCOUNT_BALANCE and RISK_PCT as env vars, or edit defaults here.
+# RISK_PCT = 0.02 means risk 2% of account per trade.
+# ==============================
+ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "15"))
+RISK_PCT = float(os.getenv("RISK_PCT", "0.02"))
+
 
 def at_max_capacity():
     open_count = 0
@@ -137,10 +145,13 @@ def check_telegram_commands():
 
         if text == "/status":
             _handle_status()
+        elif text == "/stats":
+            send_telegram(get_stats_summary())
         elif text == "/help":
             send_telegram(
                 "📖 Commands:\n"
                 "/status — open & pending trades\n"
+                "/stats  — win rate, expectancy, all-time edge\n"
                 "/cancel SYMBOL — remove pending signal\n"
                 "/help — this message"
             )
@@ -179,6 +190,25 @@ def _handle_cancel(symbol):
         send_telegram(f"✅ Cancelled pending: {symbol}")
     else:
         send_telegram(f"⚠️ No pending trade for: {symbol}")
+
+
+# ==============================
+# POSITION SIZING
+# ==============================
+def calc_position_size(entry, sl):
+    """
+    Returns (risk_dollars, units, position_value) based on ACCOUNT_BALANCE / RISK_PCT.
+    risk_dollars = how much of the account is at risk on this trade.
+    units        = how many coins/contracts to buy.
+    position_value = notional value of the position.
+    """
+    risk_dollars = round(ACCOUNT_BALANCE * RISK_PCT, 4)
+    risk_per_unit = abs(entry - sl)
+    if risk_per_unit <= 0:
+        return risk_dollars, 0.0, 0.0
+    units = risk_dollars / risk_per_unit
+    position_value = round(units * entry, 4)
+    return risk_dollars, round(units, 6), position_value
 
 
 # ==============================
@@ -266,7 +296,7 @@ def momentum_score(symbol, market_type):
         return 0
 
     vol_avg_usdt = df['volume'].tail(3).mean() * close
-    if vol_avg_usdt < 500_000:  # $500K USDT per candle minimum
+    if vol_avg_usdt < 150_000:  # $150K USDT per candle minimum
         return 0
 
     hl = df['high'] - df['low']
@@ -466,6 +496,8 @@ def run_bot():
         market_label = f"{'Spot' if market_type == 'spot' else 'Futures'} · {exchange}"
         now_str = datetime.utcnow().strftime("%d %b %Y · %H:%M UTC")
 
+        risk_dollars, units, pos_value = calc_position_size(entry, sl)
+
         msg = (
             f"{'─' * 22}\n"
             f"{direction}  [{trade_type.upper()}]\n"
@@ -477,6 +509,10 @@ def run_bot():
             f"SL      {_fmt_price(sl)}  (▼ {sl_pct:.2f}%)\n"
             f"TP      {_fmt_price(tp)}  (▲ {tp_pct:.2f}%)\n"
             f"RR      1 : {rr}\n"
+            f"{'─' * 22}\n"
+            f"💰 POSITION SIZING  ({RISK_PCT*100:.0f}% risk)\n"
+            f"Risk    ${risk_dollars:.2f}  of ${ACCOUNT_BALANCE:.2f}\n"
+            f"Size    {units} units  (~${pos_value:.2f})\n"
             f"{'─' * 22}\n"
             f"⏳ Pending — waiting for entry to trigger"
         )
