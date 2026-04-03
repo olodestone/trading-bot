@@ -22,6 +22,7 @@ futures_exchange = ccxt.mexc({"enableRateLimit": True})
 
 spot_exchange.options['adjustForTimeDifference'] = True
 futures_exchange.options['adjustForTimeDifference'] = True
+futures_exchange.options['defaultType'] = 'swap'   # ensure futures tickers, not spot
 
 SPOT_MARKETS = spot_exchange.load_markets()
 FUTURES_MARKETS = futures_exchange.load_markets()
@@ -359,39 +360,48 @@ def _get_liquid_active_pool(exchange, market_type, symbol_filter, top_n=50):
     """
     try:
         tickers = exchange.fetch_tickers()
-        pool = []
-        for sym, t in tickers.items():
-            if not symbol_filter(sym):
-                continue
-            if _is_stable(sym) or _is_non_crypto(sym):
-                continue
-            # MEXC futures often returns quoteVolume=None — fall back to
-            # baseVolume * last price to get USDT-denominated volume
-            vol_24h = t.get("quoteVolume") or 0
-            if vol_24h == 0:
-                last_price = t.get("last") or 0
-                base_vol   = t.get("baseVolume") or 0
-                vol_24h    = last_price * base_vol
-            if vol_24h < 2_000_000:
-                continue
-            # percentage can be None on MEXC futures — skip movement gate
-            # if data is unavailable rather than rejecting the whole pool
-            pct_raw = t.get("percentage")
-            if pct_raw is not None and abs(pct_raw) < 1.5:
-                continue
-            pool.append((sym, vol_24h))
-        pool.sort(key=lambda x: x[1], reverse=True)
-        result = [s for s, _ in pool[:top_n]]
-        if not result:
-            raise ValueError("empty pool after filters")
-        return result
     except Exception as e:
-        print(f"⚠️ fetch_tickers failed ({market_type}): {e} — using fallback")
+        print(f"⚠️ fetch_tickers error ({market_type}): {type(e).__name__}: {e} — using fallback")
         if market_type == "spot":
             return [s for s in SPOT_MARKETS
                     if symbol_filter(s) and not _is_stable(s) and not _is_non_crypto(s)][:top_n]
         return [s for s in FUTURES_MARKETS
                 if symbol_filter(s) and not _is_stable(s) and not _is_non_crypto(s)][:top_n]
+
+    pool = []
+    for sym, t in tickers.items():
+        if not symbol_filter(sym):
+            continue
+        if _is_stable(sym) or _is_non_crypto(sym):
+            continue
+        # MEXC futures often returns quoteVolume=None — fall back to
+        # baseVolume * last price to get USDT-denominated volume
+        vol_24h = t.get("quoteVolume") or 0
+        if vol_24h == 0:
+            last_price = t.get("last") or 0
+            base_vol   = t.get("baseVolume") or 0
+            vol_24h    = last_price * base_vol
+        if vol_24h < 2_000_000:
+            continue
+        # percentage can be None on MEXC futures — skip movement gate
+        # if data is unavailable rather than rejecting the whole pool
+        pct_raw = t.get("percentage")
+        if pct_raw is not None and abs(pct_raw) < 1.5:
+            continue
+        pool.append((sym, vol_24h))
+
+    pool.sort(key=lambda x: x[1], reverse=True)
+    result = [s for s, _ in pool[:top_n]]
+
+    if not result:
+        print(f"⚠️ fetch_tickers ({market_type}): pool empty after filters — using fallback")
+        if market_type == "spot":
+            return [s for s in SPOT_MARKETS
+                    if symbol_filter(s) and not _is_stable(s) and not _is_non_crypto(s)][:top_n]
+        return [s for s in FUTURES_MARKETS
+                if symbol_filter(s) and not _is_stable(s) and not _is_non_crypto(s)][:top_n]
+
+    return result
 
 
 def get_pairs():
