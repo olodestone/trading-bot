@@ -295,9 +295,10 @@ _STABLES = {
 
 # Non-crypto commodity / metals perpetuals that appear on MEXC futures
 _NON_CRYPTO = {
-    "XAUT", "PAXG", "CACHE", "XAU", "XAG", "XAGT",   # gold / silver tokens
-    "USOIL", "UKOIL", "OIL", "BRENT", "WTI",           # oil perpetuals
-    "WHEAT", "CORN", "SOYB",                            # agricultural
+    "XAUT", "PAXG", "CACHE", "XAU", "XAG", "XAGT",        # gold / silver tokens
+    "SILVER", "GOLD",                                       # metal perpetuals
+    "USOIL", "UKOIL", "OIL", "BRENT", "WTI",               # oil perpetuals
+    "WHEAT", "CORN", "SOYB",                                # agricultural
 }
 
 
@@ -364,7 +365,13 @@ def _get_liquid_active_pool(exchange, market_type, symbol_filter, top_n=50):
                 continue
             if _is_stable(sym) or _is_non_crypto(sym):
                 continue
+            # MEXC futures often returns quoteVolume=None — fall back to
+            # baseVolume * last price to get USDT-denominated volume
             vol_24h = t.get("quoteVolume") or 0
+            if vol_24h == 0:
+                last_price = t.get("last") or 0
+                base_vol   = t.get("baseVolume") or 0
+                vol_24h    = last_price * base_vol
             if vol_24h < 2_000_000:
                 continue
             # percentage can be None on MEXC futures — skip movement gate
