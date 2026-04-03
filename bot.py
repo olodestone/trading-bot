@@ -99,6 +99,10 @@ def prune_last_signals():
 MAX_CONCURRENT = 5
 MAX_DAILY_LOSSES = 3
 
+# Mid-cap price filter — focus on explosive movers, exclude BTC/ETH and sub-cent noise
+MID_CAP_MIN = 0.10   # $0.10 minimum price
+MID_CAP_MAX = 150.0  # $150 maximum price
+
 # ==============================
 # POSITION SIZING CONFIG
 # Set ACCOUNT_BALANCE and RISK_PCT as env vars, or edit defaults here.
@@ -471,20 +475,23 @@ def check_pending_trades():
             print(f"✅ ENTRY HIT: {symbol}")
             direction = "LONG" if trade['signal'] == "BUY" else "SHORT"
             market_label = "Spot" if trade['market_type'] == "spot" else "Futures"
+            tp2 = trade.get('tp2')
+            tp2_line = f"TP2     {_fmt_price(tp2)}\n" if tp2 else ""
             send_telegram(
                 f"✅ ENTRY TRIGGERED\n"
                 f"{'─' * 22}\n"
                 f"{symbol}  {direction}  [{market_label}]\n\n"
                 f"Entry   {_fmt_price(trade['entry'])}\n"
                 f"SL      {_fmt_price(trade['sl'])}\n"
-                f"TP      {_fmt_price(trade['tp'])}\n"
+                f"TP1     {_fmt_price(trade['tp'])}  ← close 50%\n"
+                f"{tp2_line}"
                 f"RR      1 : {trade['rr']}\n"
                 f"{'─' * 22}\n"
                 f"🔔 Trade is now live. Managing SL/TP."
             )
             save_trade(
                 trade['pair'], trade['signal'], trade['entry'],
-                trade['sl'], trade['tp'], trade['rr'],
+                trade['sl'], trade['tp'], tp2, trade['rr'],
                 trade['market_type'], trade.get('atr', 0.0)
             )
         else:
@@ -523,6 +530,11 @@ def run_bot():
         if any(len(x) < 50 for x in [df_15m, df_1h, df_4h, df_1d]):
             continue
 
+        # Mid-cap filter: skip BTC/ETH (too slow) and sub-cent noise
+        price_now = df_15m.iloc[-1]['close']
+        if not (MID_CAP_MIN <= price_now <= MID_CAP_MAX):
+            continue
+
         df_15m = apply_indicators(df_15m)
         df_1h = apply_indicators(df_1h)
         df_4h = apply_indicators(df_4h)
@@ -532,7 +544,7 @@ def run_bot():
         if not result:
             continue
 
-        sig, entry, sl, tp, rr, atr, trade_type = result
+        sig, entry, sl, tp, tp2, rr, atr, trade_type = result
 
         # Skip if already pending
         if any(t['pair'] == symbol for t in pending_trades):
@@ -556,13 +568,18 @@ def run_bot():
             continue
 
         sl_pct = abs(sl - entry) / entry * 100
-        tp_pct = abs(tp - entry) / entry * 100
+        tp1_pct = abs(tp - entry) / entry * 100
         direction = "🟢 LONG" if sig == "BUY" else "🔴 SHORT"
         exchange = "KuCoin" if market_type == "spot" else "MEXC"
         market_label = f"{'Spot' if market_type == 'spot' else 'Futures'} · {exchange}"
         now_str = datetime.utcnow().strftime("%d %b %Y · %H:%M UTC")
 
         risk_dollars, units, pos_value = calc_position_size(entry, sl)
+
+        tp2_line = (
+            f"TP2     {_fmt_price(tp2)}  (▲ {abs(tp2 - entry) / entry * 100:.2f}%)\n"
+            if tp2 else ""
+        )
 
         msg = (
             f"{'─' * 22}\n"
@@ -573,7 +590,8 @@ def run_bot():
             f"Time    {now_str}\n\n"
             f"Entry   {_fmt_price(entry)}\n"
             f"SL      {_fmt_price(sl)}  (▼ {sl_pct:.2f}%)\n"
-            f"TP      {_fmt_price(tp)}  (▲ {tp_pct:.2f}%)\n"
+            f"TP1     {_fmt_price(tp)}  (▲ {tp1_pct:.2f}%)  ← close 50%\n"
+            f"{tp2_line}"
             f"RR      1 : {rr}\n"
             f"{'─' * 22}\n"
             f"💰 POSITION SIZING  ({RISK_PCT*100:.0f}% risk)\n"
@@ -591,6 +609,7 @@ def run_bot():
             "entry": entry,
             "sl": sl,
             "tp": tp,
+            "tp2": tp2,
             "rr": rr,
             "market_type": market_type,
             "trade_type": trade_type,

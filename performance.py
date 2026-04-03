@@ -47,33 +47,51 @@ def ensure_csv():
                 time TEXT, pair TEXT, signal TEXT,
                 entry FLOAT, sl FLOAT, tp FLOAT, rr FLOAT,
                 status TEXT, market_type TEXT, atr FLOAT,
-                be_activated BOOLEAN, trail_sl FLOAT
+                be_activated BOOLEAN, trail_sl FLOAT,
+                tp2 FLOAT, tp1_hit BOOLEAN
             )
         """))
+        # Add new columns to existing tables without breaking live data
+        for col, typedef in [("tp2", "FLOAT"), ("tp1_hit", "BOOLEAN")]:
+            try:
+                conn.execute(text(
+                    f"ALTER TABLE {TRADES_TABLE} ADD COLUMN IF NOT EXISTS {col} {typedef}"
+                ))
+            except Exception:
+                pass
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS {PENDING_TABLE} (
                 pair TEXT, signal TEXT, entry FLOAT, sl FLOAT,
-                tp FLOAT, rr FLOAT, market_type TEXT,
+                tp FLOAT, tp2 FLOAT, rr FLOAT, market_type TEXT,
                 trade_type TEXT, atr FLOAT, queued_at TEXT
             )
         """))
+        try:
+            conn.execute(text(
+                f"ALTER TABLE {PENDING_TABLE} ADD COLUMN IF NOT EXISTS tp2 FLOAT"
+            ))
+        except Exception:
+            pass
         conn.commit()
 
 
 # ==============================
 # SAVE TRADE
 # ==============================
-def save_trade(pair, signal, entry, sl, tp, rr, market_type, atr=0.0):
+def save_trade(pair, signal, entry, sl, tp, tp2, rr, market_type, atr=0.0):
     ensure_csv()
     engine = get_engine()
     row = pd.DataFrame([{
         "time": str(datetime.utcnow()),
         "pair": pair, "signal": signal,
         "entry": round(entry, 8), "sl": round(sl, 8),
-        "tp": round(tp, 8), "rr": rr,
+        "tp": round(tp, 8),
+        "tp2": round(tp2, 8) if tp2 is not None else None,
+        "rr": rr,
         "status": "OPEN", "market_type": market_type,
         "atr": round(float(atr), 8),
-        "be_activated": False, "trail_sl": round(sl, 8)
+        "be_activated": False, "trail_sl": round(sl, 8),
+        "tp1_hit": False,
     }])
     row.to_sql(TRADES_TABLE, engine, if_exists="append", index=False)
 
@@ -85,12 +103,14 @@ def save_pending_trades(pending_trades):
     engine = get_engine()
     rows = []
     for t in pending_trades:
+        tp2 = t.get("tp2")
         rows.append({
             "pair": t["pair"],
             "signal": t["signal"],
             "entry": t["entry"],
             "sl": t["sl"],
             "tp": t["tp"],
+            "tp2": round(tp2, 8) if tp2 is not None else None,
             "rr": t["rr"],
             "market_type": t["market_type"],
             "trade_type": t.get("trade_type", "trend"),
@@ -118,12 +138,15 @@ def load_pending_trades():
             queued_at = datetime.fromisoformat(row["queued_at"])
         except Exception:
             queued_at = datetime.utcnow()
+        raw_tp2 = row.get("tp2")
+        tp2 = float(raw_tp2) if raw_tp2 is not None and not pd.isna(raw_tp2) else None
         trades.append({
             "pair": row["pair"],
             "signal": row["signal"],
             "entry": float(row["entry"]),
             "sl": float(row["sl"]),
             "tp": float(row["tp"]),
+            "tp2": tp2,
             "rr": row["rr"],
             "market_type": row["market_type"],
             "trade_type": row["trade_type"],
@@ -148,7 +171,7 @@ def get_daily_losses():
 
 
 # ==============================
-# TP/SL + BREAKEVEN + TRAILING
+# TP/SL + BREAKEVEN + TRAILING + TIERED TP
 # ==============================
 def check_trade_results(fetch_price_func, send_telegram):
     ensure_csv()
@@ -173,17 +196,23 @@ def check_trade_results(fetch_price_func, send_telegram):
 
         entry = float(row['entry'])
         sl = float(row['sl'])
-        tp = float(row['tp'])
+        tp1 = float(row['tp'])
         trail_sl = float(row['trail_sl']) if not pd.isna(row['trail_sl']) else sl
         be_activated = bool(row['be_activated'])
         risk = abs(entry - sl)
         sig = row['signal']
         changes = {}
 
+        raw_tp2 = row.get('tp2')
+        tp2 = float(raw_tp2) if raw_tp2 is not None and not pd.isna(raw_tp2) else None
+        raw_tp1_hit = row.get('tp1_hit')
+        tp1_hit = bool(raw_tp1_hit) if raw_tp1_hit is not None and not pd.isna(raw_tp1_hit) else False
+
         pair = row['pair']
         direction = "LONG" if sig == "BUY" else "SHORT"
 
         if sig == "BUY":
+            # Breakeven: move SL to entry at 1:1
             if not be_activated and price >= entry + risk:
                 changes['trail_sl'] = entry
                 changes['be_activated'] = True
@@ -195,12 +224,14 @@ def check_trade_results(fetch_price_func, send_telegram):
                     f"SL moved to entry @ {_fmt(entry)}"
                 )
 
+            # Trail: tighten SL at 2:1+
             elif be_activated and price >= entry + 2 * risk:
                 new_trail = price - (1.2 * risk)
                 if new_trail > trail_sl:
                     changes['trail_sl'] = round(new_trail, 8)
                     trail_sl = new_trail
 
+            # Stopped out
             if price <= trail_sl:
                 changes['status'] = "BE_WIN" if be_activated else "LOSS"
                 if be_activated:
@@ -215,14 +246,33 @@ def check_trade_results(fetch_price_func, send_telegram):
                         f"{pair}  {direction}\n"
                         f"Exit @ {_fmt(price)}"
                     )
-            elif price >= tp:
+            # TP2 hit (runner target — tp1 already taken)
+            elif tp1_hit and tp2 and price >= tp2:
                 changes['status'] = "WIN"
-                pnl_pct = abs(tp - entry) / entry * 100
+                tp2_pct = abs(tp2 - entry) / entry * 100
                 send_telegram(
-                    f"✅ TAKE PROFIT HIT\n"
+                    f"🏆 TP2 HIT\n"
+                    f"{'─' * 22}\n"
                     f"{pair}  {direction}\n"
-                    f"Exit @ {_fmt(tp)}  (+{pnl_pct:.2f}%)  RR 1:{row['rr']}"
+                    f"Close 25% @ {_fmt(tp2)}  (+{tp2_pct:.2f}%)\n"
+                    f"RR 1:{row['rr']}  Trail the rest"
                 )
+            # TP1 hit (first partial — 50% out)
+            elif not tp1_hit and price >= tp1:
+                changes['tp1_hit'] = True
+                tp1_pct = abs(tp1 - entry) / entry * 100
+                tp2_line = f"TP2 @ {_fmt(tp2)}" if tp2 else "No TP2 — trail remainder"
+                send_telegram(
+                    f"🎯 TP1 HIT — Close 50%\n"
+                    f"{'─' * 22}\n"
+                    f"{pair}  {direction}\n"
+                    f"Exit 50% @ {_fmt(tp1)}  (+{tp1_pct:.2f}%)\n"
+                    f"{tp2_line}\n"
+                    f"SL trails remainder"
+                )
+                # If no TP2, close the full trade as WIN
+                if not tp2:
+                    changes['status'] = "WIN"
 
         elif sig == "SELL":
             if not be_activated and price <= entry - risk:
@@ -256,14 +306,30 @@ def check_trade_results(fetch_price_func, send_telegram):
                         f"{pair}  {direction}\n"
                         f"Exit @ {_fmt(price)}"
                     )
-            elif price <= tp:
+            elif tp1_hit and tp2 and price <= tp2:
                 changes['status'] = "WIN"
-                pnl_pct = abs(tp - entry) / entry * 100
+                tp2_pct = abs(tp2 - entry) / entry * 100
                 send_telegram(
-                    f"✅ TAKE PROFIT HIT\n"
+                    f"🏆 TP2 HIT\n"
+                    f"{'─' * 22}\n"
                     f"{pair}  {direction}\n"
-                    f"Exit @ {_fmt(tp)}  (+{pnl_pct:.2f}%)  RR 1:{row['rr']}"
+                    f"Close 25% @ {_fmt(tp2)}  (+{tp2_pct:.2f}%)\n"
+                    f"RR 1:{row['rr']}  Trail the rest"
                 )
+            elif not tp1_hit and price <= tp1:
+                changes['tp1_hit'] = True
+                tp1_pct = abs(tp1 - entry) / entry * 100
+                tp2_line = f"TP2 @ {_fmt(tp2)}" if tp2 else "No TP2 — trail remainder"
+                send_telegram(
+                    f"🎯 TP1 HIT — Close 50%\n"
+                    f"{'─' * 22}\n"
+                    f"{pair}  {direction}\n"
+                    f"Exit 50% @ {_fmt(tp1)}  (+{tp1_pct:.2f}%)\n"
+                    f"{tp2_line}\n"
+                    f"SL trails remainder"
+                )
+                if not tp2:
+                    changes['status'] = "WIN"
 
         if changes:
             updates.append((str(row['time']), row['pair'], changes))

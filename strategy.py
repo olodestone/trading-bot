@@ -72,6 +72,47 @@ def is_trending(df):
 
 
 # ==============================
+# BB SQUEEZE DETECTION
+# ==============================
+def is_bb_squeeze(df, window=20):
+    """
+    True when at least 4 of the last 5 candles had BBW below 85% of its
+    50-candle average (compression), AND the current candle shows BBW
+    expanding — the classic coil → breakout transition.
+    """
+    close = df['close']
+    mid = close.rolling(window).mean()
+    std = close.rolling(window).std()
+    bbw = (4 * std) / mid.replace(0, np.nan)
+
+    if bbw.dropna().shape[0] < 55:
+        return False
+
+    bbw_avg50 = bbw.rolling(50).mean()
+    compressed = (bbw.iloc[-6:-1] < bbw_avg50.iloc[-6:-1] * 0.85).sum() >= 4
+    expanding = bbw.iloc[-1] > bbw.iloc[-2]
+    return bool(compressed and expanding)
+
+
+# ==============================
+# CONSOLIDATION COIL
+# ==============================
+def consolidation_coil(df, atr, min_candles=4):
+    """
+    True if min_candles consecutive candles before the last had a
+    candle range < 0.6 × ATR — confirms tight coil before the move.
+    """
+    count = 0
+    for i in range(2, min(len(df), 12)):
+        candle = df.iloc[-i]
+        if (candle['high'] - candle['low']) < 0.6 * atr:
+            count += 1
+        else:
+            break
+    return count >= min_candles
+
+
+# ==============================
 # STRUCTURE BIAS
 # ==============================
 def structure_bias(df):
@@ -210,14 +251,26 @@ def swing_lows(df, order=2):
 
 
 def nearest_resistance(df_1h, entry):
-    """Nearest swing high above entry on the 1h chart — used as TP target."""
+    """Nearest swing high above entry on the 1h chart — TP1 target."""
     levels = [h for h in swing_highs(df_1h) if h > entry * 1.001]
     return min(levels) if levels else None
 
 
 def nearest_support(df_1h, entry):
-    """Nearest swing low below entry on the 1h chart — used as TP target."""
+    """Nearest swing low below entry on the 1h chart — TP1 target."""
     levels = [l for l in swing_lows(df_1h) if l < entry * 0.999]
+    return max(levels) if levels else None
+
+
+def second_resistance(df_1h, tp1):
+    """Next swing high above TP1 — TP2 target for trailing the runner."""
+    levels = [h for h in swing_highs(df_1h) if h > tp1 * 1.001]
+    return min(levels) if levels else None
+
+
+def second_support(df_1h, tp1):
+    """Next swing low below TP1 — TP2 target for trailing the runner."""
+    levels = [l for l in swing_lows(df_1h) if l < tp1 * 0.999]
     return max(levels) if levels else None
 
 
@@ -225,7 +278,11 @@ def nearest_support(df_1h, entry):
 # TREND ENTRY SIGNAL
 # ==============================
 def entry_signal_trend(df_15m, df_1h, direction):
+    if len(df_15m) < 3:
+        return None
+
     last = df_15m.iloc[-1]
+    prev = df_15m.iloc[-2]
     last_1h = df_1h.iloc[-1]
 
     atr = last['atr']
@@ -233,7 +290,8 @@ def entry_signal_trend(df_15m, df_1h, direction):
         return None
 
     if direction == "BUY":
-        if last['ema9'] < last['ema21']:            # LTF uptrend required
+        # Explosive breakout trigger: close must clear previous candle's high
+        if last['close'] <= prev['high']:
             return None
         if last['stoch_k'] > 72:                    # Skip overbought entries
             return None
@@ -241,24 +299,26 @@ def entry_signal_trend(df_15m, df_1h, direction):
             return None
         if last['volume'] < last['vol_ma'] * 1.15:  # Volume confirmation
             return None
+        # Compression → expansion: coil before the breakout
+        if not is_bb_squeeze(df_15m):
+            return None
+        if not consolidation_coil(df_15m, atr):
+            return None
 
         entry = last['close']
-
-        # SL: below the recent structural swing low (last 20 candles on 15m)
-        # with a 0.3 ATR buffer so we don't sit right at the level
         sl = df_15m['low'].tail(20).min() - (0.3 * atr)
         risk = entry - sl
         if risk <= 0:
             return None
 
-        # TP: nearest resistance the market has already shown on 1h
-        tp = nearest_resistance(df_1h, entry)
-        if tp is None:
+        tp1 = nearest_resistance(df_1h, entry)
+        if tp1 is None:
             return None
-        reward = tp - entry
+        reward = tp1 - entry
 
     elif direction == "SELL":
-        if last['ema9'] > last['ema21']:
+        # Explosive breakdown trigger: close must break below previous candle's low
+        if last['close'] >= prev['low']:
             return None
         if last['stoch_k'] < 28:
             return None
@@ -266,20 +326,21 @@ def entry_signal_trend(df_15m, df_1h, direction):
             return None
         if last['volume'] < last['vol_ma'] * 1.15:
             return None
+        if not is_bb_squeeze(df_15m):
+            return None
+        if not consolidation_coil(df_15m, atr):
+            return None
 
         entry = last['close']
-
-        # SL: above the recent structural swing high (last 20 candles on 15m)
         sl = df_15m['high'].tail(20).max() + (0.3 * atr)
         risk = sl - entry
         if risk <= 0:
             return None
 
-        # TP: nearest support the market has already shown on 1h
-        tp = nearest_support(df_1h, entry)
-        if tp is None:
+        tp1 = nearest_support(df_1h, entry)
+        if tp1 is None:
             return None
-        reward = entry - tp
+        reward = entry - tp1
 
     else:
         return None
@@ -288,10 +349,13 @@ def entry_signal_trend(df_15m, df_1h, direction):
         return None
 
     rr = round(reward / risk, 2)
-    if rr < 2.0:
+    if rr < 2.5:
         return None
 
-    return direction, entry, sl, tp, rr, atr, "trend"
+    # TP2: next structural level beyond TP1 — runner target
+    tp2 = second_resistance(df_1h, tp1) if direction == "BUY" else second_support(df_1h, tp1)
+
+    return direction, entry, sl, tp1, tp2, rr, atr, "trend"
 
 
 # ==============================
@@ -301,7 +365,7 @@ def entry_signal_reversal(df_15m, df_1h, direction):
     """
     Reversal entries require engulfing pattern + extreme StochRSI + strong volume.
     SL is placed behind the engulfing candle itself — the candle defines the
-    invalidation point. TP is the nearest structural level on 1h.
+    invalidation point. TP1 is the nearest structural level on 1h, TP2 is the next.
     """
     if not is_engulfing(df_15m, direction):
         return None
@@ -319,18 +383,15 @@ def entry_signal_reversal(df_15m, df_1h, direction):
             return None
 
         entry = last['close']
-
-        # SL: below the engulfing candle's low — that candle IS the reversal,
-        # if price trades below it the setup is invalidated
         sl = last['low'] - (0.3 * atr)
         risk = entry - sl
         if risk <= 0:
             return None
 
-        tp = nearest_resistance(df_1h, entry)
-        if tp is None:
+        tp1 = nearest_resistance(df_1h, entry)
+        if tp1 is None:
             return None
-        reward = tp - entry
+        reward = tp1 - entry
 
     elif direction == "SELL":
         if last['stoch_k'] < 65:
@@ -339,17 +400,15 @@ def entry_signal_reversal(df_15m, df_1h, direction):
             return None
 
         entry = last['close']
-
-        # SL: above the engulfing candle's high
         sl = last['high'] + (0.3 * atr)
         risk = sl - entry
         if risk <= 0:
             return None
 
-        tp = nearest_support(df_1h, entry)
-        if tp is None:
+        tp1 = nearest_support(df_1h, entry)
+        if tp1 is None:
             return None
-        reward = entry - tp
+        reward = entry - tp1
 
     else:
         return None
@@ -358,10 +417,12 @@ def entry_signal_reversal(df_15m, df_1h, direction):
         return None
 
     rr = round(reward / risk, 2)
-    if rr < 2.0:
+    if rr < 2.5:
         return None
 
-    return direction, entry, sl, tp, rr, atr, "reversal"
+    tp2 = second_resistance(df_1h, tp1) if direction == "BUY" else second_support(df_1h, tp1)
+
+    return direction, entry, sl, tp1, tp2, rr, atr, "reversal"
 
 
 # ==============================
@@ -377,8 +438,8 @@ def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d):
     if reversal:
         result = entry_signal_reversal(df_15m, df_1h, reversal)
         if result:
-            direction, entry, sl, tp, rr, atr, trade_type = result
-            return direction, entry, sl, tp, rr, atr, trade_type
+            direction, entry, sl, tp1, tp2, rr, atr, trade_type = result
+            return direction, entry, sl, tp1, tp2, rr, atr, trade_type
 
     # Trend following
     bias = get_htf_bias(df_1h, df_4h, df_1d)
@@ -387,7 +448,7 @@ def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d):
 
     result = entry_signal_trend(df_15m, df_1h, bias)
     if result:
-        direction, entry, sl, tp, rr, atr, trade_type = result
-        return direction, entry, sl, tp, rr, atr, trade_type
+        direction, entry, sl, tp1, tp2, rr, atr, trade_type = result
+        return direction, entry, sl, tp1, tp2, rr, atr, trade_type
 
     return None
