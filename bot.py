@@ -296,7 +296,7 @@ def momentum_score(symbol, market_type):
         return 0
 
     vol_avg_usdt = df['volume'].tail(3).mean() * close
-    if vol_avg_usdt < 150_000:  # $150K USDT per candle minimum
+    if vol_avg_usdt < 75_000:  # $75K USDT per candle minimum
         return 0
 
     hl = df['high'] - df['low']
@@ -316,8 +316,8 @@ def get_pairs():
     """
     candidates = []
 
-    spot_syms = [s for s in list(SPOT_MARKETS)[:80] if "/USDT" in s and ":" not in s]
-    futures_syms = [s for s in list(FUTURES_MARKETS)[:80] if "/USDT:USDT" in s]
+    spot_syms = [s for s in list(SPOT_MARKETS)[:150] if "/USDT" in s and ":" not in s]
+    futures_syms = [s for s in list(FUTURES_MARKETS)[:120] if "/USDT:USDT" in s]
 
     for symbol in spot_syms:
         score = momentum_score(symbol, "spot")
