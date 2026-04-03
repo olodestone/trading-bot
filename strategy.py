@@ -64,11 +64,35 @@ def apply_indicators(df):
 # ==============================
 # MARKET CONDITION
 # ==============================
-def is_trending(df):
-    """Require ADX > 22 — filters ranging/choppy markets."""
+def get_regime_params(df_4h):
+    """
+    Detects market volatility regime from 4h ATR percentile rank.
+    Returns adaptive thresholds so the strategy loosens in high-vol
+    markets (more signals, bigger moves) and tightens in low-vol
+    markets (only the cleanest setups).
+
+    HIGH  (ATR rank > 70th pct): ADX 18, StochRSI 78/22, RR 2.0
+    NORMAL(30–70th pct):         ADX 22, StochRSI 72/28, RR 2.5
+    LOW   (ATR rank < 30th pct): ADX 25, StochRSI 68/32, RR 3.0
+    """
+    atr = df_4h['atr'].dropna()
+    if len(atr) < 50:
+        return {"adx_min": 22, "stoch_ob": 72, "stoch_os": 28, "rr_min": 2.5}
+
+    rank = float((atr < atr.iloc[-1]).mean())   # 0.0 – 1.0
+
+    if rank > 0.70:
+        return {"adx_min": 18, "stoch_ob": 78, "stoch_os": 22, "rr_min": 2.0}
+    if rank < 0.30:
+        return {"adx_min": 25, "stoch_ob": 68, "stoch_os": 32, "rr_min": 3.0}
+    return     {"adx_min": 22, "stoch_ob": 72, "stoch_os": 28, "rr_min": 2.5}
+
+
+def is_trending(df, adx_min=22):
+    """Require ADX > adx_min — filters ranging/choppy markets."""
     last = df.iloc[-1]
     adx = last['adx']
-    return not pd.isna(adx) and adx > 22
+    return not pd.isna(adx) and adx > adx_min
 
 
 # ==============================
@@ -175,25 +199,28 @@ def get_htf_bias(df_1h, df_4h, df_1d):
 # ==============================
 # HTF REVERSAL DETECTION
 # ==============================
-def detect_htf_reversal(df_4h, df_1d):
+def detect_htf_reversal(df_4h, df_1d, params):
     """
     Requires: diverging structure + extreme StochRSI + volume surge + MACD flip.
     All 4 conditions needed — avoids premature reversal calls.
+    StochRSI extremes adapt to the current volatility regime.
     """
     trend_4h = structure_bias(df_4h)
     trend_1d = structure_bias(df_1d)
     last = df_4h.iloc[-1]
 
+    stoch_ob = params["stoch_ob"]
+    stoch_os = params["stoch_os"]
     vol_surge = last['volume'] > last['vol_ma'] * 1.5
 
     # SELL reversal
     if trend_1d == "bullish" and trend_4h == "bearish":
-        if last['stoch_k'] > 75 and vol_surge and last['macd_hist'] < 0:
+        if last['stoch_k'] > stoch_ob and vol_surge and last['macd_hist'] < 0:
             return "SELL"
 
     # BUY reversal
     if trend_1d == "bearish" and trend_4h == "bullish":
-        if last['stoch_k'] < 25 and vol_surge and last['macd_hist'] > 0:
+        if last['stoch_k'] < stoch_os and vol_surge and last['macd_hist'] > 0:
             return "BUY"
 
     return None
@@ -277,13 +304,17 @@ def second_support(df_1h, tp1):
 # ==============================
 # TREND ENTRY SIGNAL
 # ==============================
-def entry_signal_trend(df_15m, df_1h, direction):
+def entry_signal_trend(df_15m, df_1h, direction, params):
     if len(df_15m) < 3:
         return None
 
     last = df_15m.iloc[-1]
     prev = df_15m.iloc[-2]
     last_1h = df_1h.iloc[-1]
+
+    stoch_ob = params["stoch_ob"]
+    stoch_os = params["stoch_os"]
+    rr_min   = params["rr_min"]
 
     atr = last['atr']
     if pd.isna(atr) or atr <= 0:
@@ -293,7 +324,7 @@ def entry_signal_trend(df_15m, df_1h, direction):
         # Explosive breakout trigger: close must clear previous candle's high
         if last['close'] <= prev['high']:
             return None
-        if last['stoch_k'] > 72:                    # Skip overbought entries
+        if last['stoch_k'] > stoch_ob:              # Skip overbought entries
             return None
         if last_1h['macd_hist'] <= 0:               # 1h MACD must be bullish
             return None
@@ -320,7 +351,7 @@ def entry_signal_trend(df_15m, df_1h, direction):
         # Explosive breakdown trigger: close must break below previous candle's low
         if last['close'] >= prev['low']:
             return None
-        if last['stoch_k'] < 28:
+        if last['stoch_k'] < stoch_os:
             return None
         if last_1h['macd_hist'] >= 0:
             return None
@@ -349,7 +380,7 @@ def entry_signal_trend(df_15m, df_1h, direction):
         return None
 
     rr = round(reward / risk, 2)
-    if rr < 2.5:
+    if rr < rr_min:
         return None
 
     # TP2: next structural level beyond TP1 — runner target
@@ -361,23 +392,28 @@ def entry_signal_trend(df_15m, df_1h, direction):
 # ==============================
 # REVERSAL ENTRY SIGNAL
 # ==============================
-def entry_signal_reversal(df_15m, df_1h, direction):
+def entry_signal_reversal(df_15m, df_1h, direction, params):
     """
     Reversal entries require engulfing pattern + extreme StochRSI + strong volume.
     SL is placed behind the engulfing candle itself — the candle defines the
     invalidation point. TP1 is the nearest structural level on 1h, TP2 is the next.
+    StochRSI extremes and minimum RR adapt to the current volatility regime.
     """
     if not is_engulfing(df_15m, direction):
         return None
 
     last = df_15m.iloc[-1]
 
+    stoch_ob = params["stoch_ob"]
+    stoch_os = params["stoch_os"]
+    rr_min   = params["rr_min"]
+
     atr = last['atr']
     if pd.isna(atr) or atr <= 0:
         return None
 
     if direction == "BUY":
-        if last['stoch_k'] > 35:                    # Must come from oversold
+        if last['stoch_k'] > stoch_os + 10:         # Must come from oversold zone
             return None
         if last['volume'] < last['vol_ma'] * 1.3:
             return None
@@ -394,7 +430,7 @@ def entry_signal_reversal(df_15m, df_1h, direction):
         reward = tp1 - entry
 
     elif direction == "SELL":
-        if last['stoch_k'] < 65:
+        if last['stoch_k'] < stoch_ob - 10:         # Must come from overbought zone
             return None
         if last['volume'] < last['vol_ma'] * 1.3:
             return None
@@ -417,7 +453,7 @@ def entry_signal_reversal(df_15m, df_1h, direction):
         return None
 
     rr = round(reward / risk, 2)
-    if rr < 2.5:
+    if rr < rr_min:
         return None
 
     tp2 = second_resistance(df_1h, tp1) if direction == "BUY" else second_support(df_1h, tp1)
@@ -429,14 +465,17 @@ def entry_signal_reversal(df_15m, df_1h, direction):
 # FINAL SIGNAL
 # ==============================
 def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d):
-    # Hard gate: 4h must be trending (ADX > 22)
-    if not is_trending(df_4h):
+    # Detect regime once — all signal functions share these adaptive thresholds
+    params = get_regime_params(df_4h)
+
+    # Hard gate: 4h must be trending (adaptive ADX threshold)
+    if not is_trending(df_4h, params["adx_min"]):
         return None
 
     # Reversal check first (higher RR potential)
-    reversal = detect_htf_reversal(df_4h, df_1d)
+    reversal = detect_htf_reversal(df_4h, df_1d, params)
     if reversal:
-        result = entry_signal_reversal(df_15m, df_1h, reversal)
+        result = entry_signal_reversal(df_15m, df_1h, reversal, params)
         if result:
             direction, entry, sl, tp1, tp2, rr, atr, trade_type = result
             return direction, entry, sl, tp1, tp2, rr, atr, trade_type
@@ -446,7 +485,7 @@ def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d):
     if not bias:
         return None
 
-    result = entry_signal_trend(df_15m, df_1h, bias)
+    result = entry_signal_trend(df_15m, df_1h, bias, params)
     if result:
         direction, entry, sl, tp1, tp2, rr, atr, trade_type = result
         return direction, entry, sl, tp1, tp2, rr, atr, trade_type

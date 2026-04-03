@@ -293,10 +293,22 @@ _STABLES = {
     "CUSD", "CEUR", "EURS", "ALUSD", "USDN", "MUSD", "USDX",
 }
 
+# Non-crypto commodity / metals perpetuals that appear on MEXC futures
+_NON_CRYPTO = {
+    "XAUT", "PAXG", "CACHE", "XAU", "XAG", "XAGT",   # gold / silver tokens
+    "USOIL", "UKOIL", "OIL", "BRENT", "WTI",           # oil perpetuals
+    "WHEAT", "CORN", "SOYB",                            # agricultural
+}
+
 
 def _is_stable(symbol):
     base = symbol.split("/")[0]
     return base in _STABLES
+
+
+def _is_non_crypto(symbol):
+    base = symbol.split("/")[0]
+    return base in _NON_CRYPTO
 
 
 # ==============================
@@ -350,13 +362,15 @@ def _get_liquid_active_pool(exchange, market_type, symbol_filter, top_n=50):
         for sym, t in tickers.items():
             if not symbol_filter(sym):
                 continue
-            if _is_stable(sym):
+            if _is_stable(sym) or _is_non_crypto(sym):
                 continue
             vol_24h = t.get("quoteVolume") or 0
-            pct_change = abs(t.get("percentage") or 0)
-            if vol_24h < 2_000_000:   # minimum $2M 24h USDT volume
+            if vol_24h < 2_000_000:
                 continue
-            if pct_change < 1.5:      # must have moved 1.5%+ today
+            # percentage can be None on MEXC futures — skip movement gate
+            # if data is unavailable rather than rejecting the whole pool
+            pct_raw = t.get("percentage")
+            if pct_raw is not None and abs(pct_raw) < 1.5:
                 continue
             pool.append((sym, vol_24h))
         pool.sort(key=lambda x: x[1], reverse=True)
@@ -367,8 +381,10 @@ def _get_liquid_active_pool(exchange, market_type, symbol_filter, top_n=50):
     except Exception as e:
         print(f"⚠️ fetch_tickers failed ({market_type}): {e} — using fallback")
         if market_type == "spot":
-            return [s for s in SPOT_MARKETS if symbol_filter(s) and not _is_stable(s)][:top_n]
-        return [s for s in FUTURES_MARKETS if symbol_filter(s) and not _is_stable(s)][:top_n]
+            return [s for s in SPOT_MARKETS
+                    if symbol_filter(s) and not _is_stable(s) and not _is_non_crypto(s)][:top_n]
+        return [s for s in FUTURES_MARKETS
+                if symbol_filter(s) and not _is_stable(s) and not _is_non_crypto(s)][:top_n]
 
 
 def get_pairs():
