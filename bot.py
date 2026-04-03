@@ -281,11 +281,28 @@ def get_price(symbol, market_type):
 # ==============================
 # MOMENTUM PAIR SELECTION
 # ==============================
+# STABLECOIN BLOCKLIST
+# ==============================
+_STABLES = {
+    "USDC", "DAI", "BUSD", "TUSD", "FDUSD", "FRAX", "USDP",
+    "UST", "USDD", "SUSD", "GUSD", "LUSD", "PYUSD", "USDJ",
+    "CUSD", "CEUR", "EURS", "ALUSD", "USDN", "MUSD", "USDX",
+}
+
+
+def _is_stable(symbol):
+    base = symbol.split("/")[0]
+    return base in _STABLES
+
+
+# ==============================
+# MOMENTUM PAIR SELECTION
+# ==============================
 def momentum_score(symbol, market_type):
     """
-    Score = ATR% * USDT volume (last 3 candles on 1h).
-    Volume is USDT-denominated to filter micro-caps with large coin supply
-    but negligible real liquidity (e.g. BTT, WIN, MTV).
+    Score = ATR% * recent 1h volume, boosted when volume is surging NOW.
+    - vol_avg_usdt: last 3 candles (3h) — captures current activity
+    - surge_mult: if last 1h vol > 20-candle avg, coin is heating up NOW
     """
     df = get_cached_tf(symbol, "1h", market_type)
     if df is None or len(df) < 20:
@@ -299,6 +316,11 @@ def momentum_score(symbol, market_type):
     if vol_avg_usdt < 75_000:  # $75K USDT per candle minimum
         return 0
 
+    # Volume surge: reward coins breaking out in volume RIGHT NOW
+    vol_ma20 = df['volume'].tail(20).mean()
+    last_vol = df['volume'].iloc[-1]
+    surge_mult = min(last_vol / vol_ma20, 3.0) if vol_ma20 > 0 else 1.0
+
     hl = df['high'] - df['low']
     hc = (df['high'] - df['close'].shift()).abs()
     lc = (df['low'] - df['close'].shift()).abs()
@@ -306,49 +328,61 @@ def momentum_score(symbol, market_type):
     atr = tr.rolling(14).mean().iloc[-1]
 
     atr_pct = (atr / close) * 100
-    return atr_pct * vol_avg_usdt
+    return atr_pct * vol_avg_usdt * surge_mult
 
 
-def _top_by_24h_volume(exchange, market_type, symbol_filter, top_n=40):
+def _get_liquid_active_pool(exchange, market_type, symbol_filter, top_n=50):
     """
-    Single API call to fetch all tickers, rank by 24h USDT volume,
-    return top N symbols. Falls back to market dict slice on error.
+    One fetch_tickers() call → filter stablecoins → gate on liquidity
+    and recent movement → sort by 24h volume → return top N.
+
+    Gates (pre-filter before momentum scoring):
+      - 24h quoteVolume > $2M   : real liquidity floor
+      - |24h % change| > 1.5%  : coin is MOVING today, not dead
     """
     try:
         tickers = exchange.fetch_tickers()
-        ranked = []
+        pool = []
         for sym, t in tickers.items():
             if not symbol_filter(sym):
                 continue
-            vol = t.get("quoteVolume") or 0
-            if vol > 0:
-                ranked.append((sym, vol))
-        ranked.sort(key=lambda x: x[1], reverse=True)
-        return [s for s, _ in ranked[:top_n]]
+            if _is_stable(sym):
+                continue
+            vol_24h = t.get("quoteVolume") or 0
+            pct_change = abs(t.get("percentage") or 0)
+            if vol_24h < 2_000_000:   # minimum $2M 24h USDT volume
+                continue
+            if pct_change < 1.5:      # must have moved 1.5%+ today
+                continue
+            pool.append((sym, vol_24h))
+        pool.sort(key=lambda x: x[1], reverse=True)
+        result = [s for s, _ in pool[:top_n]]
+        if not result:
+            raise ValueError("empty pool after filters")
+        return result
     except Exception as e:
-        print(f"⚠️ fetch_tickers failed ({market_type}): {e} — using market dict fallback")
+        print(f"⚠️ fetch_tickers failed ({market_type}): {e} — using fallback")
         if market_type == "spot":
-            return [s for s in SPOT_MARKETS if symbol_filter(s)][:top_n]
-        return [s for s in FUTURES_MARKETS if symbol_filter(s)][:top_n]
+            return [s for s in SPOT_MARKETS if symbol_filter(s) and not _is_stable(s)][:top_n]
+        return [s for s in FUTURES_MARKETS if symbol_filter(s) and not _is_stable(s)][:top_n]
 
 
 def get_pairs():
     """
-    Rank ALL USDT pairs by 24h volume (one API call per exchange),
-    score the top 40 from each by ATR%×1h_vol, return best 20.
-    BTC/ETH/SOL now compete on real volume rank, not alphabetical position.
+    Pipeline:
+      1. fetch_tickers() → liquid ($2M+) + active (1.5%+ move) USDT pairs
+      2. Score top 50 by ATR% × 1h_vol × surge_multiplier
+      3. Return best 20 — these go into the strategy
     """
     candidates = []
 
-    spot_syms = _top_by_24h_volume(
+    spot_syms = _get_liquid_active_pool(
         spot_exchange, "spot",
         lambda s: "/USDT" in s and ":" not in s,
-        top_n=40
     )
-    futures_syms = _top_by_24h_volume(
+    futures_syms = _get_liquid_active_pool(
         futures_exchange, "futures",
         lambda s: "/USDT:USDT" in s,
-        top_n=40
     )
 
     for symbol in spot_syms:
