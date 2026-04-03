@@ -309,15 +309,47 @@ def momentum_score(symbol, market_type):
     return atr_pct * vol_avg_usdt
 
 
+def _top_by_24h_volume(exchange, market_type, symbol_filter, top_n=40):
+    """
+    Single API call to fetch all tickers, rank by 24h USDT volume,
+    return top N symbols. Falls back to market dict slice on error.
+    """
+    try:
+        tickers = exchange.fetch_tickers()
+        ranked = []
+        for sym, t in tickers.items():
+            if not symbol_filter(sym):
+                continue
+            vol = t.get("quoteVolume") or 0
+            if vol > 0:
+                ranked.append((sym, vol))
+        ranked.sort(key=lambda x: x[1], reverse=True)
+        return [s for s, _ in ranked[:top_n]]
+    except Exception as e:
+        print(f"⚠️ fetch_tickers failed ({market_type}): {e} — using market dict fallback")
+        if market_type == "spot":
+            return [s for s in SPOT_MARKETS if symbol_filter(s)][:top_n]
+        return [s for s in FUTURES_MARKETS if symbol_filter(s)][:top_n]
+
+
 def get_pairs():
     """
-    Score all USDT pairs by momentum, return top 20.
-    Uses first 80 symbols from each exchange to stay within rate limits.
+    Rank ALL USDT pairs by 24h volume (one API call per exchange),
+    score the top 40 from each by ATR%×1h_vol, return best 20.
+    BTC/ETH/SOL now compete on real volume rank, not alphabetical position.
     """
     candidates = []
 
-    spot_syms = [s for s in list(SPOT_MARKETS)[:150] if "/USDT" in s and ":" not in s]
-    futures_syms = [s for s in list(FUTURES_MARKETS)[:120] if "/USDT:USDT" in s]
+    spot_syms = _top_by_24h_volume(
+        spot_exchange, "spot",
+        lambda s: "/USDT" in s and ":" not in s,
+        top_n=40
+    )
+    futures_syms = _top_by_24h_volume(
+        futures_exchange, "futures",
+        lambda s: "/USDT:USDT" in s,
+        top_n=40
+    )
 
     for symbol in spot_syms:
         score = momentum_score(symbol, "spot")
