@@ -54,7 +54,7 @@ HTF_LAST_UPDATE = {}
 MARKET_DATA = {}
 PRICE_CACHE = {}
 
-HTF_REFRESH = {"1h": 900, "4h": 14400, "1d": 86400}
+HTF_REFRESH = {"1h": 1200, "4h": 14400, "1d": 86400}
 
 
 def get_cached_tf(symbol, tf, market_type):
@@ -416,10 +416,12 @@ def get_pairs():
     spot_syms = _get_liquid_active_pool(
         spot_exchange, "spot",
         lambda s: "/USDT" in s and ":" not in s,
+        top_n=40,
     )
     futures_syms = _get_liquid_active_pool(
         futures_exchange, "futures",
         lambda s: "/USDT:USDT" in s,
+        top_n=40,
     )
 
     for symbol in spot_syms:
