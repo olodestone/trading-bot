@@ -470,11 +470,14 @@ def entry_hit(df, entry, direction, trade_type):
     return False
 
 
-def is_not_late_entry(df, entry, direction):
+def is_not_late_entry(df, entry, direction, trade_type="trend"):
     if df is None or df.empty:
         return False
     price = df.iloc[-1]['close']
-    return abs(price - entry) / entry <= 0.005
+    # Trend breakouts retest the breakout level — allow wider tolerance.
+    # Reversals must be entered at the turning point — keep tight.
+    threshold = 0.015 if trade_type == "trend" else 0.003
+    return abs(price - entry) / entry <= threshold
 
 
 # ==============================
@@ -503,7 +506,7 @@ def check_pending_trades():
             continue
 
         if entry_hit(df, trade['entry'], trade['signal'], trade['trade_type']):
-            if not is_not_late_entry(df, trade['entry'], trade['signal']):
+            if not is_not_late_entry(df, trade['entry'], trade['signal'], trade.get('trade_type', 'trend')):
                 print(f"⚠️ Late entry skipped: {symbol}")
                 continue
 

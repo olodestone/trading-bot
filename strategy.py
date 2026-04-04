@@ -351,8 +351,9 @@ def entry_signal_trend(df_15m, df_1h, direction, params):
         # Explosive breakdown trigger: close must break below previous candle's low
         if last['close'] >= prev['low']:
             return None
-        if last['stoch_k'] < stoch_os:
-            return None
+        # StochRSI oversold check removed for trend shorts: in a sustained downtrend
+        # the 15m stoch stays pinned near 0, which would permanently block SELL entries.
+        # Oversold-zone filtering is correct for reversals but wrong for trend-following.
         if last_1h['macd_hist'] >= 0:
             return None
         if last['volume'] < last['vol_ma'] * 1.15:
