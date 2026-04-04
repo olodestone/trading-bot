@@ -320,6 +320,12 @@ def momentum_score(symbol, market_type):
     - vol_avg_usdt: last 3 candles (3h) — captures current activity
     - surge_mult: if last 1h vol > 20-candle avg, coin is heating up NOW
     """
+    # Require ~6 months of daily history — blocks newly listed and manipulated tokens
+    # before they waste any further API calls or appear in the top pairs list.
+    df_1d = get_cached_tf(symbol, "1d", market_type)
+    if df_1d is None or len(df_1d) < 180:
+        return 0
+
     df = get_cached_tf(symbol, "1h", market_type)
     if df is None or len(df) < 20:
         return 0
