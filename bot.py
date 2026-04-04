@@ -101,8 +101,6 @@ MAX_CONCURRENT = 5
 MAX_DAILY_LOSSES = 3
 
 # Mid-cap price filter — focus on explosive movers, exclude BTC/ETH and sub-cent noise
-MID_CAP_MIN = 0.10   # $0.10 minimum price
-MID_CAP_MAX = 150.0  # $150 maximum price
 
 # ==============================
 # POSITION SIZING CONFIG
@@ -566,11 +564,6 @@ def run_bot():
             continue
         # Need enough history for EMA200 + ADX warmup
         if any(len(x) < 50 for x in [df_15m, df_1h, df_4h, df_1d]):
-            continue
-
-        # Mid-cap filter: skip BTC/ETH (too slow) and sub-cent noise
-        price_now = df_15m.iloc[-1]['close']
-        if not (MID_CAP_MIN <= price_now <= MID_CAP_MAX):
             continue
 
         df_15m = apply_indicators(df_15m)
