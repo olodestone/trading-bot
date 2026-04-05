@@ -158,7 +158,7 @@ def structure_bias(df):
 # ==============================
 # HTF BIAS (5-POINT CONFLUENCE)
 # ==============================
-def get_htf_bias(df_1h, df_4h, df_1d):
+def get_htf_bias(df_1h, df_4h, df_1d, params=None):
     """
     Score confluence across structure + EMA alignment.
     Require >= 4/5 points for a valid bias — reduces false signals.
@@ -189,9 +189,10 @@ def get_htf_bias(df_1h, df_4h, df_1d):
     else:
         bear_score += 1
 
-    if bull_score >= 4:
+    threshold = 3 if params and params.get("high_vol") else 4
+    if bull_score >= threshold:
         return "BUY"
-    if bear_score >= 4:
+    if bear_score >= threshold:
         return "SELL"
     return None
 
@@ -490,11 +491,12 @@ def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d, symbol=""):
         print(f"  ↳ {symbol}: reversal {reversal} detected but entry conditions not met")
 
     # Trend following
-    bias = get_htf_bias(df_1h, df_4h, df_1d)
+    bias = get_htf_bias(df_1h, df_4h, df_1d, params)
     if not bias:
         last_1h = df_1h.iloc[-1]
         last_4h = df_4h.iloc[-1]
-        print(f"  ↳ {symbol}: HTF bias < 4/5 [regime={regime}] ema50={'>' if last_1h['ema50'] > last_1h['ema200'] else '<'}ema200 di+={'>' if last_4h['plus_di'] > last_4h['minus_di'] else '<'}di-")
+        threshold = 3 if params.get("high_vol") else 4
+        print(f"  ↳ {symbol}: HTF bias < {threshold}/5 [regime={regime}] ema50={'>' if last_1h['ema50'] > last_1h['ema200'] else '<'}ema200 di+={'>' if last_4h['plus_di'] > last_4h['minus_di'] else '<'}di-")
         return None
 
     result = entry_signal_trend(df_15m, df_1h, bias, params)
