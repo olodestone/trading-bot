@@ -577,7 +577,7 @@ def run_bot():
         df_4h = apply_indicators(df_4h)
         df_1d = apply_indicators(df_1d)
 
-        result = generate_filtered_signal(df_15m, df_1h, df_4h, df_1d)
+        result = generate_filtered_signal(df_15m, df_1h, df_4h, df_1d, symbol=symbol)
         if not result:
             continue
 

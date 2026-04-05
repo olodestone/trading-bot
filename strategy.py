@@ -82,10 +82,10 @@ def get_regime_params(df_4h):
     rank = float((atr < atr.iloc[-1]).mean())   # 0.0 – 1.0
 
     if rank > 0.70:
-        return {"adx_min": 18, "stoch_ob": 78, "stoch_os": 22, "rr_min": 2.0}
+        return {"adx_min": 18, "stoch_ob": 78, "stoch_os": 22, "rr_min": 2.0, "high_vol": True}
     if rank < 0.30:
-        return {"adx_min": 25, "stoch_ob": 68, "stoch_os": 32, "rr_min": 3.0}
-    return     {"adx_min": 22, "stoch_ob": 72, "stoch_os": 28, "rr_min": 2.5}
+        return {"adx_min": 25, "stoch_ob": 68, "stoch_os": 32, "rr_min": 3.0, "high_vol": False}
+    return     {"adx_min": 22, "stoch_ob": 72, "stoch_os": 28, "rr_min": 2.5, "high_vol": False}
 
 
 def is_trending(df, adx_min=22):
@@ -331,10 +331,13 @@ def entry_signal_trend(df_15m, df_1h, direction, params):
         if last['volume'] < last['vol_ma'] * 1.15:  # Volume confirmation
             return None
         # Compression → expansion: coil before the breakout
-        if not is_bb_squeeze(df_15m):
-            return None
-        if not consolidation_coil(df_15m, atr):
-            return None
+        # In HIGH vol regime (crash/breakout already underway) the market won't
+        # consolidate first — skip these gates so we don't miss the whole move.
+        if not params.get("high_vol"):
+            if not is_bb_squeeze(df_15m):
+                return None
+            if not consolidation_coil(df_15m, atr):
+                return None
 
         entry = last['close']
         sl = df_15m['low'].tail(20).min() - (0.3 * atr)
@@ -358,10 +361,11 @@ def entry_signal_trend(df_15m, df_1h, direction, params):
             return None
         if last['volume'] < last['vol_ma'] * 1.15:
             return None
-        if not is_bb_squeeze(df_15m):
-            return None
-        if not consolidation_coil(df_15m, atr):
-            return None
+        if not params.get("high_vol"):
+            if not is_bb_squeeze(df_15m):
+                return None
+            if not consolidation_coil(df_15m, atr):
+                return None
 
         entry = last['close']
         sl = df_15m['high'].tail(20).max() + (0.3 * atr)
@@ -465,12 +469,15 @@ def entry_signal_reversal(df_15m, df_1h, direction, params):
 # ==============================
 # FINAL SIGNAL
 # ==============================
-def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d):
+def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d, symbol=""):
     # Detect regime once — all signal functions share these adaptive thresholds
     params = get_regime_params(df_4h)
+    regime = "HIGH" if params.get("high_vol") else ("LOW" if params["adx_min"] == 25 else "NORMAL")
 
     # Hard gate: 4h must be trending (adaptive ADX threshold)
     if not is_trending(df_4h, params["adx_min"]):
+        adx_val = df_4h.iloc[-1]['adx']
+        print(f"  ↳ {symbol}: ADX {adx_val:.1f} < {params['adx_min']} [{regime}] — skip")
         return None
 
     # Reversal check first (higher RR potential)
@@ -480,15 +487,51 @@ def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d):
         if result:
             direction, entry, sl, tp1, tp2, rr, atr, trade_type = result
             return direction, entry, sl, tp1, tp2, rr, atr, trade_type
+        print(f"  ↳ {symbol}: reversal {reversal} detected but entry conditions not met")
 
     # Trend following
     bias = get_htf_bias(df_1h, df_4h, df_1d)
     if not bias:
+        last_1h = df_1h.iloc[-1]
+        last_4h = df_4h.iloc[-1]
+        print(f"  ↳ {symbol}: HTF bias < 4/5 [regime={regime}] ema50={'>' if last_1h['ema50'] > last_1h['ema200'] else '<'}ema200 di+={'>' if last_4h['plus_di'] > last_4h['minus_di'] else '<'}di-")
         return None
 
     result = entry_signal_trend(df_15m, df_1h, bias, params)
     if result:
         direction, entry, sl, tp1, tp2, rr, atr, trade_type = result
         return direction, entry, sl, tp1, tp2, rr, atr, trade_type
+
+    # Log why trend entry was rejected
+    last = df_15m.iloc[-1]
+    prev = df_15m.iloc[-2]
+    last_1h = df_1h.iloc[-1]
+    atr = last['atr']
+    reasons = []
+    if bias == "BUY":
+        if last['close'] <= prev['high']:
+            reasons.append("no breakout")
+        if last['stoch_k'] > params['stoch_ob']:
+            reasons.append(f"stoch OB {last['stoch_k']:.0f}>{params['stoch_ob']}")
+        if last_1h['macd_hist'] <= 0:
+            reasons.append("1h MACD bear")
+        if last['volume'] < last['vol_ma'] * 1.15:
+            reasons.append(f"vol low {last['volume']/last['vol_ma']:.2f}x")
+        if not params.get("high_vol") and not is_bb_squeeze(df_15m):
+            reasons.append("no BB squeeze")
+        if not params.get("high_vol") and not consolidation_coil(df_15m, atr):
+            reasons.append("no coil")
+    else:
+        if last['close'] >= prev['low']:
+            reasons.append("no breakdown")
+        if last_1h['macd_hist'] >= 0:
+            reasons.append("1h MACD bull")
+        if last['volume'] < last['vol_ma'] * 1.15:
+            reasons.append(f"vol low {last['volume']/last['vol_ma']:.2f}x")
+        if not params.get("high_vol") and not is_bb_squeeze(df_15m):
+            reasons.append("no BB squeeze")
+        if not params.get("high_vol") and not consolidation_coil(df_15m, atr):
+            reasons.append("no coil")
+    print(f"  ↳ {symbol}: {bias} entry rejected [{regime}] — {', '.join(reasons) if reasons else 'RR/TP failed'}")
 
     return None
