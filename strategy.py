@@ -437,8 +437,13 @@ def entry_signal_trend(df_15m, df_1h, direction, params, market_mode="normal"):
         # Explosive breakout trigger: close must clear previous candle's high
         if last['close'] <= prev['high']:
             return None
-        if last['stoch_k'] > stoch_ob:              # Skip overbought entries
-            return None
+        if last['stoch_k'] > stoch_ob:
+            # OB on a strong breakout confirms momentum — don't block it.
+            # Only reject when the breakout is weak or volume is absent.
+            strong_breakout = (last['close'] - prev['high']) > 0.3 * atr
+            strong_volume   = last['volume'] > last['vol_ma'] * 1.5
+            if not (strong_breakout and strong_volume):
+                return None
         if last_1h['macd_hist'] <= 0:               # 1h MACD must be bullish
             return None
         if last['volume'] < last['vol_ma'] * 1.15:  # Volume confirmation
@@ -651,7 +656,10 @@ def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d, symbol="", market_mode
         if last['close'] <= prev['high']:
             reasons.append("no breakout")
         if last['stoch_k'] > params['stoch_ob']:
-            reasons.append(f"stoch OB {last['stoch_k']:.0f}>{params['stoch_ob']}")
+            strong_breakout = (last['close'] - prev['high']) > 0.3 * atr
+            strong_volume   = last['volume'] > last['vol_ma'] * 1.5
+            if not (strong_breakout and strong_volume):
+                reasons.append(f"stoch OB {last['stoch_k']:.0f}>{params['stoch_ob']} weak-breakout")
         if last_1h['macd_hist'] <= 0:
             reasons.append("1h MACD bear")
         if last['volume'] < last['vol_ma'] * 1.15:
