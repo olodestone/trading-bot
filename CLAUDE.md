@@ -39,10 +39,11 @@ Replaced `get_pairs()` approach with a two-stage pipeline:
 - Single `fetch_tickers()` API call — gets 24h data for ALL pairs simultaneously
 - Filters: stablecoin blocklist + `$2M` 24h volume gate + `|1.5%|` movement gate
 - Sorts survivors by 24h volume descending — BTC/ETH/SOL rank naturally at top
-- Returns top 50 per exchange
+- Returns top 40 per exchange
 
 **Stage 2 — `momentum_score()`**
-- Scores each of the 50 by `ATR% × 3h_avg_volume × surge_multiplier`
+- Requires 180 days of 1d history — blocks newly listed and manipulated tokens before they waste fetch calls
+- Scores each of the 40 by `ATR% × 3h_avg_volume × surge_multiplier`
 - Surge multiplier: if last 1h volume > 20-candle average → coin is heating up NOW (capped 3×)
 - Returns top 20 for strategy evaluation
 
@@ -118,15 +119,6 @@ Signal return value: now 8-tuple `(direction, entry, sl, tp1, tp2, rr, atr, trad
 - New: `rr < 2.5` → reject
 - Only the cleanest setups with genuine structural room qualify
 
-### 4f — Mid-Cap Price Filter (`bot.py`)
-
-```python
-MID_CAP_MIN = 0.10   # excludes sub-cent noise
-MID_CAP_MAX = 150.0  # excludes BTC (~$80K) and ETH (~$2K)
-```
-
-Applied in `run_bot()` before indicators run. Focuses the universe on mid-caps with the highest explosive potential.
-
 ---
 
 ## Plan 5 — Adaptive Strategy Parameters
@@ -150,6 +142,15 @@ Computed once in `generate_filtered_signal()` and threaded into:
 - `detect_htf_reversal()` — adaptive StochRSI extremes
 - `entry_signal_trend()` — adaptive StochRSI + RR minimum
 - `entry_signal_reversal()` — adaptive StochRSI + RR minimum
+- `get_htf_bias()` — threshold drops to 3/5 in HIGH vol regime (market already moving, stricter confluence would miss the whole move)
+
+**High-vol regime bypasses:**
+- BB squeeze + consolidation coil gates skipped when `high_vol=True` — crash/breakout markets won't consolidate first
+- SELL trend: StochRSI oversold check permanently removed — in a sustained downtrend the 15m stoch pins near 0 and would block all short entries; oversold filtering is correct for reversals but wrong for trend-following
+
+**Late entry tolerance** (`is_not_late_entry`): tiered by trade type
+- Trend entries: 1.5% tolerance — breakouts often retest the breakout level
+- Reversal entries: 0.3% tolerance — must be entered at the turning point
 
 ---
 
@@ -197,7 +198,6 @@ if pct_raw is not None and abs(pct_raw) < 1.5:
 - Imports `apply_indicators` and `generate_filtered_signal` directly from `strategy.py` — zero duplication, auto-reflects any strategy change
 - Walk-forward simulation: at each 15m candle `i`, slices all dataframes to `df.iloc[:i+1]` — zero lookahead bias
 - Same trade management logic as `performance.py`: breakeven at 1:1, trail tightens at 2:1, TP1 partial, TP2 runner
-- Same mid-cap price filter as `bot.py`
 - Adaptive params run automatically inside `generate_filtered_signal`
 
 **How to run:**
@@ -230,15 +230,15 @@ Every 15 minutes:
    → gate: $2M 24h volume (baseVolume×price fallback for MEXC)
    → gate: |1.5%| movement (skipped if data unavailable)
    → sort by 24h volume
-   → top 50 per exchange
+   → top 40 per exchange
 
-2. momentum_score() for each of the 50
+2. momentum_score() for each of the 40
+   → gate: 180 days 1d history (filters new/manipulated listings)
    → score = ATR% × 3h_vol × surge_mult
    → gate: $75K/h 1h volume
    → top 20 proceed
 
 3. For each of the 20 pairs:
-   → mid-cap filter: $0.10 – $150 price
    → fetch 15m / 1h / 4h / 1d candles
    → apply_indicators() on all 4 timeframes
 
@@ -247,11 +247,11 @@ Every 15 minutes:
    → is_trending(df_4h, adx_min) — adaptive ADX gate
    → detect_htf_reversal() — 4 conditions: structure divergence +
      extreme StochRSI + volume surge + MACD flip
-   → get_htf_bias() — 4/5 confluence points required
+   → get_htf_bias() — 4/5 confluence (3/5 in HIGH vol regime)
    → entry_signal_trend() or entry_signal_reversal():
        - close > prev_high (BUY) / close < prev_low (SELL)
-       - BB squeeze + consolidation coil (trend only)
-       - StochRSI not overbought/oversold (adaptive)
+       - BB squeeze + consolidation coil (trend only; skipped in HIGH vol)
+       - StochRSI not overbought for BUY (adaptive); no OS check for SELL trend
        - 1h MACD confirmation (trend only)
        - volume > 1.15× vol_ma
        - structural SL (swing low/high ± 0.3 ATR)
@@ -320,5 +320,6 @@ Status values: `OPEN`, `WIN`, `BE_WIN`, `LOSS`
 | After Plan 2–3 | 8.0/10 | Volume-based discovery, stablecoin filter |
 | After Plan 4–5 | 8.8/10 | BB squeeze, tiered TP, adaptive params, mid-cap focus |
 | After Plan 6–7 | 9.0/10 | Futures fixed, backtest engine |
+| Current | 9.2/10 | High-vol bypass (BB/coil/bias), sell trend fix, new listing filter, tiered late-entry tolerance |
 
 **Gap to 10/10:** Live order execution (currently manual alerts), session filter, account balance auto-sync, minimum order value check.

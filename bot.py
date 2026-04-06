@@ -56,6 +56,89 @@ PRICE_CACHE = {}
 
 HTF_REFRESH = {"1h": 1200, "4h": 14400, "1d": 86400}
 
+# ==============================
+# MARKET MODE STATE
+# ==============================
+# bear_breadth = % of top-20 pairs where ema50 < ema200 on 1h.
+# Tracks consecutive scans in each zone to debounce noise.
+_bear_mode_scans = 0       # consecutive scans with breadth > 65%
+_recovery_scans  = 0       # consecutive scans with breadth < 45%
+_market_mode     = "normal" # "bear" | "recovery" | "normal"
+
+
+def _update_market_mode(breadth_data):
+    """
+    Compute bear_breadth from already-computed 1h indicator data.
+    bear_breadth = fraction of pairs where ema50 < ema200 on 1h.
+
+    Bear mode activates when > 65% of pairs are below their 200 EMA
+    for 2+ consecutive scans. Deactivates when breadth drops below 45%
+    for 3+ consecutive scans (recovery mode).
+
+    Bear mode   → SELL only, ADX gate -3, vol threshold 0.90×, coil/BB skipped
+    Recovery    → All signals, RR minimum 2.0 across all regimes
+    """
+    global _bear_mode_scans, _recovery_scans, _market_mode
+
+    if not breadth_data:
+        return
+
+    bear_count = sum(
+        1 for df_1h in breadth_data.values()
+        if df_1h.iloc[-1]['ema50'] < df_1h.iloc[-1]['ema200']
+    )
+    breadth = bear_count / len(breadth_data)
+
+    if breadth > 0.65:
+        _bear_mode_scans += 1
+        _recovery_scans   = 0
+    elif breadth < 0.45:
+        _recovery_scans  += 1
+        _bear_mode_scans  = 0
+    else:
+        _bear_mode_scans = max(0, _bear_mode_scans - 1)
+        _recovery_scans  = max(0, _recovery_scans  - 1)
+
+    prev_mode = _market_mode
+    if _bear_mode_scans >= 2:
+        _market_mode = "bear"
+    elif _recovery_scans >= 3:
+        _market_mode = "recovery"
+    else:
+        _market_mode = "normal"
+
+    mode_labels = {"bear": "🐻 BEAR", "recovery": "🌱 RECOVERY", "normal": "😐 NORMAL"}
+    print(f"📊 Market mode: {mode_labels[_market_mode]} | bear_breadth: {breadth:.0%} ({bear_count}/{len(breadth_data)} pairs ema50<ema200)")
+
+    # Notify on mode transitions
+    if _market_mode != prev_mode:
+        if _market_mode == "bear":
+            send_telegram(
+                f"🐻 BEAR MODE ACTIVATED\n"
+                f"bear_breadth: {breadth:.0%} ({bear_count}/{len(breadth_data)} pairs below ema200)\n\n"
+                f"Changes active:\n"
+                f"• SELL signals only (BUY disabled)\n"
+                f"• ADX gate lowered by 3\n"
+                f"• Volume threshold → 0.90×\n"
+                f"• BB squeeze & coil skipped for SELL\n"
+                f"• HTF bias threshold reduced by 1"
+            )
+        elif _market_mode == "recovery":
+            send_telegram(
+                f"🌱 RECOVERY MODE ACTIVATED\n"
+                f"bear_breadth: {breadth:.0%} ({bear_count}/{len(breadth_data)} pairs below ema200)\n\n"
+                f"Changes active:\n"
+                f"• BUY + SELL signals enabled\n"
+                f"• RR minimum → 2.0 (all regimes)\n"
+                f"• All other gates restored to normal"
+            )
+        elif prev_mode in ("bear", "recovery"):
+            send_telegram(
+                f"😐 NORMAL MODE RESTORED\n"
+                f"bear_breadth: {breadth:.0%}\n"
+                f"All standard parameters in effect."
+            )
+
 
 def get_cached_tf(symbol, tf, market_type):
     key = f"{symbol}_{tf}_{market_type}"
@@ -560,6 +643,12 @@ def run_bot():
     refresh_markets_if_needed()
     pairs = get_pairs()
 
+    # ── Phase 1: fetch + indicators for all pairs ──────────────────────────
+    # We need all pairs' indicator data before generating any signals so we
+    # can compute bear_breadth and determine the macro market mode first.
+    all_data    = {}   # symbol → (df_15m, df_1h, df_4h, df_1d, market_type)
+    breadth_data = {}  # symbol → df_1h  (for bear_breadth computation)
+
     for symbol, market_type in pairs:
         df_15m, source = fetch_tf(symbol, "15m", market_type)
         df_1h = get_cached_tf(symbol, "1h", market_type)
@@ -573,11 +662,22 @@ def run_bot():
             continue
 
         df_15m = apply_indicators(df_15m)
-        df_1h = apply_indicators(df_1h)
-        df_4h = apply_indicators(df_4h)
-        df_1d = apply_indicators(df_1d)
+        df_1h  = apply_indicators(df_1h)
+        df_4h  = apply_indicators(df_4h)
+        df_1d  = apply_indicators(df_1d)
 
-        result = generate_filtered_signal(df_15m, df_1h, df_4h, df_1d, symbol=symbol)
+        all_data[symbol]     = (df_15m, df_1h, df_4h, df_1d, market_type)
+        breadth_data[symbol] = df_1h
+
+    # Determine macro market mode from breadth before any signal evaluation
+    _update_market_mode(breadth_data)
+
+    # ── Phase 2: generate signals with market mode applied ─────────────────
+    for symbol, (df_15m, df_1h, df_4h, df_1d, market_type) in all_data.items():
+        result = generate_filtered_signal(
+            df_15m, df_1h, df_4h, df_1d,
+            symbol=symbol, market_mode=_market_mode
+        )
         if not result:
             continue
 

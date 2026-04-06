@@ -64,7 +64,7 @@ def apply_indicators(df):
 # ==============================
 # MARKET CONDITION
 # ==============================
-def get_regime_params(df_4h):
+def get_regime_params(df_4h, market_mode="normal"):
     """
     Detects market volatility regime from 4h ATR percentile rank.
     Returns adaptive thresholds so the strategy loosens in high-vol
@@ -74,18 +74,34 @@ def get_regime_params(df_4h):
     HIGH  (ATR rank > 70th pct): ADX 18, StochRSI 78/22, RR 2.0
     NORMAL(30–70th pct):         ADX 22, StochRSI 72/28, RR 2.5
     LOW   (ATR rank < 30th pct): ADX 25, StochRSI 68/32, RR 3.0
+
+    Market mode overrides (applied on top of regime):
+      bear     — ADX minimum reduced by 3 (ADX lags in early crash phases)
+      recovery — RR minimum set to 2.0 (first-pullback longs have best edge)
     """
     atr = df_4h['atr'].dropna()
     if len(atr) < 50:
-        return {"adx_min": 22, "stoch_ob": 72, "stoch_os": 28, "rr_min": 2.5}
+        params = {"adx_min": 22, "stoch_ob": 72, "stoch_os": 28, "rr_min": 2.5, "high_vol": False}
+    else:
+        rank = float((atr < atr.iloc[-1]).mean())   # 0.0 – 1.0
 
-    rank = float((atr < atr.iloc[-1]).mean())   # 0.0 – 1.0
+        if rank > 0.70:
+            params = {"adx_min": 18, "stoch_ob": 78, "stoch_os": 22, "rr_min": 2.0, "high_vol": True}
+        elif rank < 0.30:
+            params = {"adx_min": 25, "stoch_ob": 68, "stoch_os": 32, "rr_min": 3.0, "high_vol": False}
+        else:
+            params = {"adx_min": 22, "stoch_ob": 72, "stoch_os": 28, "rr_min": 2.5, "high_vol": False}
 
-    if rank > 0.70:
-        return {"adx_min": 18, "stoch_ob": 78, "stoch_os": 22, "rr_min": 2.0, "high_vol": True}
-    if rank < 0.30:
-        return {"adx_min": 25, "stoch_ob": 68, "stoch_os": 32, "rr_min": 3.0, "high_vol": False}
-    return     {"adx_min": 22, "stoch_ob": 72, "stoch_os": 28, "rr_min": 2.5, "high_vol": False}
+    if market_mode == "bear":
+        # ADX lags during early crash phases — trend is real even when ADX hasn't
+        # had 14 bars to accumulate. Drop by 3 to catch sustained downtrends.
+        params["adx_min"] = max(params["adx_min"] - 3, 14)
+    elif market_mode == "recovery":
+        # Best longs come on the first pullback after a bear phase ends.
+        # Relax RR minimum so we don't miss the bulk of the up move.
+        params["rr_min"] = 2.0
+
+    return params
 
 
 def is_trending(df, adx_min=22):
@@ -158,10 +174,14 @@ def structure_bias(df):
 # ==============================
 # HTF BIAS (5-POINT CONFLUENCE)
 # ==============================
-def get_htf_bias(df_1h, df_4h, df_1d, params=None):
+def get_htf_bias(df_1h, df_4h, df_1d, params=None, market_mode="normal"):
     """
     Score confluence across structure + EMA alignment.
     Require >= 4/5 points for a valid bias — reduces false signals.
+
+    Bear mode: SELL only, threshold reduced by 1. In a broad market crash,
+    requiring full 4/5 bearish confluence blocks every short because one
+    non-bearish element (e.g. 1d structure not yet broken) is always present.
     """
     last_1h = df_1h.iloc[-1]
     last_4h = df_4h.iloc[-1]
@@ -189,10 +209,20 @@ def get_htf_bias(df_1h, df_4h, df_1d, params=None):
     else:
         bear_score += 1
 
-    threshold = 3 if params and params.get("high_vol") else 4
-    if bull_score >= threshold:
+    base_threshold = 3 if params and params.get("high_vol") else 4
+
+    if market_mode == "bear":
+        # SELL only — BUY signals are disabled at the caller level.
+        # Reduce threshold by 1: crash markets always have one lagging
+        # non-bearish factor (e.g. daily structure not yet confirmed).
+        sell_threshold = base_threshold - 1
+        if bear_score >= sell_threshold:
+            return "SELL"
+        return None
+
+    if bull_score >= base_threshold:
         return "BUY"
-    if bear_score >= threshold:
+    if bear_score >= base_threshold:
         return "SELL"
     return None
 
@@ -305,7 +335,7 @@ def second_support(df_1h, tp1):
 # ==============================
 # TREND ENTRY SIGNAL
 # ==============================
-def entry_signal_trend(df_15m, df_1h, direction, params):
+def entry_signal_trend(df_15m, df_1h, direction, params, market_mode="normal"):
     if len(df_15m) < 3:
         return None
 
@@ -360,9 +390,17 @@ def entry_signal_trend(df_15m, df_1h, direction, params):
         # Oversold-zone filtering is correct for reversals but wrong for trend-following.
         if last_1h['macd_hist'] >= 0:
             return None
-        if last['volume'] < last['vol_ma'] * 1.15:
+
+        # Bear mode: volume threshold relaxed to 0.90× — volume dries up
+        # market-wide during panic phases; 0.9× with a clean break is meaningful.
+        # Normal/recovery: require the usual 1.15× confirmation.
+        vol_thresh = 0.90 if market_mode == "bear" else 1.15
+        if last['volume'] < last['vol_ma'] * vol_thresh:
             return None
-        if not params.get("high_vol"):
+
+        # Bear mode: skip BB squeeze and coil — crashes move in steps, not from
+        # tight coils. HIGH vol already bypasses these; extend to all regimes in bear.
+        if market_mode != "bear" and not params.get("high_vol"):
             if not is_bb_squeeze(df_15m):
                 return None
             if not consolidation_coil(df_15m, atr):
@@ -470,36 +508,45 @@ def entry_signal_reversal(df_15m, df_1h, direction, params):
 # ==============================
 # FINAL SIGNAL
 # ==============================
-def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d, symbol=""):
+def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d, symbol="", market_mode="normal"):
     # Detect regime once — all signal functions share these adaptive thresholds
-    params = get_regime_params(df_4h)
-    regime = "HIGH" if params.get("high_vol") else ("LOW" if params["adx_min"] == 25 else "NORMAL")
+    params = get_regime_params(df_4h, market_mode)
 
-    # Hard gate: 4h must be trending (adaptive ADX threshold)
+    # Use stoch_ob to infer the per-pair ATR regime — unaffected by bear mode's ADX adjustment
+    regime = "HIGH" if params.get("high_vol") else ("LOW" if params["stoch_ob"] == 68 else "NORMAL")
+
+    mode_tag = f"|{market_mode.upper()}" if market_mode != "normal" else ""
+    regime_label = f"{regime}{mode_tag}"
+
+    # Hard gate: 4h must be trending (adaptive ADX threshold, reduced in bear mode)
     if not is_trending(df_4h, params["adx_min"]):
         adx_val = df_4h.iloc[-1]['adx']
-        print(f"  ↳ {symbol}: ADX {adx_val:.1f} < {params['adx_min']} [{regime}] — skip")
+        print(f"  ↳ {symbol}: ADX {adx_val:.1f} < {params['adx_min']} [{regime_label}] — skip")
         return None
 
     # Reversal check first (higher RR potential)
-    reversal = detect_htf_reversal(df_4h, df_1d, params)
-    if reversal:
-        result = entry_signal_reversal(df_15m, df_1h, reversal, params)
-        if result:
-            direction, entry, sl, tp1, tp2, rr, atr, trade_type = result
-            return direction, entry, sl, tp1, tp2, rr, atr, trade_type
-        print(f"  ↳ {symbol}: reversal {reversal} detected but entry conditions not met")
+    # Skip in bear mode — reversals require an opposing trend which doesn't exist in a crash
+    if market_mode != "bear":
+        reversal = detect_htf_reversal(df_4h, df_1d, params)
+        if reversal:
+            result = entry_signal_reversal(df_15m, df_1h, reversal, params)
+            if result:
+                direction, entry, sl, tp1, tp2, rr, atr, trade_type = result
+                return direction, entry, sl, tp1, tp2, rr, atr, trade_type
+            print(f"  ↳ {symbol}: reversal {reversal} detected but entry conditions not met")
 
     # Trend following
-    bias = get_htf_bias(df_1h, df_4h, df_1d, params)
+    bias = get_htf_bias(df_1h, df_4h, df_1d, params, market_mode)
     if not bias:
         last_1h = df_1h.iloc[-1]
         last_4h = df_4h.iloc[-1]
-        threshold = 3 if params.get("high_vol") else 4
-        print(f"  ↳ {symbol}: HTF bias < {threshold}/5 [regime={regime}] ema50={'>' if last_1h['ema50'] > last_1h['ema200'] else '<'}ema200 di+={'>' if last_4h['plus_di'] > last_4h['minus_di'] else '<'}di-")
+        # In bear mode the threshold is reduced by 1 for SELL — show correct number
+        base_threshold = 3 if params.get("high_vol") else 4
+        threshold = base_threshold - 1 if market_mode == "bear" else base_threshold
+        print(f"  ↳ {symbol}: HTF bias < {threshold}/5 [{regime_label}] ema50={'>' if last_1h['ema50'] > last_1h['ema200'] else '<'}ema200 di+={'>' if last_4h['plus_di'] > last_4h['minus_di'] else '<'}di-")
         return None
 
-    result = entry_signal_trend(df_15m, df_1h, bias, params)
+    result = entry_signal_trend(df_15m, df_1h, bias, params, market_mode)
     if result:
         direction, entry, sl, tp1, tp2, rr, atr, trade_type = result
         return direction, entry, sl, tp1, tp2, rr, atr, trade_type
@@ -528,12 +575,15 @@ def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d, symbol=""):
             reasons.append("no breakdown")
         if last_1h['macd_hist'] >= 0:
             reasons.append("1h MACD bull")
-        if last['volume'] < last['vol_ma'] * 1.15:
+        # Bear mode uses 0.90× vol threshold; normal uses 1.15×
+        vol_thresh = 0.90 if market_mode == "bear" else 1.15
+        if last['volume'] < last['vol_ma'] * vol_thresh:
             reasons.append(f"vol low {last['volume']/last['vol_ma']:.2f}x")
-        if not params.get("high_vol") and not is_bb_squeeze(df_15m):
+        # Bear mode skips BB/coil for SELL — only log these in normal/recovery
+        if market_mode != "bear" and not params.get("high_vol") and not is_bb_squeeze(df_15m):
             reasons.append("no BB squeeze")
-        if not params.get("high_vol") and not consolidation_coil(df_15m, atr):
+        if market_mode != "bear" and not params.get("high_vol") and not consolidation_coil(df_15m, atr):
             reasons.append("no coil")
-    print(f"  ↳ {symbol}: {bias} entry rejected [{regime}] — {', '.join(reasons) if reasons else 'RR/TP failed'}")
+    print(f"  ↳ {symbol}: {bias} entry rejected [{regime_label}] — {', '.join(reasons) if reasons else 'RR/TP failed'}")
 
     return None
