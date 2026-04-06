@@ -333,6 +333,88 @@ def second_support(df_1h, tp1):
 
 
 # ==============================
+# SUPPORT BOUNCE ENTRY
+# ==============================
+def entry_signal_bounce(df_15m, df_1h, df_4h, params):
+    """
+    Catches the FIRST touch of a major support level while the 4h is still
+    structurally bearish — the setup the existing reversal system misses.
+
+    The existing reversal requires trend_4h == "bullish" (structure already
+    recovered). This fires before that, at the actual swing low.
+
+    Gates (all required):
+      1. 4h StochRSI < 20  — deeply oversold, hardcoded extreme (not regime-relative)
+      2. 4h MACD histogram diverging up  — momentum turning even if price hasn't
+      3. Price within 1.5% of a prior 1h swing low  — AT structural support
+      4. 15m engulfing (bullish) OR hammer  — reversal candle confirming the bounce
+      5. 15m volume > 1.5× vol_ma  — real buying interest, not just low-vol drift
+      6. RR ≥ params["rr_min"] + 0.5  — adaptive regime base + counter-trend premium:
+           HIGH vol → 2.5, NORMAL → 3.0, LOW vol → 3.5
+           Counter-trend always needs more reward than a trend entry in the same regime.
+    """
+    if len(df_15m) < 3 or len(df_4h) < 3:
+        return None
+
+    last_4h = df_4h.iloc[-1]
+    prev_4h = df_4h.iloc[-2]
+    last    = df_15m.iloc[-1]
+
+    atr = last['atr']
+    if pd.isna(atr) or atr <= 0:
+        return None
+
+    # Gate 1: 4h deeply oversold — structural extreme
+    if last_4h['stoch_k'] > 20:
+        return None
+
+    # Gate 2: 4h MACD histogram turning up (diverging) — not yet flipped, just turning
+    if last_4h['macd_hist'] <= prev_4h['macd_hist']:
+        return None
+
+    entry = last['close']
+
+    # Gate 3: price must be sitting within 1.5% of a prior 1h swing low
+    prior_lows = [l for l in swing_lows(df_1h) if abs(entry - l) / entry <= 0.015]
+    if not prior_lows:
+        return None
+
+    # Gate 4: 15m engulfing OR hammer candle
+    body       = abs(last['close'] - last['open'])
+    lower_wick = min(last['open'], last['close']) - last['low']
+    upper_wick = last['high'] - max(last['open'], last['close'])
+    is_hammer  = body > 0 and lower_wick >= 2 * body and upper_wick <= body
+    if not is_engulfing(df_15m, "BUY") and not is_hammer:
+        return None
+
+    # Gate 5: 15m volume surge — real capitulation/absorption, not drift
+    if last['volume'] < last['vol_ma'] * 1.5:
+        return None
+
+    # SL below recent 10-bar low — tight, behind the support zone
+    sl   = df_15m['low'].tail(10).min() - (0.3 * atr)
+    risk = entry - sl
+    if risk <= 0:
+        return None
+
+    tp1 = nearest_resistance(df_1h, entry)
+    if tp1 is None:
+        return None
+    reward = tp1 - entry
+    if reward <= 0:
+        return None
+
+    rr = round(reward / risk, 2)
+    rr_min = params["rr_min"] + 0.5   # regime base + counter-trend premium
+    if rr < rr_min:
+        return None
+
+    tp2 = second_resistance(df_1h, tp1)
+
+    return "BUY", entry, sl, tp1, tp2, rr, atr, "bounce"
+
+
+# ==============================
 # TREND ENTRY SIGNAL
 # ==============================
 def entry_signal_trend(df_15m, df_1h, direction, params, market_mode="normal"):
@@ -524,16 +606,24 @@ def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d, symbol="", market_mode
         print(f"  ↳ {symbol}: ADX {adx_val:.1f} < {params['adx_min']} [{regime_label}] — skip")
         return None
 
-    # Reversal check first (higher RR potential)
-    # Skip in bear mode — reversals require an opposing trend which doesn't exist in a crash
-    if market_mode != "bear":
-        reversal = detect_htf_reversal(df_4h, df_1d, params)
-        if reversal:
-            result = entry_signal_reversal(df_15m, df_1h, reversal, params)
-            if result:
-                direction, entry, sl, tp1, tp2, rr, atr, trade_type = result
-                return direction, entry, sl, tp1, tp2, rr, atr, trade_type
-            print(f"  ↳ {symbol}: reversal {reversal} detected but entry conditions not met")
+    # Support bounce — checked before reversal because it fires at the actual bottom,
+    # before the 4h structure has turned. Works in all modes including bear.
+    # This is the setup the standard reversal misses (requires 4h already bullish).
+    bounce = entry_signal_bounce(df_15m, df_1h, df_4h, params)
+    if bounce:
+        direction, entry, sl, tp1, tp2, rr, atr, trade_type = bounce
+        return direction, entry, sl, tp1, tp2, rr, atr, trade_type
+
+    # Structure-confirmed reversal (higher RR potential, requires 1d/4h divergence).
+    # Re-enabled in bear mode — the existing gates (4h structure bullish + vol surge +
+    # MACD flip) are strict enough on their own; bear mode should not block this.
+    reversal = detect_htf_reversal(df_4h, df_1d, params)
+    if reversal:
+        result = entry_signal_reversal(df_15m, df_1h, reversal, params)
+        if result:
+            direction, entry, sl, tp1, tp2, rr, atr, trade_type = result
+            return direction, entry, sl, tp1, tp2, rr, atr, trade_type
+        print(f"  ↳ {symbol}: reversal {reversal} detected but entry conditions not met")
 
     # Trend following
     bias = get_htf_bias(df_1h, df_4h, df_1d, params, market_mode)

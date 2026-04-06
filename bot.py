@@ -554,6 +554,13 @@ def entry_hit(df, entry, direction, trade_type):
             and last['close'] < last['open']
         )
 
+    if trade_type == "bounce":
+        # Entry at support — price dips to the level and shows a bullish close.
+        # No need for prev_high break like reversal; the bounce candle already
+        # confirmed the setup at signal time.
+        if direction == "BUY":
+            return last['low'] <= entry and last['close'] > last['open']
+
     return False
 
 
@@ -562,7 +569,8 @@ def is_not_late_entry(df, entry, direction, trade_type="trend"):
         return False
     price = df.iloc[-1]['close']
     # Trend breakouts retest the breakout level — allow wider tolerance.
-    # Reversals must be entered at the turning point — keep tight.
+    # Reversals and bounces must be entered at the turning point — keep tight.
+    # If price has moved away from a support bounce, the edge is gone.
     threshold = 0.015 if trade_type == "trend" else 0.003
     return abs(price - entry) / entry <= threshold
 
