@@ -56,7 +56,7 @@ def apply_indicators(df):
     df['minus_di'] = minus_di
 
     # Volume MA
-    df['vol_ma'] = df['volume'].rolling(20).mean()
+    df['vol_ma'] = df['volume'].rolling(20).median()
 
     return df
 
@@ -406,10 +406,17 @@ def entry_signal_bounce(df_15m, df_1h, df_4h, params):
 
     rr = round(reward / risk, 2)
     rr_min = params["rr_min"] + 0.5   # regime base + counter-trend premium
-    if rr < rr_min:
-        return None
 
     tp2 = second_resistance(df_1h, tp1)
+
+    if rr >= rr_min:
+        pass
+    elif tp2 is not None:
+        tp2_rr = round((tp2 - entry) / risk, 2)
+        if tp2_rr < rr_min or rr < 1.5:
+            return None
+    else:
+        return None
 
     return "BUY", entry, sl, tp1, tp2, rr, atr, "bounce"
 
@@ -511,11 +518,20 @@ def entry_signal_trend(df_15m, df_1h, direction, params, market_mode="normal"):
         return None
 
     rr = round(reward / risk, 2)
-    if rr < rr_min:
-        return None
 
-    # TP2: next structural level beyond TP1 — runner target
+    # Compute TP2 before the RR gate so it can rescue a marginal TP1.
     tp2 = second_resistance(df_1h, tp1) if direction == "BUY" else second_support(df_1h, tp1)
+
+    if rr >= rr_min:
+        pass  # TP1 alone is sufficient — allow regardless of TP2
+    elif tp2 is not None:
+        # TP1 is marginal — TP2 proves structure has room.
+        # Require TP2 RR ≥ rr_min and TP1 RR ≥ 1.5 (floor — first partial must be meaningful).
+        tp2_rr = round(abs(tp2 - entry) / risk, 2)
+        if tp2_rr < rr_min or rr < 1.5:
+            return None
+    else:
+        return None  # No TP2 to rescue marginal TP1
 
     return direction, entry, sl, tp1, tp2, rr, atr, "trend"
 
@@ -584,10 +600,17 @@ def entry_signal_reversal(df_15m, df_1h, direction, params):
         return None
 
     rr = round(reward / risk, 2)
-    if rr < rr_min:
-        return None
 
     tp2 = second_resistance(df_1h, tp1) if direction == "BUY" else second_support(df_1h, tp1)
+
+    if rr >= rr_min:
+        pass
+    elif tp2 is not None:
+        tp2_rr = round(abs(tp2 - entry) / risk, 2)
+        if tp2_rr < rr_min or rr < 1.5:
+            return None
+    else:
+        return None
 
     return direction, entry, sl, tp1, tp2, rr, atr, "reversal"
 

@@ -92,7 +92,7 @@ def _update_market_mode(breadth_data):
     if breadth > 0.65:
         _bear_mode_scans += 1
         _recovery_scans   = 0
-    elif breadth < 0.45:
+    elif breadth <= 0.45:
         _recovery_scans  += 1
         _bear_mode_scans  = 0
     else:
