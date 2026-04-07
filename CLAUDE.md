@@ -312,6 +312,198 @@ Status values: `OPEN`, `WIN`, `BE_WIN`, `LOSS`
 
 ---
 
+## Plan 8 — Bear / Recovery / Normal Market Mode
+
+**Problem:** Bot fired zero signals during April 5-6 2026 tariff selloff crash. No bear-specific logic existed — all gates were tuned for normal trending markets.
+
+**Changes: `bot.py`, `strategy.py`**
+
+New module-level state in `bot.py`:
+```python
+_bear_mode_scans = 0
+_recovery_scans  = 0
+_market_mode     = "normal"
+```
+
+New function `_update_market_mode(breadth_data)`:
+- Computes `bear_breadth` = fraction of top-20 pairs where `ema50 < ema200` on 1h
+- `breadth > 65%` for 2+ scans → `"bear"` mode
+- `breadth ≤ 45%` for 3+ scans → `"recovery"` mode (boundary is ≤, not <, so 9/20=45% counts)
+- Otherwise → `"normal"` mode
+- Sends Telegram alert on every mode transition
+
+Two-pass `run_bot()`:
+- Phase 1: fetch + apply indicators for all pairs, build `breadth_data{}`
+- Phase 2: `_update_market_mode()`, then generate signals with `market_mode` passed in
+
+**Bear mode changes (`strategy.py`):**
+- `get_htf_bias()`: SELL only, threshold reduced by 1 (4→3 or 3→2 in HIGH vol)
+- `get_regime_params()`: ADX min −3 (floor 14) — ADX lags in early crashes
+- `entry_signal_trend()` SELL: vol threshold 0.90× instead of 1.15×; BB squeeze + coil skipped
+- Reversal BUY re-enabled in bear mode (gates are already strict enough)
+
+**Recovery mode changes:**
+- `get_regime_params()`: forces `rr_min = 2.0` across all regimes
+
+---
+
+## Plan 9 — Support Bounce Entry Type
+
+**Problem:** BUY signals at support during downtrend couldn't fire — reversal required 4h already bullish, which isn't true at first touch of support.
+
+**Changes: `strategy.py`**
+
+New function `entry_signal_bounce(df_15m, df_1h, df_4h, params)`:
+- Gate 1: `last_4h['stoch_k'] < 20` — 4h must be oversold (at support, not mid-range)
+- Gate 2: `4h macd_hist` improving (turning less negative) — momentum inflecting
+- Gate 3: prior 1h swing low within 1.5% of entry — price at actual structural support
+- Gate 4: 15m bullish engulfing OR hammer — reversal candle confirmation
+- Gate 5: `volume > vol_ma × 1.5` — real buying interest
+- SL: `df_15m['low'].tail(10).min() − (0.3 × ATR)`
+- RR minimum: `params["rr_min"] + 0.5` — counter-trend premium (HIGH→2.5, NORMAL→3.0, LOW→3.5)
+
+Hammer detection:
+```python
+body = abs(last['close'] - last['open'])
+lower_wick = min(last['open'], last['close']) - last['low']
+upper_wick = last['high'] - max(last['open'], last['close'])
+is_hammer = body > 0 and lower_wick >= 2 * body and upper_wick <= body
+```
+
+Checked before reversal in `generate_filtered_signal()`. Works in all market modes including bear.
+
+**Late entry tolerance:** bounce uses 0.3% (same as reversal — must be at support).
+
+---
+
+## Plan 10 — StochRSI Smarter OB Usage
+
+**Problem:** StochRSI OB was a hard block on BUY. But OB on a genuine momentum breakout confirms the move — blocking it was wrong.
+
+**Changes: `strategy.py` — `entry_signal_trend()`**
+
+```python
+if last['stoch_k'] > stoch_ob:
+    strong_breakout = (last['close'] - prev['high']) > 0.3 * atr
+    strong_volume   = last['volume'] > last['vol_ma'] * 1.5
+    if not (strong_breakout and strong_volume):
+        return None
+    # else: OB is confirming momentum, allow
+```
+
+Rejection log updated: `"stoch OB 92>68 weak-breakout"` — shows OB was considered but bypass didn't trigger.
+
+Rule: OB + weak breakout → reject. OB + strong breakout (close > prev_high by 0.3 ATR) + strong volume (1.5×) → allow.
+
+---
+
+## Plan 11 — Median vol_ma (Volume Illusion Fix)
+
+**Problem:** `vol_ma = rolling(20).mean()` was destroyed by crash/bounce spike candles. 3-5 massive candles in the 20-candle window inflated the mean so badly that normal candles showed as 0.00x–0.07x, blocking all volume gates.
+
+**Changes: `strategy.py` — `apply_indicators()`**
+
+```python
+# Before:
+df['vol_ma'] = df['volume'].rolling(20).mean()
+
+# After:
+df['vol_ma'] = df['volume'].rolling(20).median()
+```
+
+Median of 20 values = 10th value. Up to 9 spike candles cannot move it. Volume data is right-skewed — median is the statistically correct central tendency estimator. Confirmed working in logs: BTC, DOT, ETH/spot vol rejections disappeared after deployment.
+
+---
+
+## Plan 12 — TP2-Primary RR Gating
+
+**Problem:** RR gate only checked TP1. A setup with TP1 RR 1.8 and TP2 RR 4.0 was rejected even though the trade plan (50% at TP1, runner to TP2) proved structural room.
+
+**Changes: `strategy.py` — `entry_signal_trend()`, `entry_signal_reversal()`, `entry_signal_bounce()`**
+
+TP2 computed before RR gate in all three functions. Logic:
+
+```python
+if rr >= rr_min:
+    pass  # TP1 sufficient on its own — original behavior
+elif tp2 is not None:
+    tp2_rr = round(abs(tp2 - entry) / risk, 2)
+    if tp2_rr < rr_min or rr < 1.5:
+        return None
+    # TP2 proves structure has room — allow with TP1 ≥ 1.5 floor
+else:
+    return None  # No TP2 to rescue marginal TP1
+```
+
+The 1.5 floor on TP1 is a minimum — TP1 can be 1.7, 2.3, anything ≥ 1.5. It just ensures the first partial close is meaningful. TP1 ≥ rr_min bypasses TP2 check entirely.
+
+---
+
+## Current Signal Flow (End to End)
+
+```
+Every 15 minutes:
+
+1. fetch_tickers() [one API call per exchange]
+   → block stablecoins + non-crypto commodities
+   → gate: $2M 24h volume (baseVolume×price fallback for MEXC)
+   → gate: |1.5%| movement (skipped if data unavailable)
+   → sort by 24h volume
+   → top 40 per exchange
+
+2. momentum_score() for each of the 40
+   → gate: 180 days 1d history (filters new/manipulated listings)
+   → score = ATR% × 3h_vol × surge_mult
+   → gate: $75K/h 1h volume
+   → top 20 proceed
+
+3. Phase 1: fetch 15m/1h/4h/1d for all 20 pairs, apply_indicators()
+   → compute bear_breadth from 1h EMA50/EMA200 across all pairs
+   → _update_market_mode() → "bear" / "recovery" / "normal"
+
+4. Phase 2 — generate_filtered_signal() per pair:
+   → get_regime_params(df_4h, market_mode) — HIGH/NORMAL/LOW vol + mode adjustments
+   → is_trending(df_4h, adx_min) — adaptive ADX gate
+   → entry_signal_bounce() — counter-trend BUY at structural support (fires first)
+   → detect_htf_reversal() — 4 conditions: structure divergence +
+     extreme StochRSI + volume surge + MACD flip
+   → get_htf_bias() — 4/5 confluence (3/5 in HIGH vol; −1 more in bear mode for SELL)
+   → entry_signal_trend() or entry_signal_reversal():
+       - 15m close > prev_high (BUY) / close < prev_low (SELL)
+       - BB squeeze + consolidation coil (trend only; skipped in HIGH vol + bear SELL)
+       - StochRSI OB: bypass allowed if close−prev_high > 0.3×ATR AND vol > 1.5×vol_ma
+       - 1h MACD confirmation (trend only)
+       - volume > 1.15× vol_ma (median-based, spike-resistant)
+       - structural SL (swing low/high ± 0.3 ATR)
+       - TP1 = nearest 1h swing level
+       - TP2 = second 1h swing level (runner) — computed before RR gate
+       - RR gate: TP1 ≥ rr_min → pass; else TP2 ≥ rr_min AND TP1 ≥ 1.5 → pass
+
+5. Signal fires → pending queue (waits for entry to be touched)
+6. Entry hit → live trade saved to DB
+7. Trade monitored every 15 min:
+   → 1:1 hit → SL to breakeven
+   → 2:1 hit → trail tightens (price - 1.2×risk)
+   → TP1 hit → alert "Close 50%", tp1_hit=True
+   → TP2 hit → alert "Close 25%, trail rest", status=WIN
+   → trail_sl hit → status=BE_WIN or LOSS
+```
+
+---
+
+## HTF Bias Confluence Thresholds
+
+| Condition | Threshold |
+|---|---|
+| Normal vol, any mode | 4/5 |
+| HIGH vol regime | 3/5 |
+| Bear mode, normal vol | 3/5 (4−1) |
+| Bear mode, HIGH vol | 2/5 (3−1) |
+
+The 5 confluence factors: EMA50 vs EMA200 (1h), DI+ vs DI− (4h), 1d structure, 4h structure, 1h MACD direction.
+
+---
+
 ## Bot Rating History
 
 | Version | Grade | Key addition |
@@ -320,6 +512,7 @@ Status values: `OPEN`, `WIN`, `BE_WIN`, `LOSS`
 | After Plan 2–3 | 8.0/10 | Volume-based discovery, stablecoin filter |
 | After Plan 4–5 | 8.8/10 | BB squeeze, tiered TP, adaptive params, mid-cap focus |
 | After Plan 6–7 | 9.0/10 | Futures fixed, backtest engine |
-| Current | 9.2/10 | High-vol bypass (BB/coil/bias), sell trend fix, new listing filter, tiered late-entry tolerance |
+| After Plan 8 | 9.2/10 | Bear/recovery/normal market mode, sell trend fix, HTF bias bypass |
+| Current | 9.4/10 | Support bounce entry, StochRSI OB bypass, median vol_ma, TP2-primary RR gating |
 
 **Gap to 10/10:** Live order execution (currently manual alerts), session filter, account balance auto-sync, minimum order value check.

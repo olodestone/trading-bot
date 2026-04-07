@@ -348,7 +348,7 @@ def entry_signal_bounce(df_15m, df_1h, df_4h, params):
       2. 4h MACD histogram diverging up  — momentum turning even if price hasn't
       3. Price within 1.5% of a prior 1h swing low  — AT structural support
       4. 15m engulfing (bullish) OR hammer  — reversal candle confirming the bounce
-      5. 15m volume > 1.5× vol_ma  — real buying interest, not just low-vol drift
+      5. Volume ≥ 1.5× vol_ma (or ≥ 0.8× when stoch_k < 15 extreme oversold)
       6. RR ≥ params["rr_min"] + 0.5  — adaptive regime base + counter-trend premium:
            HIGH vol → 2.5, NORMAL → 3.0, LOW vol → 3.5
            Counter-trend always needs more reward than a trend entry in the same regime.
@@ -368,6 +368,12 @@ def entry_signal_bounce(df_15m, df_1h, df_4h, params):
     if last_4h['stoch_k'] > 20:
         return None
 
+    # Plan B: extreme oversold flag — when stoch_k < 15, volume requirement
+    # is relaxed from 1.5× to 0.8×. Crash conditions inflate vol_ma even with
+    # median; the first recovery candle at structural support reads artificially
+    # low against that inflated baseline. The stoch_k < 15 gate compensates.
+    extreme_oversold = last_4h['stoch_k'] < 15
+
     # Gate 2: 4h MACD histogram turning up (diverging) — not yet flipped, just turning
     if last_4h['macd_hist'] <= prev_4h['macd_hist']:
         return None
@@ -379,7 +385,18 @@ def entry_signal_bounce(df_15m, df_1h, df_4h, params):
     if not prior_lows:
         return None
 
-    # Gate 4: 15m engulfing OR hammer candle
+    # Gate 3b: extreme oversold only — before allowing the 0.8× volume relaxation,
+    # confirm a momentum shift has begun. Standard oversold (15–20) keeps the 1.5×
+    # volume gate which already enforces real buying; no extra gate needed there.
+    # Prevents entering a continuation dump at the relaxed threshold.
+    if extreme_oversold:
+        nearest_low      = min(prior_lows, key=lambda l: abs(entry - l))
+        stoch_rising     = last_4h['stoch_k'] > prev_4h['stoch_k']
+        price_reclaiming = entry >= nearest_low   # close at or above support = holding
+        if not (stoch_rising or price_reclaiming):
+            return None
+
+    # Gate 4: 15m bullish reaction candle — engulfing OR hammer
     body       = abs(last['close'] - last['open'])
     lower_wick = min(last['open'], last['close']) - last['low']
     upper_wick = last['high'] - max(last['open'], last['close'])
@@ -387,8 +404,12 @@ def entry_signal_bounce(df_15m, df_1h, df_4h, params):
     if not is_engulfing(df_15m, "BUY") and not is_hammer:
         return None
 
-    # Gate 5: 15m volume surge — real capitulation/absorption, not drift
-    if last['volume'] < last['vol_ma'] * 1.5:
+    # Gate 5: volume check — threshold depends on how oversold 4h is.
+    # Extreme oversold (stoch_k < 15): 0.8× — first recovery candle at a crash
+    #   low is the highest-probability bounce but vol_ma is still inflated.
+    # Standard oversold (15–20): 1.5× — require real buying absorption.
+    vol_min = 0.8 if extreme_oversold else 1.5
+    if last['volume'] < last['vol_ma'] * vol_min:
         return None
 
     # SL below recent 10-bar low — tight, behind the support zone
@@ -419,6 +440,117 @@ def entry_signal_bounce(df_15m, df_1h, df_4h, params):
         return None
 
     return "BUY", entry, sl, tp1, tp2, rr, atr, "bounce"
+
+
+# ==============================
+# FADE RESISTANCE ENTRY (BEAR MODE SELL)
+# ==============================
+def entry_signal_fade_resistance(df_15m, df_4h, df_1h, params):
+    """
+    Plan A: Rally-to-resistance SELL in a confirmed 4h downtrend.
+
+    Price bounces in a bear market and presses into the 4h EMA50 (dynamic
+    resistance). A bearish reversal candle forms at that level, then the
+    NEXT 15m candle closes below its low — confirming sellers took control.
+
+    Intentionally bypasses 1h MACD bull: the bullish MACD is the symptom of
+    the rally that delivered price to resistance, not a new uptrend. The 4h
+    ema50 < ema200 structure is the authority.
+
+    Gates (all required):
+      1. 4h ema50 < ema200                   — bear structure confirmed
+      2. Reversal candle high within 2% of 4h EMA50  — at dynamic resistance
+      3. 4h stoch_k > 60                     — rally reached resistance (not OS)
+      4. Prev 15m: shooting star OR bearish engulfing  — reversal candle at level
+      5. Last 15m: close < prev['low']        — break-of-low confirmation
+      6. Volume 0.8x–1.2x on confirmation    — normal fade vol; spike = breakout
+    """
+    if len(df_15m) < 3 or len(df_4h) < 3:
+        return None
+
+    last_4h  = df_4h.iloc[-1]
+    last     = df_15m.iloc[-1]
+    prev     = df_15m.iloc[-2]   # the reversal candle that formed at resistance
+    prev_prev = df_15m.iloc[-3]  # candle before it (needed for engulfing check)
+
+    atr = last['atr']
+    if pd.isna(atr) or atr <= 0:
+        return None
+
+    # Gate 1: 4h bear structure confirmed
+    if last_4h['ema50'] >= last_4h['ema200']:
+        return None
+
+    # Gate 2: reversal candle's high was within 2% of 4h EMA50 (tested resistance)
+    ema50_4h = last_4h['ema50']
+    price_ref = max(prev['high'], prev['close'])
+    if abs(price_ref - ema50_4h) / ema50_4h > 0.02:
+        return None
+
+    # Gate 3: 4h stoch_k > 60 — rally has momentum, not already washed out
+    if last_4h['stoch_k'] < 60:
+        return None
+
+    # Gate 4: prev 15m candle is a bearish reversal
+    # Shooting star: body at bottom, upper wick ≥ 2× body, lower wick ≤ body
+    prev_body        = abs(prev['close'] - prev['open'])
+    prev_upper_wick  = prev['high'] - max(prev['open'], prev['close'])
+    prev_lower_wick  = min(prev['open'], prev['close']) - prev['low']
+    is_shooting_star = (
+        prev_body > 0
+        and prev_upper_wick >= 2 * prev_body
+        and prev_lower_wick <= prev_body
+    )
+    # Bearish engulfing: prev_prev bullish, prev bearish and engulfs it
+    is_bearish_engulf = (
+        prev_prev['close'] > prev_prev['open']
+        and prev['close'] < prev['open']
+        and prev['open'] >= prev_prev['close']
+        and prev['close'] <= prev_prev['open']
+    )
+    if not is_shooting_star and not is_bearish_engulf:
+        return None
+
+    # Gate 5: current candle closed below the reversal candle's low (confirmed break)
+    if last['close'] >= prev['low']:
+        return None
+
+    # Gate 6: volume on confirmation candle in 0.8x–1.2x range
+    # Below 0.8x: too quiet, move has no conviction
+    # Above 1.2x: high volume at this level = buyers pushing through, not a fade
+    vol_ratio = last['volume'] / last['vol_ma'] if last['vol_ma'] > 0 else 0
+    if vol_ratio < 0.8 or vol_ratio > 1.2:
+        return None
+
+    # SL above the reversal candle's high — that's the invalidation point
+    entry = last['close']
+    sl    = prev['high'] + (0.3 * atr)
+    risk  = sl - entry
+    if risk <= 0:
+        return None
+
+    tp1 = nearest_support(df_1h, entry)
+    if tp1 is None:
+        return None
+    reward = entry - tp1
+    if reward <= 0:
+        return None
+
+    rr   = round(reward / risk, 2)
+    rr_min = params["rr_min"]
+
+    tp2 = second_support(df_1h, tp1)
+
+    if rr >= rr_min:
+        pass
+    elif tp2 is not None:
+        tp2_rr = round(abs(tp2 - entry) / risk, 2)
+        if tp2_rr < rr_min or rr < 1.5:
+            return None
+    else:
+        return None
+
+    return "SELL", entry, sl, tp1, tp2, rr, atr, "fade"
 
 
 # ==============================
@@ -634,13 +766,37 @@ def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d, symbol="", market_mode
         print(f"  ↳ {symbol}: ADX {adx_val:.1f} < {params['adx_min']} [{regime_label}] — skip")
         return None
 
-    # Support bounce — checked before reversal because it fires at the actual bottom,
-    # before the 4h structure has turned. Works in all modes including bear.
-    # This is the setup the standard reversal misses (requires 4h already bullish).
+    # Priority routing — fade vs bounce ordering depends on proximity to resistance.
+    # When price is within 1.5% of 4h EMA50 in bear mode, a bounce BUY would be
+    # entering directly into overhead resistance. Fade SELL takes priority there.
+    # When price is NOT near EMA50, bounce at support fires first as normal.
+    near_ema50_resistance = False
+    if market_mode == "bear":
+        _ema50_4h   = df_4h.iloc[-1]['ema50']
+        _last_close = df_15m.iloc[-1]['close']
+        near_ema50_resistance = abs(_last_close - _ema50_4h) / _ema50_4h <= 0.015
+
+    # Near EMA50 resistance: fade first, then bounce
+    if near_ema50_resistance:
+        fade = entry_signal_fade_resistance(df_15m, df_4h, df_1h, params)
+        if fade:
+            direction, entry, sl, tp1, tp2, rr, atr, trade_type = fade
+            return direction, entry, sl, tp1, tp2, rr, atr, trade_type
+
+    # Support bounce — fires at actual bottom before 4h structure turns.
+    # Works in all modes. Near-resistance case: bounce still attempted if fade failed.
     bounce = entry_signal_bounce(df_15m, df_1h, df_4h, params)
     if bounce:
         direction, entry, sl, tp1, tp2, rr, atr, trade_type = bounce
         return direction, entry, sl, tp1, tp2, rr, atr, trade_type
+
+    # Fade for bear mode when NOT near EMA50 resistance
+    # (near-resistance case already checked above before bounce).
+    if market_mode == "bear" and not near_ema50_resistance:
+        fade = entry_signal_fade_resistance(df_15m, df_4h, df_1h, params)
+        if fade:
+            direction, entry, sl, tp1, tp2, rr, atr, trade_type = fade
+            return direction, entry, sl, tp1, tp2, rr, atr, trade_type
 
     # Structure-confirmed reversal (higher RR potential, requires 1d/4h divergence).
     # Re-enabled in bear mode — the existing gates (4h structure bullish + vol surge +
