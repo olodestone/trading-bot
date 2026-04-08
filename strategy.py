@@ -133,6 +133,7 @@ def get_regime_params(df_4h, market_mode="normal"):
     # Store current 4h ADX so entry functions can check trend strength without
     # receiving df_4h directly — used for the BB/coil bypass (ADX > 28).
     params["adx_4h"] = float(df_4h.iloc[-1]["adx"]) if not pd.isna(df_4h.iloc[-1]["adx"]) else 0.0
+    params["market_mode"] = market_mode
 
     return params
 
@@ -444,6 +445,18 @@ def entry_signal_bounce(df_15m, df_1h, df_4h, params):
     # ── BUY at support ─────────────────────────────────────────────────────
     if near_sup:
         nearest_sup = max(near_sup)
+        dist_atr    = round((entry - nearest_sup) / atr, 2)
+
+        # In recovery mode require structure to be turning bullish before buying.
+        if params.get("market_mode") == "recovery":
+            close_above_ema50 = entry > df_1h.iloc[-1].get("ema50", entry - 1)
+            _sw_lows  = swing_lows(df_1h)
+            higher_low = len(_sw_lows) >= 2 and _sw_lows[-1] > _sw_lows[-2]
+            gate_pass  = close_above_ema50 or higher_low
+            print(f"    bounce BUY: sup={nearest_sup:.4f} dist={dist_atr}ATR | recovery gate: ema50={'✓' if close_above_ema50 else '✗'} higher_low={'✓' if higher_low else '✗'} → {'pass' if gate_pass else 'BLOCK'}")
+            if not gate_pass:
+                return None
+
         conf_candle = is_engulfing(df_15m, "BUY") or is_hammer
         conf_rsi    = stoch_k < 30
         conf_macd   = macd_turning_up
@@ -460,10 +473,18 @@ def entry_signal_bounce(df_15m, df_1h, df_4h, params):
                         confs = [c for c in ["candle", "rsi_os", "macd_turn"] if [conf_candle, conf_rsi, conf_macd][["candle", "rsi_os", "macd_turn"].index(c)]]
                         print(f"    bounce BUY conf={'+'.join(confs)} stoch={stoch_k:.0f} rr={rr}")
                         return "BUY", entry, sl, tp1, tp2, rr, atr, "bounce"
+        else:
+            print(f"    bounce BUY: sup={nearest_sup:.4f} dist={dist_atr}ATR | no confirmation (candle=✗ stoch={stoch_k:.0f} macd={'↑' if macd_turning_up else '↓'})")
+    else:
+        if params.get("market_mode") != "recovery":
+            print(f"    bounce BUY: no structure near price (tol={round(tol, 4)})")
 
     # ── SELL at resistance ─────────────────────────────────────────────────
-    if near_res:
+    # Skip SELL bounces in recovery mode — market is turning bullish; a SELL
+    # queued here would lock out the directionally-correct BUY for 15+ minutes.
+    if near_res and params.get("market_mode") != "recovery":
         nearest_res = min(near_res)
+        dist_atr    = round((nearest_res - entry) / atr, 2)
         conf_candle = is_engulfing(df_15m, "SELL") or is_shooting_star
         conf_rsi    = stoch_k > 70
         conf_macd   = macd_turning_down
@@ -480,6 +501,10 @@ def entry_signal_bounce(df_15m, df_1h, df_4h, params):
                         confs = [c for c in ["candle", "rsi_ob", "macd_turn"] if [conf_candle, conf_rsi, conf_macd][["candle", "rsi_ob", "macd_turn"].index(c)]]
                         print(f"    bounce SELL conf={'+'.join(confs)} stoch={stoch_k:.0f} rr={rr}")
                         return "SELL", entry, sl, tp1, tp2, rr, atr, "bounce"
+        else:
+            print(f"    bounce SELL: res={nearest_res:.4f} dist={dist_atr}ATR | no confirmation (candle=✗ stoch={stoch_k:.0f} macd={'↓' if macd_turning_down else '↑'})")
+    elif not near_res and params.get("market_mode") != "recovery":
+        print(f"    bounce SELL: no structure near price (tol={round(tol, 4)})")
 
     return None
 
@@ -1197,21 +1222,18 @@ def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d, symbol="", market_mode
 # ==============================
 def generate_pullback_signal(df_15m, df_1h, df_4h, df_1d=None, symbol="", market_mode="normal"):
     """
-    3-step pullback trend system.
+    Routing logic (ADX ≥ threshold branch):
 
-    Step 1 — Regime Filter
-      Trend exists? ADX > threshold AND 4H EMA50 slope confirms direction.
+      trend_ok  = 4h EMA50 slope clearly bull or bear
+      rsi_ok    = 1h RSI in pullback zone
+      confluence = Step-3 trigger score (0-3)
 
-    Step 2 — Setup
-      1H RSI in pullback zone — price has retraced into the trend, not chasing.
+      trend_ok AND rsi_ok AND confluence ≥ 2  →  PULLBACK
+      trend_ok                                →  BOUNCE
+      else                                    →  MICRO
 
-    Step 3 — Trigger
-      15M RSI cross back in trend direction + price above/below EMA20.
-
-    Step 4 — Management (handled in backtest/bot)
-      TP1: 1R   → partial exit (50%), move SL to BE
-      TP2: 2.5R → runner (remaining 50%)
-      BE: only after TP1 is hit
+    ADX < threshold → RANGE → else MICRO (unchanged)
+    Bear mode: only SELL; recovery mode: no SELL.
     """
     if len(df_4h) < 6 or len(df_1h) < 2 or len(df_15m) < 3:
         return None
@@ -1219,28 +1241,25 @@ def generate_pullback_signal(df_15m, df_1h, df_4h, df_1d=None, symbol="", market
     last_4h  = df_4h.iloc[-1]
     last_1h  = df_1h.iloc[-1]
     last_15m = df_15m.iloc[-1]
-    prev_15m = df_15m.iloc[-2]
 
-    # ── Step 1: Regime Filter ──────────────────────────────────────────────
-    # ADX confirms a trend exists. If ADX is below threshold the pair is ranging —
-    # fall back to the range entry instead of returning nothing.
+    params = get_regime_params(df_4h, market_mode)
+
+    # ── ADX gate: ranging market → RANGE → else MICRO ─────────────────────
     adx = last_4h.get("adx", 0)
     adx_min = 17 if market_mode == "bear" else 20
     if pd.isna(adx) or adx < adx_min:
-        params = get_regime_params(df_4h, market_mode)
         range_result = entry_signal_range(df_15m, df_1h, df_4h, params, market_mode)
         if range_result:
             direction, entry, sl, tp1, tp2, rr, atr, _ = range_result
             print(f"  ✅ RANGE {direction} {symbol} | ADX4h={adx:.1f}<{adx_min} (ranging) | entry={entry:.4f} sl={sl:.4f} tp1={tp1:.4f} rr={rr} | mode={market_mode}")
             return range_result
-        # Range missed — try micro trend as final fallback in ranging market
         micro = entry_signal_micro_trend(df_15m, df_1h, params, market_mode)
         if micro:
             m_dir, m_entry, m_sl, m_tp1, _, m_rr, m_atr, _ = micro
-            print(f"  ✅ MICRO {m_dir} {symbol} | ADX4h={adx:.1f} (range+pullback miss) | entry={m_entry:.4f} sl={m_sl:.4f} tp1={m_tp1:.4f} rr={m_rr} | mode={market_mode}")
+            print(f"  ✅ MICRO {m_dir} {symbol} | ADX4h={adx:.1f} (range miss) | entry={m_entry:.4f} sl={m_sl:.4f} tp1={m_tp1:.4f} rr={m_rr} | mode={market_mode}")
         return micro
 
-    # EMA50 slope: compare current vs 5 bars ago (confirms trend is moving, not flat)
+    # ── trend_ok: 4h EMA50 slope clearly directional ──────────────────────
     ema50_now  = last_4h["ema50"]
     ema200_now = last_4h["ema200"]
     ema50_prev = df_4h.iloc[-6]["ema50"]
@@ -1252,100 +1271,82 @@ def generate_pullback_signal(df_15m, df_1h, df_4h, df_1d=None, symbol="", market
 
     if market_mode == "bear":
         if not ema_bear:
-            return None
+            return None       # bear mode: only trade SELL in a confirmed downtrend
         direction = "SELL"
+        trend_ok  = True
     elif ema_bull and not ema_bear:
         direction = "BUY"
+        trend_ok  = True
     elif ema_bear and not ema_bull:
         direction = "SELL"
+        trend_ok  = True
     else:
-        return None   # flat or conflicting
+        direction = None      # flat / conflicting — no pullback direction
+        trend_ok  = False
 
-    # ── Step 2: Setup ─────────────────────────────────────────────────────
-    # 1H RSI must be in pullback zone — retracing into the trend, not overextended.
-    # Recovery mode: market is recovering — block SELL signals (symmetric with
-    # bear mode blocking BUY).
+    # Recovery mode: no shorting into a recovering market
+    if market_mode == "recovery" and direction == "SELL":
+        return None
+
+    # ── rsi_ok: 1h RSI in pullback zone ───────────────────────────────────
     rsi_1h = last_1h.get("rsi")
     if pd.isna(rsi_1h):
         return None
 
-    if market_mode == "recovery" and direction == "SELL":
-        return None   # don't short into a recovering market
-
-    if direction == "BUY":
-        if not (40 <= rsi_1h <= 48):   # real pullback, trend still intact
-            return None
+    if trend_ok:
+        rsi_ok = (40 <= rsi_1h <= 48) if direction == "BUY" else (52 <= rsi_1h <= 60)
     else:
-        if not (52 <= rsi_1h <= 60):   # not oversold, not mid-range noise
+        rsi_ok = False
+
+    # ── confluence: Step-3 trigger score ──────────────────────────────────
+    confluence = 0
+    if trend_ok and rsi_ok and len(df_1h) >= 5:
+        prev_1h     = df_1h.iloc[-2]
+        rsi_1h_prev = prev_1h.get("rsi")
+        ema20       = last_15m.get("ema20")
+        close       = last_15m["close"]
+        if not any(pd.isna(x) for x in [rsi_1h_prev, ema20]):
+            if direction == "BUY":
+                rsi_in_zone = 40 <= rsi_1h <= 52
+                rsi_cross   = (rsi_1h_prev <= 45) and (rsi_1h > 45)
+                ema_align   = close > ema20
+            else:
+                rsi_in_zone = 48 <= rsi_1h <= 60
+                rsi_cross   = (rsi_1h_prev >= 55) and (rsi_1h < 55)
+                ema_align   = close < ema20
+            confluence = sum([rsi_in_zone, rsi_cross, ema_align])
+
+    # ── Route ─────────────────────────────────────────────────────────────
+    if trend_ok and rsi_ok and confluence >= 2:
+        # Full pullback setup confirmed
+        atr   = last_15m.get("atr", 0)
+        close = last_15m["close"]
+        if direction == "BUY":
+            sl = df_15m["low"].tail(10).min() - 0.3 * atr
+        else:
+            sl = df_15m["high"].tail(10).max() + 0.3 * atr
+        risk = abs(close - sl)
+        if risk <= 0 or risk > close * 0.06:
             return None
+        tp1 = close + (1.0 * risk if direction == "BUY" else -1.0 * risk)
+        rr  = 1.0
+        print(f"  ✅ PULLBACK {direction} {symbol} | RSI1h={rsi_1h:.1f} ADX4h={adx:.1f} conf={confluence}/3 | entry={close:.4f} sl={sl:.4f} tp1={tp1:.4f} trail-after | mode={market_mode}")
+        return (direction, close, sl, tp1, None, rr, atr, "pullback")
 
-    # ── Step 3: Trigger ───────────────────────────────────────────────────
-    # 1H RSI crosses back in trend direction + 15M price on correct side of EMA20.
-    # Prior-depth check: RSI must have come FROM a meaningful level before this
-    # cross — prevents triggering on repeated oscillations around 45/55.
-    if len(df_1h) < 5:
-        return None
-
-    prev_1h     = df_1h.iloc[-2]
-    rsi_1h_prev = prev_1h.get("rsi")
-    rsi_1h_lookback = df_1h["rsi"].iloc[-5:-1]   # 4 bars before current
-
-    ema20 = last_15m.get("ema20")
-    close = last_15m["close"]
-
-    if any(pd.isna(x) for x in [rsi_1h_prev, ema20]):
-        return None
-
-    # 3-of-4 confluence: EMA slope already confirmed (mandatory).
-    # Need any 2 of the remaining 3: RSI zone, RSI cross, EMA20 align.
-    if direction == "BUY":
-        rsi_in_zone = 40 <= rsi_1h <= 52          # widened slightly from 48
-        rsi_cross   = (rsi_1h_prev <= 45) and (rsi_1h > 45)
-        ema_align   = close > ema20
-    else:
-        rsi_in_zone = 48 <= rsi_1h <= 60          # widened slightly from 52
-        rsi_cross   = (rsi_1h_prev >= 55) and (rsi_1h < 55)
-        ema_align   = close < ema20
-
-    confluence = sum([rsi_in_zone, rsi_cross, ema_align])
-
-    if confluence < 2:
-        # Pullback conditions not met — try bounce then micro trend as fallbacks
-        params = get_regime_params(df_4h, market_mode)
+    elif trend_ok:
+        # Trend is clear but RSI not in zone or confluence too low → BOUNCE
+        reason = "rsi-zone-miss" if not rsi_ok else "low-conf"
         bounce_result = entry_signal_bounce(df_15m, df_1h, df_4h, params)
         if bounce_result:
             b_dir, b_entry, b_sl, b_tp1, b_tp2, b_rr, b_atr, _ = bounce_result
-            print(f"  ✅ BOUNCE {b_dir} {symbol} | RSI1h={rsi_1h:.1f} ADX4h={adx:.1f} (pullback miss→bounce) | entry={b_entry:.4f} sl={b_sl:.4f} tp1={b_tp1:.4f} rr={b_rr} | mode={market_mode}")
-            return bounce_result
+            print(f"  ✅ BOUNCE {b_dir} {symbol} | RSI1h={rsi_1h:.1f} ADX4h={adx:.1f} ({reason}→bounce) | entry={b_entry:.4f} sl={b_sl:.4f} tp1={b_tp1:.4f} rr={b_rr} | mode={market_mode}")
+        return bounce_result
+
+    else:
+        # EMA flat / conflicting — no trend direction → MICRO
         micro = entry_signal_micro_trend(df_15m, df_1h, params, market_mode)
         if micro:
             m_dir, m_entry, m_sl, m_tp1, _, m_rr, m_atr, _ = micro
-            print(f"  ✅ MICRO {m_dir} {symbol} | RSI1h={rsi_1h:.1f} ADX4h={adx:.1f} (pullback+bounce miss) | entry={m_entry:.4f} sl={m_sl:.4f} tp1={m_tp1:.4f} rr={m_rr} | mode={market_mode}")
+            _rsi_log = rsi_1h or 0
+            print(f"  ✅ MICRO {m_dir} {symbol} | RSI1h={_rsi_log:.1f} ADX4h={adx:.1f} (ema-flat→micro) | entry={m_entry:.4f} sl={m_sl:.4f} tp1={m_tp1:.4f} rr={m_rr} | mode={market_mode}")
         return micro
-
-    # ── Exits ─────────────────────────────────────────────────────────────
-    atr   = last_15m.get("atr", 0)
-    entry = close
-
-    if direction == "BUY":
-        sl = df_15m["low"].tail(10).min() - 0.3 * atr
-    else:
-        sl = df_15m["high"].tail(10).max() + 0.3 * atr
-
-    risk = abs(entry - sl)
-    if risk <= 0 or risk > entry * 0.06:   # reject if SL > 6% away
-        return None
-
-    # TP1 is fixed at 1R (partial exit — always achievable in a real pullback).
-    # TP2 is None — after TP1 the runner uses an ATR trail in trade management,
-    # so there is no fixed ceiling on the runner's profit.
-    if direction == "BUY":
-        tp1 = entry + 1.0 * risk
-    else:
-        tp1 = entry - 1.0 * risk
-
-    rr = 1.0   # minimum guaranteed RR; runner can go much further via trail
-
-    print(f"  ✅ PULLBACK {direction} {symbol} | RSI1h={rsi_1h:.1f} ADX4h={adx:.1f} conf={confluence}/3 | entry={entry:.4f} sl={sl:.4f} tp1={tp1:.4f} trail-after | mode={market_mode}")
-
-    return (direction, entry, sl, tp1, None, rr, atr, "pullback")

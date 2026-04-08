@@ -682,6 +682,20 @@ def run_bot():
 
     # ── Phase 2: generate signals with market mode applied ─────────────────
     for symbol, (df_15m, df_1h, df_4h, df_1d, market_type) in all_data.items():
+        # Per-coin snapshot so we can see what each pair is doing each scan
+        try:
+            _l1h = df_1h.iloc[-1]
+            _l4h = df_4h.iloc[-1]
+            _adx   = _l4h.get("adx") or 0
+            _rsi   = _l1h.get("rsi") or 0
+            _stoch = _l4h.get("stoch_k") or 0
+            _e50   = _l1h.get("ema50") or 0
+            _e200  = _l1h.get("ema200") or 0
+            _ema_s = "bull" if _e50 > _e200 else "bear"
+            print(f"  {symbol:<22} ADX4h={_adx:5.1f}  RSI1h={_rsi:5.1f}  stoch4h={_stoch:5.1f}  EMA={_ema_s}")
+        except Exception:
+            pass
+
         result = generate_pullback_signal(
             df_15m, df_1h, df_4h, df_1d,
             symbol=symbol, market_mode=_market_mode
