@@ -117,9 +117,11 @@ def _update_market_mode(breadth_data):
                 f"🐻 BEAR MODE ACTIVATED\n"
                 f"bear_breadth: {breadth:.0%} ({bear_count}/{len(breadth_data)} pairs below ema200)\n\n"
                 f"Changes active:\n"
-                f"• SELL signals only (BUY disabled)\n"
-                f"• ADX gate lowered by 3\n"
-                f"• Volume threshold → 0.90×\n"
+                f"• SELL signals on confirmed 4h downtrend pairs only\n"
+                f"• Bounce BUY at structural support still enabled\n"
+                f"• Fade-resistance SELL at 4h EMA50 enabled\n"
+                f"• ADX gate −2 (normal/LOW vol) or −3 (HIGH vol)\n"
+                f"• Volume threshold → 0.80× low-liquidity / 0.90× standard\n"
                 f"• BB squeeze & coil skipped for SELL\n"
                 f"• HTF bias threshold reduced by 1"
             )
@@ -128,9 +130,9 @@ def _update_market_mode(breadth_data):
                 f"🌱 RECOVERY MODE ACTIVATED\n"
                 f"bear_breadth: {breadth:.0%} ({bear_count}/{len(breadth_data)} pairs below ema200)\n\n"
                 f"Changes active:\n"
-                f"• BUY + SELL signals enabled\n"
+                f"• BUY signals only (SELL blocked across all entry types)\n"
                 f"• RR minimum → 2.0 (all regimes)\n"
-                f"• All other gates restored to normal"
+                f"• Bounce BUY: extra gate — price above 1h EMA50 or higher low required"
             )
         elif prev_mode in ("bear", "recovery"):
             send_telegram(
