@@ -1334,10 +1334,21 @@ def generate_pullback_signal(df_15m, df_1h, df_4h, df_1d=None, symbol="", market
         risk = abs(close - sl)
         if risk <= 0 or risk > close * 0.06:
             return None
-        tp1 = close + (1.0 * risk if direction == "BUY" else -1.0 * risk)
-        rr  = 1.0
-        print(f"  ✅ PULLBACK {direction} {symbol} | RSI1h={rsi_1h:.1f} ADX4h={adx:.1f} conf={confluence}/3 | entry={close:.4f} sl={sl:.4f} tp1={tp1:.4f} trail-after | mode={market_mode}")
-        return (direction, close, sl, tp1, None, rr, atr, "pullback")
+        # Use structural TP (nearest 1h swing level) instead of fixed 1R
+        if direction == "BUY":
+            tp1 = nearest_resistance(df_1h, close) or nearest_resistance(df_4h, close)
+            tp2 = second_resistance(df_1h, tp1) if tp1 else None
+        else:
+            tp1 = nearest_support(df_1h, close) or nearest_support(df_4h, close)
+            tp2 = second_support(df_1h, tp1) if tp1 else None
+        if tp1 is None:
+            return None
+        reward = abs(tp1 - close)
+        rr = round(reward / risk, 2)
+        if rr < 1.5:
+            return None
+        print(f"  ✅ PULLBACK {direction} {symbol} | RSI1h={rsi_1h:.1f} ADX4h={adx:.1f} conf={confluence}/3 | entry={close:.4f} sl={sl:.4f} tp1={tp1:.4f} rr={rr} | mode={market_mode}")
+        return (direction, close, sl, tp1, tp2, rr, atr, "pullback")
 
     elif trend_ok:
         # Trend is clear but RSI not in zone or confluence too low → BOUNCE
