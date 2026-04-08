@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+from datetime import datetime as _dt
 
 
 # ==============================
@@ -7,9 +8,10 @@ import numpy as np
 # ==============================
 def apply_indicators(df):
     # Trend EMAs
-    df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
-    df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
-    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
+    df['ema9']   = df['close'].ewm(span=9,   adjust=False).mean()
+    df['ema20']  = df['close'].ewm(span=20,  adjust=False).mean()
+    df['ema21']  = df['close'].ewm(span=21,  adjust=False).mean()
+    df['ema50']  = df['close'].ewm(span=50,  adjust=False).mean()
     df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
 
     # RSI
@@ -71,44 +73,90 @@ def get_regime_params(df_4h, market_mode="normal"):
     markets (more signals, bigger moves) and tightens in low-vol
     markets (only the cleanest setups).
 
-    HIGH  (ATR rank > 70th pct): ADX 18, StochRSI 78/22, RR 2.0
-    NORMAL(30–70th pct):         ADX 22, StochRSI 72/28, RR 2.5
-    LOW   (ATR rank < 30th pct): ADX 25, StochRSI 68/32, RR 3.0
+    Two separate ADX thresholds are produced:
 
-    Market mode overrides (applied on top of regime):
-      bear     — ADX minimum reduced by 3 (ADX lags in early crash phases)
-      recovery — RR minimum set to 2.0 (first-pullback longs have best edge)
+      adx_route — routing decision (trending vs ranging path).
+                  Lower bar: a pair at ADX 17 isn't trending enough for a
+                  trend entry but still has directional bias — bounce/fade/
+                  reversal should get a chance before falling back to range mode.
+
+      adx_min   — entry quality gate inside trend entries.
+                  Higher bar: the trend must be established before we commit
+                  to a directional position. Used by is_trending() inside the
+                  trend entry signal.
+
+    Regime table (adx_route / adx_min):
+      HIGH  vol (ATR > 70th pct): 15 / 19, StochRSI 78/22, RR 2.0
+      NORMAL    (30–70th pct):    18 / 22, StochRSI 72/28, RR 2.5
+      LOW   vol (ATR < 30th pct): 20 / 23, StochRSI 68/32, RR 3.0
+
+    Bear mode reductions (per-regime — HIGH vol crashes spike ADX faster):
+      HIGH vol bear:   adx_min 19→16 (−3),  adx_route 15→13 (−2)
+      NORMAL vol bear: adx_min 22→20 (−2),  adx_route 18→16 (−2)
+      LOW vol bear:    adx_min 23→21 (−2),  adx_route 20→18 (−2)
+
+    Recovery mode: RR minimum → 2.0 (first-pullback longs have best edge)
     """
     atr = df_4h['atr'].dropna()
     if len(atr) < 50:
-        params = {"adx_min": 22, "stoch_ob": 72, "stoch_os": 28, "rr_min": 2.5, "high_vol": False}
+        # Fallback when not enough history — NORMAL defaults
+        params = {"adx_min": 22, "adx_route": 18, "stoch_ob": 72, "stoch_os": 28, "rr_min": 2.5, "high_vol": False}
+        _bear_min_adj, _bear_route_adj = 2, 2
     else:
         rank = float((atr < atr.iloc[-1]).mean())   # 0.0 – 1.0
 
         if rank > 0.70:
-            params = {"adx_min": 18, "stoch_ob": 78, "stoch_os": 22, "rr_min": 2.0, "high_vol": True}
+            # HIGH vol: explosive moves, ADX builds fast — lower entry bar
+            params = {"adx_min": 19, "adx_route": 15, "stoch_ob": 78, "stoch_os": 22, "rr_min": 2.0, "high_vol": True}
+            _bear_min_adj, _bear_route_adj = 3, 2   # 19→16, 15→13
         elif rank < 0.30:
-            params = {"adx_min": 25, "stoch_ob": 68, "stoch_os": 32, "rr_min": 3.0, "high_vol": False}
+            # LOW vol: slow-moving market, trends need longer to confirm — raise bar
+            # adx_min 23 (not 25) — 25 is rarely achieved in genuinely quiet markets
+            params = {"adx_min": 23, "adx_route": 20, "stoch_ob": 68, "stoch_os": 32, "rr_min": 3.0, "high_vol": False}
+            _bear_min_adj, _bear_route_adj = 2, 2   # 23→21, 20→18
         else:
-            params = {"adx_min": 22, "stoch_ob": 72, "stoch_os": 28, "rr_min": 2.5, "high_vol": False}
+            # NORMAL vol
+            params = {"adx_min": 22, "adx_route": 18, "stoch_ob": 72, "stoch_os": 28, "rr_min": 2.5, "high_vol": False}
+            _bear_min_adj, _bear_route_adj = 2, 2   # 22→20, 18→16
 
     if market_mode == "bear":
-        # ADX lags during early crash phases — trend is real even when ADX hasn't
-        # had 14 bars to accumulate. Drop by 3 to catch sustained downtrends.
-        params["adx_min"] = max(params["adx_min"] - 3, 14)
+        # ADX lags during early crash phases — trend is real before ADX confirms.
+        # Reduction is per-regime: HIGH vol crashes spike ADX faster (needs -3),
+        # NORMAL/LOW are slower-moving (needs only -2).
+        params["adx_min"]   = max(params["adx_min"]   - _bear_min_adj,   14)
+        params["adx_route"] = max(params["adx_route"] - _bear_route_adj, 10)
     elif market_mode == "recovery":
         # Best longs come on the first pullback after a bear phase ends.
         # Relax RR minimum so we don't miss the bulk of the up move.
         params["rr_min"] = 2.0
 
+    # Store current 4h ADX so entry functions can check trend strength without
+    # receiving df_4h directly — used for the BB/coil bypass (ADX > 28).
+    params["adx_4h"] = float(df_4h.iloc[-1]["adx"]) if not pd.isna(df_4h.iloc[-1]["adx"]) else 0.0
+
     return params
 
 
 def is_trending(df, adx_min=22):
-    """Require ADX > adx_min — filters ranging/choppy markets."""
+    """
+    Require ADX > adx_min — filters ranging/choppy markets.
+
+    Rising ADX bypass: if ADX is within 5 points of the threshold and has
+    been rising for 3 bars, the trend is building. Allow it rather than
+    waiting for ADX to cross after the move is already underway.
+    A rising ADX at 18 is better than a falling ADX at 25.
+    """
     last = df.iloc[-1]
     adx = last['adx']
-    return not pd.isna(adx) and adx > adx_min
+    if pd.isna(adx):
+        return False
+    if adx > adx_min:
+        return True
+    # Rising bypass: ADX close to threshold and pointing up
+    if len(df) >= 4 and adx > adx_min - 5:
+        if df['adx'].iloc[-1] > df['adx'].iloc[-4]:
+            return True
+    return False
 
 
 # ==============================
@@ -176,20 +224,30 @@ def structure_bias(df):
 # ==============================
 def get_htf_bias(df_1h, df_4h, df_1d, params=None, market_mode="normal"):
     """
-    Score confluence across structure + EMA alignment.
-    Require >= 4/5 points for a valid bias — reduces false signals.
+    4h DI direction is mandatory — never fire against the confirmed 4h trend.
+    Score the remaining 4 factors: 1h/4h/1d structure + 1h EMA50/200 alignment.
+    Require 3/4 in NORMAL vol, 2/4 in HIGH vol.
 
-    Bear mode: SELL only, threshold reduced by 1. In a broad market crash,
-    requiring full 4/5 bearish confluence blocks every short because one
-    non-bearish element (e.g. 1d structure not yet broken) is always present.
+    Making DI mandatory rather than counted prevents a setup from passing 4/5
+    with DI pointing the wrong way — which was previously possible.
+
+    Bear mode: SELL only. Threshold drops by 1 (2/4 NORMAL, 1/4 HIGH).
+    1d structure is always the last to confirm in early crash phases —
+    requiring 3/4 without 1d would block every legitimate short in the open.
     """
     last_1h = df_1h.iloc[-1]
     last_4h = df_4h.iloc[-1]
 
+    # Mandatory gate: 4h DI must confirm the direction.
+    # A setup that scores well on structure but has DI pointing the wrong way
+    # is fighting the strongest real-time trend signal we have.
+    di_bull = last_4h['plus_di'] > last_4h['minus_di']
+    di_bear = last_4h['minus_di'] > last_4h['plus_di']
+
+    # Score the remaining 4 factors
     bull_score = 0
     bear_score = 0
 
-    # Structure (3 timeframes)
     for df in [df_1h, df_4h, df_1d]:
         bias = structure_bias(df)
         if bias == "bullish":
@@ -197,32 +255,26 @@ def get_htf_bias(df_1h, df_4h, df_1d, params=None, market_mode="normal"):
         elif bias == "bearish":
             bear_score += 1
 
-    # EMA 50/200 alignment on 1h
+    # 1h EMA50/200 alignment
     if last_1h['ema50'] > last_1h['ema200']:
         bull_score += 1
     else:
         bear_score += 1
 
-    # DI alignment on 4h
-    if last_4h['plus_di'] > last_4h['minus_di']:
-        bull_score += 1
-    else:
-        bear_score += 1
-
-    base_threshold = 3 if params and params.get("high_vol") else 4
+    # 3/4 required in NORMAL vol, 2/4 in HIGH vol
+    base_threshold = 2 if params and params.get("high_vol") else 3
 
     if market_mode == "bear":
-        # SELL only — BUY signals are disabled at the caller level.
-        # Reduce threshold by 1: crash markets always have one lagging
-        # non-bearish factor (e.g. daily structure not yet confirmed).
-        sell_threshold = base_threshold - 1
-        if bear_score >= sell_threshold:
+        # SELL only — BUY disabled at caller level.
+        # Threshold drops by 1: 1d structure lags in early crash phases.
+        sell_threshold = max(base_threshold - 1, 1)
+        if di_bear and bear_score >= sell_threshold:
             return "SELL"
         return None
 
-    if bull_score >= base_threshold:
+    if di_bull and bull_score >= base_threshold:
         return "BUY"
-    if bear_score >= base_threshold:
+    if di_bear and bear_score >= base_threshold:
         return "SELL"
     return None
 
@@ -333,113 +385,103 @@ def second_support(df_1h, tp1):
 
 
 # ==============================
-# SUPPORT BOUNCE ENTRY
+# SUPPORT / RESISTANCE BOUNCE ENTRY
 # ==============================
 def entry_signal_bounce(df_15m, df_1h, df_4h, params):
     """
-    Catches the FIRST touch of a major support level while the 4h is still
-    structurally bearish — the setup the existing reversal system misses.
+    True fallback bounce — fires at any structural support OR resistance level.
 
-    The existing reversal requires trend_4h == "bullish" (structure already
-    recovered). This fires before that, at the actual swing low.
+    MANDATORY: price within ATR×0.5 of a prior swing low (BUY) or swing high (SELL).
 
-    Gates (all required):
-      1. 4h StochRSI < 20  — deeply oversold, hardcoded extreme (not regime-relative)
-      2. 4h MACD histogram diverging up  — momentum turning even if price hasn't
-      3. Price within 1.5% of a prior 1h swing low  — AT structural support
-      4. 15m engulfing (bullish) OR hammer  — reversal candle confirming the bounce
-      5. Volume ≥ 1.5× vol_ma (or ≥ 0.8× when stoch_k < 15 extreme oversold)
-      6. RR ≥ params["rr_min"] + 0.5  — adaptive regime base + counter-trend premium:
-           HIGH vol → 2.5, NORMAL → 3.0, LOW vol → 3.5
-           Counter-trend always needs more reward than a trend entry in the same regime.
+    ONE confirmation required (not all):
+      a) Reversal candle  — hammer/bullish-engulfing (BUY) or shooting-star/bearish-engulfing (SELL)
+      b) RSI oversold/OB  — 4h stoch_k < 30 (BUY) or > 70 (SELL)
+      c) MACD turning     — 4h macd_hist improving in signal direction
+
+    SL: beyond the structural level (level ± 0.3 ATR).
+    RR: ≥ params["rr_min"] (counter-trend premium dropped — one confirmation is enough gate).
     """
-    if len(df_15m) < 3 or len(df_4h) < 3:
+    if len(df_15m) < 3 or len(df_4h) < 3 or len(df_1h) < 3:
         return None
 
     last_4h = df_4h.iloc[-1]
     prev_4h = df_4h.iloc[-2]
     last    = df_15m.iloc[-1]
+    prev    = df_15m.iloc[-2]
 
     atr = last['atr']
     if pd.isna(atr) or atr <= 0:
         return None
 
-    # Gate 1: 4h deeply oversold — structural extreme
-    if last_4h['stoch_k'] > 20:
-        return None
-
-    # Plan B: extreme oversold flag — when stoch_k < 15, volume requirement
-    # is relaxed from 1.5× to 0.8×. Crash conditions inflate vol_ma even with
-    # median; the first recovery candle at structural support reads artificially
-    # low against that inflated baseline. The stoch_k < 15 gate compensates.
-    extreme_oversold = last_4h['stoch_k'] < 15
-
-    # Gate 2: 4h MACD histogram turning up (diverging) — not yet flipped, just turning
-    if last_4h['macd_hist'] <= prev_4h['macd_hist']:
-        return None
-
     entry = last['close']
 
-    # Gate 3: price must be sitting within 1.5% of a prior 1h swing low
-    prior_lows = [l for l in swing_lows(df_1h) if abs(entry - l) / entry <= 0.015]
-    if not prior_lows:
-        return None
+    # ── Structural proximity (ATR-based tolerance) ─────────────────────────
+    lows_1h  = swing_lows(df_1h)
+    highs_1h = swing_highs(df_1h)
+    lows_4h  = swing_lows(df_4h)
+    highs_4h = swing_highs(df_4h)
 
-    # Gate 3b: extreme oversold only — before allowing the 0.8× volume relaxation,
-    # confirm a momentum shift has begun. Standard oversold (15–20) keeps the 1.5×
-    # volume gate which already enforces real buying; no extra gate needed there.
-    # Prevents entering a continuation dump at the relaxed threshold.
-    if extreme_oversold:
-        nearest_low      = min(prior_lows, key=lambda l: abs(entry - l))
-        stoch_rising     = last_4h['stoch_k'] > prev_4h['stoch_k']
-        price_reclaiming = entry >= nearest_low   # close at or above support = holding
-        if not (stoch_rising or price_reclaiming):
-            return None
+    tol = atr * 0.5
 
-    # Gate 4: 15m bullish reaction candle — engulfing OR hammer
-    body       = abs(last['close'] - last['open'])
-    lower_wick = min(last['open'], last['close']) - last['low']
-    upper_wick = last['high'] - max(last['open'], last['close'])
-    is_hammer  = body > 0 and lower_wick >= 2 * body and upper_wick <= body
-    if not is_engulfing(df_15m, "BUY") and not is_hammer:
-        return None
+    near_sup = [l for l in lows_1h + lows_4h  if abs(entry - l) <= tol and l < entry * 1.001]
+    near_res = [h for h in highs_1h + highs_4h if abs(entry - h) <= tol and h > entry * 0.999]
 
-    # Gate 5: volume check — threshold depends on how oversold 4h is.
-    # Extreme oversold (stoch_k < 15): 0.8× — first recovery candle at a crash
-    #   low is the highest-probability bounce but vol_ma is still inflated.
-    # Standard oversold (15–20): 1.5× — require real buying absorption.
-    vol_min = 0.8 if extreme_oversold else 1.5
-    if last['volume'] < last['vol_ma'] * vol_min:
-        return None
+    # ── Confirmations ─────────────────────────────────────────────────────
+    body_last       = abs(last['close'] - last['open'])
+    lower_wick_last = min(last['open'], last['close']) - last['low']
+    upper_wick_last = last['high'] - max(last['open'], last['close'])
+    is_hammer       = body_last > 0 and lower_wick_last >= 2 * body_last and upper_wick_last <= body_last
 
-    # SL below recent 10-bar low — tight, behind the support zone
-    sl   = df_15m['low'].tail(10).min() - (0.3 * atr)
-    risk = entry - sl
-    if risk <= 0:
-        return None
+    body_prev       = abs(prev['close'] - prev['open'])
+    upper_wick_prev = prev['high'] - max(prev['open'], prev['close'])
+    lower_wick_prev = min(prev['open'], prev['close']) - prev['low']
+    is_shooting_star = body_prev > 0 and upper_wick_prev >= 2 * body_prev and lower_wick_prev <= body_prev
 
-    tp1 = nearest_resistance(df_1h, entry)
-    if tp1 is None:
-        return None
-    reward = tp1 - entry
-    if reward <= 0:
-        return None
+    stoch_k = last_4h.get('stoch_k', 50)
+    macd_turning_up   = last_4h['macd_hist'] > prev_4h['macd_hist']
+    macd_turning_down = last_4h['macd_hist'] < prev_4h['macd_hist']
 
-    rr = round(reward / risk, 2)
-    rr_min = params["rr_min"] + 0.5   # regime base + counter-trend premium
+    # ── BUY at support ─────────────────────────────────────────────────────
+    if near_sup:
+        nearest_sup = max(near_sup)
+        conf_candle = is_engulfing(df_15m, "BUY") or is_hammer
+        conf_rsi    = stoch_k < 30
+        conf_macd   = macd_turning_up
+        if conf_candle or conf_rsi or conf_macd:
+            sl   = nearest_sup - 0.3 * atr
+            risk = entry - sl
+            if risk > 0 and last['volume'] >= last['vol_ma'] * 0.8:
+                tp1 = nearest_resistance(df_1h, entry) or nearest_resistance(df_4h, entry)
+                if tp1 is not None and tp1 > entry:
+                    reward = tp1 - entry
+                    rr = round(reward / risk, 2)
+                    if rr >= params["rr_min"]:
+                        tp2 = second_resistance(df_1h, tp1)
+                        confs = [c for c in ["candle", "rsi_os", "macd_turn"] if [conf_candle, conf_rsi, conf_macd][["candle", "rsi_os", "macd_turn"].index(c)]]
+                        print(f"    bounce BUY conf={'+'.join(confs)} stoch={stoch_k:.0f} rr={rr}")
+                        return "BUY", entry, sl, tp1, tp2, rr, atr, "bounce"
 
-    tp2 = second_resistance(df_1h, tp1)
+    # ── SELL at resistance ─────────────────────────────────────────────────
+    if near_res:
+        nearest_res = min(near_res)
+        conf_candle = is_engulfing(df_15m, "SELL") or is_shooting_star
+        conf_rsi    = stoch_k > 70
+        conf_macd   = macd_turning_down
+        if conf_candle or conf_rsi or conf_macd:
+            sl   = nearest_res + 0.3 * atr
+            risk = sl - entry
+            if risk > 0 and last['volume'] >= last['vol_ma'] * 0.8:
+                tp1 = nearest_support(df_1h, entry) or nearest_support(df_4h, entry)
+                if tp1 is not None and tp1 < entry:
+                    reward = entry - tp1
+                    rr = round(reward / risk, 2)
+                    if rr >= params["rr_min"]:
+                        tp2 = second_support(df_1h, tp1)
+                        confs = [c for c in ["candle", "rsi_ob", "macd_turn"] if [conf_candle, conf_rsi, conf_macd][["candle", "rsi_ob", "macd_turn"].index(c)]]
+                        print(f"    bounce SELL conf={'+'.join(confs)} stoch={stoch_k:.0f} rr={rr}")
+                        return "SELL", entry, sl, tp1, tp2, rr, atr, "bounce"
 
-    if rr >= rr_min:
-        pass
-    elif tp2 is not None:
-        tp2_rr = round((tp2 - entry) / risk, 2)
-        if tp2_rr < rr_min or rr < 1.5:
-            return None
-    else:
-        return None
-
-    return "BUY", entry, sl, tp1, tp2, rr, atr, "bounce"
+    return None
 
 
 # ==============================
@@ -554,55 +596,271 @@ def entry_signal_fade_resistance(df_15m, df_4h, df_1h, params):
 
 
 # ==============================
-# TREND ENTRY SIGNAL
+# MICRO TREND CONTINUATION
 # ==============================
-def entry_signal_trend(df_15m, df_1h, direction, params, market_mode="normal"):
-    if len(df_15m) < 3:
+def entry_signal_micro_trend(df_15m, df_1h, params, market_mode="normal"):
+    """
+    Light momentum entry — catches trending pairs that never pull back deep enough
+    for the pullback system.
+
+    Gates:
+      1. Price above EMA20 (BUY) / below EMA20 (SELL) — on the right side of momentum
+      2. Small pullback recently — at least 1 of the last 3 candles touched within
+         0.3×ATR of EMA20 (price paused, didn't reverse)
+      3. Volume spike — current candle volume > vol_ma × 1.5 (real participation)
+      4. 1H RSI not overbought/oversold — between 40 and 70 (BUY), 30 and 60 (SELL)
+         (avoids entering at exhaustion)
+
+    Exits:
+      TP1: entry ± 1.0×ATR  — tight, realistic for momentum continuation
+      SL:  EMA20 ± 0.3×ATR  — price back inside EMA20 = momentum failed
+      RR:  must clear 1.2 minimum
+    """
+    if len(df_15m) < 5 or len(df_1h) < 1:
         return None
 
-    last = df_15m.iloc[-1]
-    prev = df_15m.iloc[-2]
-    last_1h = df_1h.iloc[-1]
+    last   = df_15m.iloc[-1]
+    recent = df_15m.iloc[-4:-1]   # 3 candles before current
 
-    stoch_ob = params["stoch_ob"]
-    stoch_os = params["stoch_os"]
-    rr_min   = params["rr_min"]
+    atr   = last.get("atr", 0)
+    ema20 = last.get("ema20")
+    close = last["close"]
+
+    if pd.isna(atr) or atr <= 0 or pd.isna(ema20):
+        return None
+
+    rsi_1h = df_1h.iloc[-1].get("rsi")
+    if pd.isna(rsi_1h):
+        return None
+
+    # Volume spike
+    if last["volume"] < last["vol_ma"] * 1.5:
+        return None
+
+    # Recovery mode blocks SELL, bear mode blocks BUY
+    for direction in (["SELL"] if market_mode == "bear" else
+                      ["BUY"]  if market_mode == "recovery" else
+                      ["BUY", "SELL"]):
+
+        if direction == "BUY":
+            price_side    = close > ema20
+            rsi_ok        = 40 <= rsi_1h <= 70
+            pullback_near = any(abs(c["low"] - ema20) <= 0.3 * atr for _, c in recent.iterrows())
+            sl            = ema20 - 0.3 * atr
+        else:
+            price_side    = close < ema20
+            rsi_ok        = 30 <= rsi_1h <= 60
+            pullback_near = any(abs(c["high"] - ema20) <= 0.3 * atr for _, c in recent.iterrows())
+            sl            = ema20 + 0.3 * atr
+
+        if not (price_side and rsi_ok and pullback_near):
+            continue
+
+        risk = abs(close - sl)
+        if risk <= 0 or risk > close * 0.04:   # SL max 4% — micro entries must be tight
+            continue
+
+        tp1 = close + atr if direction == "BUY" else close - atr
+        rr  = round(abs(tp1 - close) / risk, 2)
+        if rr < 1.2:
+            continue
+
+        return (direction, close, sl, tp1, None, rr, atr, "micro")
+
+    return None
+
+
+# ==============================
+# RANGE ENTRY SIGNAL
+# ==============================
+def entry_signal_range(df_15m, df_1h, df_4h, params, market_mode="normal"):
+    """
+    Support/resistance range trade — fires when the pair is ranging (ADX below
+    threshold). Instead of sitting idle, buy at structural support and sell at
+    structural resistance. The range defines entry, SL, and target.
+
+    BUY at support (disabled in bear mode — bounce already covers it):
+      1. Price within 1.5% of a 4h or 1h swing low
+      2. 4h stoch_k < 45  — room to run to resistance, not already stretched
+      3. 15m bullish engulfing OR hammer
+      4. Volume ≥ 0.8× vol_ma  — relaxed; ranges are structurally quiet
+      5. TP: nearest 4h swing high (opposite side of range)
+      6. RR ≥ 1.5
+
+    SELL at resistance:
+      1. Price within 1.5% of a 4h or 1h swing high
+      2. 4h stoch_k > 65  — properly overbought, not just mildly elevated
+      3. 15m shooting star OR bearish engulfing (current or prior candle)
+      4. Volume ≥ 0.9×
+      5. TP: nearest 4h swing low
+      6. RR ≥ 1.5
+    """
+    if len(df_15m) < 3 or len(df_4h) < 3 or len(df_1h) < 3:
+        return None
+
+    last_4h = df_4h.iloc[-1]
+    last    = df_15m.iloc[-1]
+    prev    = df_15m.iloc[-2]
 
     atr = last['atr']
     if pd.isna(atr) or atr <= 0:
         return None
 
+    entry = last['close']
+
+    # Collect structural levels from 4h (primary) and 1h (secondary)
+    lows_4h   = swing_lows(df_4h)
+    highs_4h  = swing_highs(df_4h)
+    lows_1h   = swing_lows(df_1h)
+    highs_1h  = swing_highs(df_1h)
+
+    support_candidates    = [l for l in lows_4h + lows_1h  if l < entry * 0.999]
+    resistance_candidates = [h for h in highs_4h + highs_1h if h > entry * 1.001]
+
+    nearest_sup = max(support_candidates)    if support_candidates    else None
+    nearest_res = min(resistance_candidates) if resistance_candidates else None
+
+    # ATR-based tolerance — markets don't respect perfect lines.
+    # ATR×0.5 scales with the pair's volatility; a fixed 1.5% was too tight in fast markets.
+    level_tol       = atr * 0.5
+    near_support    = nearest_sup is not None and abs(entry - nearest_sup) <= level_tol
+    near_resistance = nearest_res is not None and abs(entry - nearest_res) <= level_tol
+
+    # Volume gate — must show some real participation, not dead-air candles
+    if last['volume'] < last['vol_ma'] * 0.9:
+        return None
+
+    # ── BUY at support ─────────────────────────────────────────────────────
+    # Bear mode disabled — existing bounce entry covers oversold support plays.
+    # stoch_k < 35: must be properly oversold, not just approaching support mid-range.
+    if near_support and market_mode != "bear" and last_4h['stoch_k'] < 35:
+        body       = abs(last['close'] - last['open'])
+        lower_wick = min(last['open'], last['close']) - last['low']
+        upper_wick = last['high'] - max(last['open'], last['close'])
+        is_hammer  = body > 0 and lower_wick >= 2 * body and upper_wick <= body
+
+        if is_engulfing(df_15m, "BUY") or is_hammer:
+            sl   = nearest_sup - (0.3 * atr)
+            risk = entry - sl
+            if risk > 0:
+                tp1_candidates = [h for h in highs_4h if h > entry * 1.001]
+                tp1 = min(tp1_candidates) if tp1_candidates else nearest_resistance(df_1h, entry)
+                if tp1 is not None:
+                    reward = tp1 - entry
+                    if reward > 0:
+                        rr = round(reward / risk, 2)
+                        if rr >= 1.5:
+                            tp2 = second_resistance(df_1h, tp1)
+                            return "BUY", entry, sl, tp1, tp2, rr, atr, "range"
+
+    # ── SELL at resistance ─────────────────────────────────────────────────
+    # stoch_k > 65: must be properly overbought at resistance, not just elevated.
+    if near_resistance and last_4h['stoch_k'] > 65:
+        def _is_shooting_star(c):
+            body       = abs(c['close'] - c['open'])
+            upper_wick = c['high'] - max(c['open'], c['close'])
+            lower_wick = min(c['open'], c['close']) - c['low']
+            return body > 0 and upper_wick >= 2 * body and lower_wick <= body
+
+        bearish_candle = (
+            is_engulfing(df_15m, "SELL")
+            or _is_shooting_star(last)
+            or _is_shooting_star(prev)
+        )
+
+        if bearish_candle:
+            sl   = nearest_res + (0.3 * atr)
+            risk = sl - entry
+            if risk > 0:
+                tp1_candidates = [l for l in lows_4h if l < entry * 0.999]
+                tp1 = max(tp1_candidates) if tp1_candidates else nearest_support(df_1h, entry)
+                if tp1 is not None:
+                    reward = entry - tp1
+                    if reward > 0:
+                        rr = round(reward / risk, 2)
+                        if rr >= 1.5:
+                            tp2 = second_support(df_1h, tp1)
+                            return "SELL", entry, sl, tp1, tp2, rr, atr, "range"
+
+    return None
+
+
+# ==============================
+# TREND ENTRY SIGNAL
+# ==============================
+def entry_signal_trend(df_15m, df_1h, df_4h, direction, params, market_mode="normal"):
+    if len(df_15m) < 3 or len(df_1h) < 4:
+        return None
+
+    last = df_15m.iloc[-1]
+    prev = df_15m.iloc[-2]
+
+    rr_min = params["rr_min"]
+    atr    = last['atr']
+    if pd.isna(atr) or atr <= 0:
+        return None
+
+    # Time-of-day: 01–07 UTC is the deep Asia / low-liquidity window globally.
+    # Volume is structurally lower then — not because the setup is weak.
+    hour_utc = _dt.utcnow().hour
+    low_liquidity_window = 1 <= hour_utc <= 7
+
+    # Strong 4h trend bypass for BB/coil gates.
+    # When 4h ADX > 28 the trend is well-established — breakouts are continuations
+    # off pullbacks, not from coils. Coil quality only matters in borderline trends.
+    strong_4h_trend = params.get("adx_4h", 0) > 28
+
     if direction == "BUY":
         # Explosive breakout trigger: close must clear previous candle's high
         if last['close'] <= prev['high']:
             return None
-        if last['stoch_k'] > stoch_ob:
-            # OB on a strong breakout confirms momentum — don't block it.
-            # Only reject when the breakout is weak or volume is absent.
+
+        # StochRSI gate raised to 85 — stoch_k 72–85 in an uptrend is normal
+        # momentum, not overextension. Only gate at genuinely extreme levels.
+        if last['stoch_k'] > 85:
             strong_breakout = (last['close'] - prev['high']) > 0.3 * atr
             strong_volume   = last['volume'] > last['vol_ma'] * 1.5
             if not (strong_breakout and strong_volume):
                 return None
-        if last_1h['macd_hist'] <= 0:               # 1h MACD must be bullish
+
+        # MACD turning bullish over 3 bars — catches the momentum shift before the
+        # full zero-line cross. Best entries are at the turn, not after it.
+        if df_1h['macd_hist'].iloc[-1] <= df_1h['macd_hist'].iloc[-4]:
             return None
-        if last['volume'] < last['vol_ma'] * 1.15:  # Volume confirmation
+
+        # Volume — time-of-day aware:
+        #   Low liquidity window (01–07 UTC): 0.8× — structurally thin, not weak setup
+        #   Strong breakout (close > prev_high by > 0.5 ATR): 1.0× — price = conviction
+        #   Standard: 1.15×
+        strong_breakout_move = (last['close'] - prev['high']) > 0.5 * atr
+        vol_thresh = 0.8 if low_liquidity_window else (1.0 if strong_breakout_move else 1.15)
+        if last['volume'] < last['vol_ma'] * vol_thresh:
             return None
-        # Compression → expansion: coil before the breakout
-        # In HIGH vol regime (crash/breakout already underway) the market won't
-        # consolidate first — skip these gates so we don't miss the whole move.
-        if not params.get("high_vol"):
+
+        # Compression → expansion: coil before the breakout.
+        # Skipped in HIGH vol (crash/breakout already underway — no coil forms).
+        # Skipped when 4h ADX > 28 (strong trend continuation off a pullback).
+        if not params.get("high_vol") and not strong_4h_trend:
             if not is_bb_squeeze(df_15m):
                 return None
             if not consolidation_coil(df_15m, atr):
                 return None
 
         entry = last['close']
-        sl = df_15m['low'].tail(20).min() - (0.3 * atr)
-        risk = entry - sl
+        sl    = df_15m['low'].tail(20).min() - (0.3 * atr)
+        risk  = entry - sl
         if risk <= 0:
             return None
 
+        # TP1: prefer nearest 1h swing high; fall back to 4h when 1h is too close
         tp1 = nearest_resistance(df_1h, entry)
+        if tp1 is not None:
+            if round((tp1 - entry) / risk, 2) < rr_min:
+                tp1_4h = nearest_resistance(df_4h, entry)
+                if tp1_4h is not None and tp1_4h > tp1:
+                    tp1 = tp1_4h
+        else:
+            tp1 = nearest_resistance(df_4h, entry)
         if tp1 is None:
             return None
         reward = tp1 - entry
@@ -611,34 +869,45 @@ def entry_signal_trend(df_15m, df_1h, direction, params, market_mode="normal"):
         # Explosive breakdown trigger: close must break below previous candle's low
         if last['close'] >= prev['low']:
             return None
-        # StochRSI oversold check removed for trend shorts: in a sustained downtrend
-        # the 15m stoch stays pinned near 0, which would permanently block SELL entries.
-        # Oversold-zone filtering is correct for reversals but wrong for trend-following.
-        if last_1h['macd_hist'] >= 0:
+
+        # MACD turning bearish over 3 bars
+        if df_1h['macd_hist'].iloc[-1] >= df_1h['macd_hist'].iloc[-4]:
             return None
 
-        # Bear mode: volume threshold relaxed to 0.90× — volume dries up
-        # market-wide during panic phases; 0.9× with a clean break is meaningful.
-        # Normal/recovery: require the usual 1.15× confirmation.
-        vol_thresh = 0.90 if market_mode == "bear" else 1.15
+        # Volume — time-of-day aware with bear mode override:
+        #   Bear mode: 0.80× low-liquidity, 0.90× standard (panic thins volume market-wide)
+        #   Normal/recovery: 0.80× low-liquidity, 1.0× strong breakdown, 1.15× standard
+        strong_breakdown_move = (prev['low'] - last['close']) > 0.5 * atr
+        if market_mode == "bear":
+            vol_thresh = 0.80 if low_liquidity_window else 0.90
+        else:
+            vol_thresh = 0.80 if low_liquidity_window else (1.0 if strong_breakdown_move else 1.15)
         if last['volume'] < last['vol_ma'] * vol_thresh:
             return None
 
-        # Bear mode: skip BB squeeze and coil — crashes move in steps, not from
-        # tight coils. HIGH vol already bypasses these; extend to all regimes in bear.
-        if market_mode != "bear" and not params.get("high_vol"):
+        # Bear mode: skip BB squeeze and coil — crashes move in steps, not coils.
+        # HIGH vol already bypasses these; strong_4h_trend bypass mirrors BUY logic.
+        if market_mode != "bear" and not params.get("high_vol") and not strong_4h_trend:
             if not is_bb_squeeze(df_15m):
                 return None
             if not consolidation_coil(df_15m, atr):
                 return None
 
         entry = last['close']
-        sl = df_15m['high'].tail(20).max() + (0.3 * atr)
-        risk = sl - entry
+        sl    = df_15m['high'].tail(20).max() + (0.3 * atr)
+        risk  = sl - entry
         if risk <= 0:
             return None
 
+        # TP1: prefer nearest 1h swing low; fall back to 4h when 1h is too close
         tp1 = nearest_support(df_1h, entry)
+        if tp1 is not None:
+            if round((entry - tp1) / risk, 2) < rr_min:
+                tp1_4h = nearest_support(df_4h, entry)
+                if tp1_4h is not None and tp1_4h < tp1:
+                    tp1 = tp1_4h
+        else:
+            tp1 = nearest_support(df_4h, entry)
         if tp1 is None:
             return None
         reward = entry - tp1
@@ -649,21 +918,31 @@ def entry_signal_trend(df_15m, df_1h, direction, params, market_mode="normal"):
     if reward <= 0:
         return None
 
+    rr_raw = reward / risk
+
+    # ATR cap: swing levels further than 3.5R are unlikely to be reached before
+    # reversal (backtest: only 2/48 trades hit TP1 at the full swing target).
+    # When RR > 3.5, cap TP1 at 2.5×ATR — a realistic near-term target — and
+    # promote the original swing level to TP2 as the runner.
+    _ATR_TP_MULT = 2.5
+    _ATR_CAP_RR  = 3.5
+    if rr_raw > _ATR_CAP_RR:
+        tp2 = tp1
+        tp1 = (entry + _ATR_TP_MULT * atr) if direction == "BUY" else (entry - _ATR_TP_MULT * atr)
+        reward = abs(tp1 - entry)
+    else:
+        tp2 = second_resistance(df_1h, tp1) if direction == "BUY" else second_support(df_1h, tp1)
+
     rr = round(reward / risk, 2)
 
-    # Compute TP2 before the RR gate so it can rescue a marginal TP1.
-    tp2 = second_resistance(df_1h, tp1) if direction == "BUY" else second_support(df_1h, tp1)
-
     if rr >= rr_min:
-        pass  # TP1 alone is sufficient — allow regardless of TP2
+        pass  # TP1 alone is sufficient
     elif tp2 is not None:
-        # TP1 is marginal — TP2 proves structure has room.
-        # Require TP2 RR ≥ rr_min and TP1 RR ≥ 1.5 (floor — first partial must be meaningful).
         tp2_rr = round(abs(tp2 - entry) / risk, 2)
         if tp2_rr < rr_min or rr < 1.5:
             return None
     else:
-        return None  # No TP2 to rescue marginal TP1
+        return None
 
     return direction, entry, sl, tp1, tp2, rr, atr, "trend"
 
@@ -671,11 +950,12 @@ def entry_signal_trend(df_15m, df_1h, direction, params, market_mode="normal"):
 # ==============================
 # REVERSAL ENTRY SIGNAL
 # ==============================
-def entry_signal_reversal(df_15m, df_1h, direction, params):
+def entry_signal_reversal(df_15m, df_1h, df_4h, direction, params):
     """
     Reversal entries require engulfing pattern + extreme StochRSI + strong volume.
     SL is placed behind the engulfing candle itself — the candle defines the
-    invalidation point. TP1 is the nearest structural level on 1h, TP2 is the next.
+    invalidation point. TP1 is the nearest structural level on 1h, with 4h
+    fallback when 1h is too close. TP2 is the next structural level.
     StochRSI extremes and minimum RR adapt to the current volatility regime.
     """
     if not is_engulfing(df_15m, direction):
@@ -703,7 +983,15 @@ def entry_signal_reversal(df_15m, df_1h, direction, params):
         if risk <= 0:
             return None
 
+        # TP1: prefer nearest 1h swing high; fall back to 4h when 1h is too close
         tp1 = nearest_resistance(df_1h, entry)
+        if tp1 is not None:
+            if round((tp1 - entry) / risk, 2) < rr_min:
+                tp1_4h = nearest_resistance(df_4h, entry)
+                if tp1_4h is not None and tp1_4h > tp1:
+                    tp1 = tp1_4h
+        else:
+            tp1 = nearest_resistance(df_4h, entry)
         if tp1 is None:
             return None
         reward = tp1 - entry
@@ -720,7 +1008,15 @@ def entry_signal_reversal(df_15m, df_1h, direction, params):
         if risk <= 0:
             return None
 
+        # TP1: prefer nearest 1h swing low; fall back to 4h when 1h is too close
         tp1 = nearest_support(df_1h, entry)
+        if tp1 is not None:
+            if round((entry - tp1) / risk, 2) < rr_min:
+                tp1_4h = nearest_support(df_4h, entry)
+                if tp1_4h is not None and tp1_4h < tp1:
+                    tp1 = tp1_4h
+        else:
+            tp1 = nearest_support(df_4h, entry)
         if tp1 is None:
             return None
         reward = entry - tp1
@@ -731,9 +1027,20 @@ def entry_signal_reversal(df_15m, df_1h, direction, params):
     if reward <= 0:
         return None
 
-    rr = round(reward / risk, 2)
+    rr_raw = reward / risk
 
-    tp2 = second_resistance(df_1h, tp1) if direction == "BUY" else second_support(df_1h, tp1)
+    # ATR cap: same logic as trend — cap TP1 at 2.5×ATR when swing target > 3.5R,
+    # promote original swing level to TP2 as runner.
+    _ATR_TP_MULT = 2.5
+    _ATR_CAP_RR  = 3.5
+    if rr_raw > _ATR_CAP_RR:
+        tp2 = tp1
+        tp1 = (entry + _ATR_TP_MULT * atr) if direction == "BUY" else (entry - _ATR_TP_MULT * atr)
+        reward = abs(tp1 - entry)
+    else:
+        tp2 = second_resistance(df_1h, tp1) if direction == "BUY" else second_support(df_1h, tp1)
+
+    rr = round(reward / risk, 2)
 
     if rr >= rr_min:
         pass
@@ -760,38 +1067,47 @@ def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d, symbol="", market_mode
     mode_tag = f"|{market_mode.upper()}" if market_mode != "normal" else ""
     regime_label = f"{regime}{mode_tag}"
 
-    # Hard gate: 4h must be trending (adaptive ADX threshold, reduced in bear mode)
-    if not is_trending(df_4h, params["adx_min"]):
-        adx_val = df_4h.iloc[-1]['adx']
-        print(f"  ↳ {symbol}: ADX {adx_val:.1f} < {params['adx_min']} [{regime_label}] — skip")
+    # Trending vs ranging routing — slope-aware.
+    #
+    # Three-zone decision:
+    #   Zone A (ADX >= adx_route)            → trending, no slope needed
+    #   Zone B (ADX in [adx_route-3, adx_route) AND slope >= +0.5/3bars)
+    #                                         → trending — ADX building toward threshold,
+    #                                           trend is forming not fading
+    #   Zone C (everything else)              → ranging — route to S/R entry
+    #
+    # Using slope here distinguishes "ADX 16 and rising" (trend initiating)
+    # from "ADX 16 and falling" (trend collapsing back to range) at the boundary.
+    adx_val   = df_4h.iloc[-1]['adx']
+    adx_slope = float(df_4h['adx'].iloc[-1] - df_4h['adx'].iloc[-4]) if len(df_4h) >= 4 else 0.0
+    adx_route = params["adx_route"]
+
+    trending = (
+        adx_val >= adx_route                                          # Zone A
+        or (adx_val >= adx_route - 3 and adx_slope >= 0.5)           # Zone B
+    )
+
+    # Ranging market — range and bounce entries disabled (backtest showed net negative).
+    # Range: 61% WR but avg win only ~0.49R vs -1.0R loss → TP targeting broken.
+    # Bounce: 40.5% WR — direction wrong more often than right on this setup.
+    # Both will be reworked separately. For now skip and log.
+    if not trending:
+        print(f"  ↳ {symbol}: ADX {adx_val:.1f} slope {adx_slope:+.1f} <{adx_route} [{regime_label}] ranging — skip (range/bounce disabled)")
         return None
 
-    # Priority routing — fade vs bounce ordering depends on proximity to resistance.
-    # When price is within 1.5% of 4h EMA50 in bear mode, a bounce BUY would be
-    # entering directly into overhead resistance. Fade SELL takes priority there.
-    # When price is NOT near EMA50, bounce at support fires first as normal.
+    # Bear mode fade at resistance — kept, targets well-defined structural level.
     near_ema50_resistance = False
     if market_mode == "bear":
         _ema50_4h   = df_4h.iloc[-1]['ema50']
         _last_close = df_15m.iloc[-1]['close']
         near_ema50_resistance = abs(_last_close - _ema50_4h) / _ema50_4h <= 0.015
 
-    # Near EMA50 resistance: fade first, then bounce
     if near_ema50_resistance:
         fade = entry_signal_fade_resistance(df_15m, df_4h, df_1h, params)
         if fade:
             direction, entry, sl, tp1, tp2, rr, atr, trade_type = fade
             return direction, entry, sl, tp1, tp2, rr, atr, trade_type
 
-    # Support bounce — fires at actual bottom before 4h structure turns.
-    # Works in all modes. Near-resistance case: bounce still attempted if fade failed.
-    bounce = entry_signal_bounce(df_15m, df_1h, df_4h, params)
-    if bounce:
-        direction, entry, sl, tp1, tp2, rr, atr, trade_type = bounce
-        return direction, entry, sl, tp1, tp2, rr, atr, trade_type
-
-    # Fade for bear mode when NOT near EMA50 resistance
-    # (near-resistance case already checked above before bounce).
     if market_mode == "bear" and not near_ema50_resistance:
         fade = entry_signal_fade_resistance(df_15m, df_4h, df_1h, params)
         if fade:
@@ -803,7 +1119,7 @@ def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d, symbol="", market_mode
     # MACD flip) are strict enough on their own; bear mode should not block this.
     reversal = detect_htf_reversal(df_4h, df_1d, params)
     if reversal:
-        result = entry_signal_reversal(df_15m, df_1h, reversal, params)
+        result = entry_signal_reversal(df_15m, df_1h, df_4h, reversal, params)
         if result:
             direction, entry, sl, tp1, tp2, rr, atr, trade_type = result
             return direction, entry, sl, tp1, tp2, rr, atr, trade_type
@@ -814,53 +1130,222 @@ def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d, symbol="", market_mode
     if not bias:
         last_1h = df_1h.iloc[-1]
         last_4h = df_4h.iloc[-1]
-        # In bear mode the threshold is reduced by 1 for SELL — show correct number
-        base_threshold = 3 if params.get("high_vol") else 4
-        threshold = base_threshold - 1 if market_mode == "bear" else base_threshold
-        print(f"  ↳ {symbol}: HTF bias < {threshold}/5 [{regime_label}] ema50={'>' if last_1h['ema50'] > last_1h['ema200'] else '<'}ema200 di+={'>' if last_4h['plus_di'] > last_4h['minus_di'] else '<'}di-")
+        # DI mandatory + 3/4 remaining (2/4 HIGH vol); bear drops threshold by 1
+        base_threshold = 2 if params.get("high_vol") else 3
+        threshold = max(base_threshold - 1, 1) if market_mode == "bear" else base_threshold
+        di_dir = "bull" if last_4h['plus_di'] > last_4h['minus_di'] else "bear"
+        print(f"  ↳ {symbol}: HTF bias DI={di_dir}, score <{threshold}/4 [{regime_label}] ema50={'>' if last_1h['ema50'] > last_1h['ema200'] else '<'}ema200")
         return None
 
-    result = entry_signal_trend(df_15m, df_1h, bias, params, market_mode)
+    result = entry_signal_trend(df_15m, df_1h, df_4h, bias, params, market_mode)
     if result:
         direction, entry, sl, tp1, tp2, rr, atr, trade_type = result
         return direction, entry, sl, tp1, tp2, rr, atr, trade_type
 
     # Log why trend entry was rejected
-    last = df_15m.iloc[-1]
-    prev = df_15m.iloc[-2]
-    last_1h = df_1h.iloc[-1]
-    atr = last['atr']
+    last    = df_15m.iloc[-1]
+    prev    = df_15m.iloc[-2]
+    atr     = last['atr']
+    hour_utc = _dt.utcnow().hour
+    low_liquidity_window = 1 <= hour_utc <= 7
+    strong_4h_trend = params.get("adx_4h", 0) > 28
     reasons = []
+
     if bias == "BUY":
         if last['close'] <= prev['high']:
             reasons.append("no breakout")
-        if last['stoch_k'] > params['stoch_ob']:
+        if last['stoch_k'] > 85:
             strong_breakout = (last['close'] - prev['high']) > 0.3 * atr
             strong_volume   = last['volume'] > last['vol_ma'] * 1.5
             if not (strong_breakout and strong_volume):
-                reasons.append(f"stoch OB {last['stoch_k']:.0f}>{params['stoch_ob']} weak-breakout")
-        if last_1h['macd_hist'] <= 0:
-            reasons.append("1h MACD bear")
-        if last['volume'] < last['vol_ma'] * 1.15:
-            reasons.append(f"vol low {last['volume']/last['vol_ma']:.2f}x")
-        if not params.get("high_vol") and not is_bb_squeeze(df_15m):
-            reasons.append("no BB squeeze")
-        if not params.get("high_vol") and not consolidation_coil(df_15m, atr):
-            reasons.append("no coil")
+                reasons.append(f"stoch OB {last['stoch_k']:.0f}>85 weak-breakout")
+        if len(df_1h) >= 4 and df_1h['macd_hist'].iloc[-1] <= df_1h['macd_hist'].iloc[-4]:
+            reasons.append("1h MACD not turning bull")
+        strong_breakout_move = (last['close'] - prev['high']) > 0.5 * atr
+        vol_thresh = 0.8 if low_liquidity_window else (1.0 if strong_breakout_move else 1.15)
+        if last['volume'] < last['vol_ma'] * vol_thresh:
+            reasons.append(f"vol low {last['volume']/last['vol_ma']:.2f}x (need {vol_thresh}x)")
+        if not params.get("high_vol") and not strong_4h_trend:
+            if not is_bb_squeeze(df_15m):
+                reasons.append("no BB squeeze")
+            if not consolidation_coil(df_15m, atr):
+                reasons.append("no coil")
     else:
         if last['close'] >= prev['low']:
             reasons.append("no breakdown")
-        if last_1h['macd_hist'] >= 0:
-            reasons.append("1h MACD bull")
-        # Bear mode uses 0.90× vol threshold; normal uses 1.15×
-        vol_thresh = 0.90 if market_mode == "bear" else 1.15
+        if len(df_1h) >= 4 and df_1h['macd_hist'].iloc[-1] >= df_1h['macd_hist'].iloc[-4]:
+            reasons.append("1h MACD not turning bear")
+        strong_breakdown_move = (prev['low'] - last['close']) > 0.5 * atr
+        if market_mode == "bear":
+            vol_thresh = 0.80 if low_liquidity_window else 0.90
+        else:
+            vol_thresh = 0.80 if low_liquidity_window else (1.0 if strong_breakdown_move else 1.15)
         if last['volume'] < last['vol_ma'] * vol_thresh:
-            reasons.append(f"vol low {last['volume']/last['vol_ma']:.2f}x")
-        # Bear mode skips BB/coil for SELL — only log these in normal/recovery
-        if market_mode != "bear" and not params.get("high_vol") and not is_bb_squeeze(df_15m):
-            reasons.append("no BB squeeze")
-        if market_mode != "bear" and not params.get("high_vol") and not consolidation_coil(df_15m, atr):
-            reasons.append("no coil")
+            reasons.append(f"vol low {last['volume']/last['vol_ma']:.2f}x (need {vol_thresh}x)")
+        if market_mode != "bear" and not params.get("high_vol") and not strong_4h_trend:
+            if not is_bb_squeeze(df_15m):
+                reasons.append("no BB squeeze")
+            if not consolidation_coil(df_15m, atr):
+                reasons.append("no coil")
     print(f"  ↳ {symbol}: {bias} entry rejected [{regime_label}] — {', '.join(reasons) if reasons else 'RR/TP failed'}")
 
     return None
+
+
+# ==============================
+# PULLBACK TREND SIGNAL
+# ==============================
+def generate_pullback_signal(df_15m, df_1h, df_4h, df_1d=None, symbol="", market_mode="normal"):
+    """
+    3-step pullback trend system.
+
+    Step 1 — Regime Filter
+      Trend exists? ADX > threshold AND 4H EMA50 slope confirms direction.
+
+    Step 2 — Setup
+      1H RSI in pullback zone — price has retraced into the trend, not chasing.
+
+    Step 3 — Trigger
+      15M RSI cross back in trend direction + price above/below EMA20.
+
+    Step 4 — Management (handled in backtest/bot)
+      TP1: 1R   → partial exit (50%), move SL to BE
+      TP2: 2.5R → runner (remaining 50%)
+      BE: only after TP1 is hit
+    """
+    if len(df_4h) < 6 or len(df_1h) < 2 or len(df_15m) < 3:
+        return None
+
+    last_4h  = df_4h.iloc[-1]
+    last_1h  = df_1h.iloc[-1]
+    last_15m = df_15m.iloc[-1]
+    prev_15m = df_15m.iloc[-2]
+
+    # ── Step 1: Regime Filter ──────────────────────────────────────────────
+    # ADX confirms a trend exists. If ADX is below threshold the pair is ranging —
+    # fall back to the range entry instead of returning nothing.
+    adx = last_4h.get("adx", 0)
+    adx_min = 17 if market_mode == "bear" else 20
+    if pd.isna(adx) or adx < adx_min:
+        params = get_regime_params(df_4h, market_mode)
+        range_result = entry_signal_range(df_15m, df_1h, df_4h, params, market_mode)
+        if range_result:
+            direction, entry, sl, tp1, tp2, rr, atr, _ = range_result
+            print(f"  ✅ RANGE {direction} {symbol} | ADX4h={adx:.1f}<{adx_min} (ranging) | entry={entry:.4f} sl={sl:.4f} tp1={tp1:.4f} rr={rr} | mode={market_mode}")
+            return range_result
+        # Range missed — try micro trend as final fallback in ranging market
+        micro = entry_signal_micro_trend(df_15m, df_1h, params, market_mode)
+        if micro:
+            m_dir, m_entry, m_sl, m_tp1, _, m_rr, m_atr, _ = micro
+            print(f"  ✅ MICRO {m_dir} {symbol} | ADX4h={adx:.1f} (range+pullback miss) | entry={m_entry:.4f} sl={m_sl:.4f} tp1={m_tp1:.4f} rr={m_rr} | mode={market_mode}")
+        return micro
+
+    # EMA50 slope: compare current vs 5 bars ago (confirms trend is moving, not flat)
+    ema50_now  = last_4h["ema50"]
+    ema200_now = last_4h["ema200"]
+    ema50_prev = df_4h.iloc[-6]["ema50"]
+    if any(pd.isna(x) for x in [ema50_now, ema200_now, ema50_prev]):
+        return None
+
+    ema_bull = (ema50_now > ema200_now) and (ema50_now > ema50_prev)
+    ema_bear = (ema50_now < ema200_now) and (ema50_now < ema50_prev)
+
+    if market_mode == "bear":
+        if not ema_bear:
+            return None
+        direction = "SELL"
+    elif ema_bull and not ema_bear:
+        direction = "BUY"
+    elif ema_bear and not ema_bull:
+        direction = "SELL"
+    else:
+        return None   # flat or conflicting
+
+    # ── Step 2: Setup ─────────────────────────────────────────────────────
+    # 1H RSI must be in pullback zone — retracing into the trend, not overextended.
+    # Recovery mode: market is recovering — block SELL signals (symmetric with
+    # bear mode blocking BUY).
+    rsi_1h = last_1h.get("rsi")
+    if pd.isna(rsi_1h):
+        return None
+
+    if market_mode == "recovery" and direction == "SELL":
+        return None   # don't short into a recovering market
+
+    if direction == "BUY":
+        if not (40 <= rsi_1h <= 48):   # real pullback, trend still intact
+            return None
+    else:
+        if not (52 <= rsi_1h <= 60):   # not oversold, not mid-range noise
+            return None
+
+    # ── Step 3: Trigger ───────────────────────────────────────────────────
+    # 1H RSI crosses back in trend direction + 15M price on correct side of EMA20.
+    # Prior-depth check: RSI must have come FROM a meaningful level before this
+    # cross — prevents triggering on repeated oscillations around 45/55.
+    if len(df_1h) < 5:
+        return None
+
+    prev_1h     = df_1h.iloc[-2]
+    rsi_1h_prev = prev_1h.get("rsi")
+    rsi_1h_lookback = df_1h["rsi"].iloc[-5:-1]   # 4 bars before current
+
+    ema20 = last_15m.get("ema20")
+    close = last_15m["close"]
+
+    if any(pd.isna(x) for x in [rsi_1h_prev, ema20]):
+        return None
+
+    # 3-of-4 confluence: EMA slope already confirmed (mandatory).
+    # Need any 2 of the remaining 3: RSI zone, RSI cross, EMA20 align.
+    if direction == "BUY":
+        rsi_in_zone = 40 <= rsi_1h <= 52          # widened slightly from 48
+        rsi_cross   = (rsi_1h_prev <= 45) and (rsi_1h > 45)
+        ema_align   = close > ema20
+    else:
+        rsi_in_zone = 48 <= rsi_1h <= 60          # widened slightly from 52
+        rsi_cross   = (rsi_1h_prev >= 55) and (rsi_1h < 55)
+        ema_align   = close < ema20
+
+    confluence = sum([rsi_in_zone, rsi_cross, ema_align])
+
+    if confluence < 2:
+        # Pullback conditions not met — try bounce then micro trend as fallbacks
+        params = get_regime_params(df_4h, market_mode)
+        bounce_result = entry_signal_bounce(df_15m, df_1h, df_4h, params)
+        if bounce_result:
+            b_dir, b_entry, b_sl, b_tp1, b_tp2, b_rr, b_atr, _ = bounce_result
+            print(f"  ✅ BOUNCE {b_dir} {symbol} | RSI1h={rsi_1h:.1f} ADX4h={adx:.1f} (pullback miss→bounce) | entry={b_entry:.4f} sl={b_sl:.4f} tp1={b_tp1:.4f} rr={b_rr} | mode={market_mode}")
+            return bounce_result
+        micro = entry_signal_micro_trend(df_15m, df_1h, params, market_mode)
+        if micro:
+            m_dir, m_entry, m_sl, m_tp1, _, m_rr, m_atr, _ = micro
+            print(f"  ✅ MICRO {m_dir} {symbol} | RSI1h={rsi_1h:.1f} ADX4h={adx:.1f} (pullback+bounce miss) | entry={m_entry:.4f} sl={m_sl:.4f} tp1={m_tp1:.4f} rr={m_rr} | mode={market_mode}")
+        return micro
+
+    # ── Exits ─────────────────────────────────────────────────────────────
+    atr   = last_15m.get("atr", 0)
+    entry = close
+
+    if direction == "BUY":
+        sl = df_15m["low"].tail(10).min() - 0.3 * atr
+    else:
+        sl = df_15m["high"].tail(10).max() + 0.3 * atr
+
+    risk = abs(entry - sl)
+    if risk <= 0 or risk > entry * 0.06:   # reject if SL > 6% away
+        return None
+
+    # TP1 is fixed at 1R (partial exit — always achievable in a real pullback).
+    # TP2 is None — after TP1 the runner uses an ATR trail in trade management,
+    # so there is no fixed ceiling on the runner's profit.
+    if direction == "BUY":
+        tp1 = entry + 1.0 * risk
+    else:
+        tp1 = entry - 1.0 * risk
+
+    rr = 1.0   # minimum guaranteed RR; runner can go much further via trail
+
+    print(f"  ✅ PULLBACK {direction} {symbol} | RSI1h={rsi_1h:.1f} ADX4h={adx:.1f} conf={confluence}/3 | entry={entry:.4f} sl={sl:.4f} tp1={tp1:.4f} trail-after | mode={market_mode}")
+
+    return (direction, entry, sl, tp1, None, rr, atr, "pullback")

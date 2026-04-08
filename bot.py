@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import os
 import signal as signal_module
 
-from strategy import apply_indicators, generate_filtered_signal
+from strategy import apply_indicators, generate_pullback_signal
 from performance import (
     save_trade, check_trade_results, daily_report,
     ensure_csv, save_pending_trades, load_pending_trades,
@@ -682,7 +682,7 @@ def run_bot():
 
     # ── Phase 2: generate signals with market mode applied ─────────────────
     for symbol, (df_15m, df_1h, df_4h, df_1d, market_type) in all_data.items():
-        result = generate_filtered_signal(
+        result = generate_pullback_signal(
             df_15m, df_1h, df_4h, df_1d,
             symbol=symbol, market_mode=_market_mode
         )
