@@ -586,8 +586,8 @@ def check_pending_trades():
         symbol = trade['pair']
         market_type = trade['market_type']
 
-        if datetime.now() - trade['time'] > timedelta(hours=24):
-            print(f"❌ Expired: {symbol}")
+        if datetime.now() - trade['time'] > timedelta(hours=1):
+            print(f"❌ Expired (1h): {symbol}")
             continue
 
         key = f"{symbol}_15m_{market_type}"

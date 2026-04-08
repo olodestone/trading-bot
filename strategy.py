@@ -425,7 +425,7 @@ def entry_signal_bounce(df_15m, df_1h, df_4h, params):
     tol = atr * 0.5
 
     near_sup = [l for l in lows_1h + lows_4h  if abs(entry - l) <= tol and l < entry * 1.001]
-    near_res = [h for h in highs_1h + highs_4h if abs(entry - h) <= tol and h > entry * 0.999]
+    near_res = [h for h in highs_1h + highs_4h if abs(entry - h) <= tol and h >= entry]
 
     # ── Confirmations ─────────────────────────────────────────────────────
     body_last       = abs(last['close'] - last['open'])
@@ -488,9 +488,15 @@ def entry_signal_bounce(df_15m, df_1h, df_4h, params):
         conf_candle = is_engulfing(df_15m, "SELL") or is_shooting_star
         conf_rsi    = stoch_k > 70
         conf_macd   = macd_turning_down
-        if conf_candle or conf_rsi or conf_macd:
+        # MACD turn alone is too weak — require candle or RSI OB, or MACD only when approaching OB
+        strong_conf = conf_candle or conf_rsi or (conf_macd and stoch_k > 55)
+        if strong_conf:
             sl   = nearest_res + 0.3 * atr
             risk = sl - entry
+            # Minimum SL distance: 0.5×ATR — resistance at entry creates a trivially tight stop
+            if risk < atr * 0.5:
+                print(f"    bounce SELL: res={nearest_res:.4f} SL too tight (risk={risk:.4f} < 0.5×ATR={atr*0.5:.4f})")
+                return None
             if risk > 0 and last['volume'] >= last['vol_ma'] * 0.8:
                 tp1 = nearest_support(df_1h, entry) or nearest_support(df_4h, entry)
                 if tp1 is not None and tp1 < entry:
