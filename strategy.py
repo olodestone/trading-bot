@@ -460,6 +460,11 @@ def entry_signal_bounce(df_15m, df_1h, df_4h, params):
         conf_candle = is_engulfing(df_15m, "BUY") or is_hammer
         conf_rsi    = stoch_k < 30
         conf_macd   = macd_turning_up
+        # Recovery mode: candle confirmation mandatory — MACD/RSI alone just means
+        # "less bad", not a real reversal. Price must show actual rejection at support.
+        if params.get("market_mode") == "recovery" and not conf_candle:
+            print(f"    bounce BUY: recovery — candle required (stoch={stoch_k:.0f} macd={'↑' if conf_macd else '↓'})")
+            return None
         if conf_candle or conf_rsi or conf_macd:
             sl   = nearest_sup - 0.3 * atr
             risk = entry - sl
