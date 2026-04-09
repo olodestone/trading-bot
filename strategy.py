@@ -463,6 +463,9 @@ def entry_signal_bounce(df_15m, df_1h, df_4h, params):
         if conf_candle or conf_rsi or conf_macd:
             sl   = nearest_sup - 0.3 * atr
             risk = entry - sl
+            if risk < atr * 0.5:
+                print(f"    bounce BUY: sup={nearest_sup:.4f} SL too tight (risk={risk:.4f} < 0.5×ATR={atr*0.5:.4f})")
+                return None
             if risk > 0 and last['volume'] >= last['vol_ma'] * 0.8:
                 tp1 = nearest_resistance(df_1h, entry) or nearest_resistance(df_4h, entry)
                 if tp1 is not None and tp1 > entry:
