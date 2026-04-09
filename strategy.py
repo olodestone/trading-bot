@@ -452,8 +452,8 @@ def entry_signal_bounce(df_15m, df_1h, df_4h, params):
             close_above_ema50 = entry > df_1h.iloc[-1].get("ema50", entry - 1)
             _sw_lows  = swing_lows(df_1h)
             higher_low = len(_sw_lows) >= 2 and _sw_lows[-1] > _sw_lows[-2]
-            gate_pass  = close_above_ema50 or higher_low
-            print(f"    bounce BUY: sup={nearest_sup:.4f} dist={dist_atr}ATR | recovery gate: ema50={'✓' if close_above_ema50 else '✗'} higher_low={'✓' if higher_low else '✗'} → {'pass' if gate_pass else 'BLOCK'}")
+            gate_pass  = close_above_ema50 and higher_low
+            print(f"    bounce BUY: sup={nearest_sup:.4f} dist={dist_atr}ATR | recovery gate: ema50={'✓' if close_above_ema50 else '✗'} AND higher_low={'✓' if higher_low else '✗'} → {'pass' if gate_pass else 'BLOCK'}")
             if not gate_pass:
                 return None
 
@@ -466,10 +466,11 @@ def entry_signal_bounce(df_15m, df_1h, df_4h, params):
             print(f"    bounce BUY: recovery — candle required (stoch={stoch_k:.0f} macd={'↑' if conf_macd else '↓'})")
             return None
         if conf_candle or conf_rsi or conf_macd:
-            sl   = nearest_sup - 0.3 * atr
+            sl_buf = 0.5 * atr if params.get("market_mode") == "recovery" else 0.3 * atr
+            sl   = nearest_sup - sl_buf
             risk = entry - sl
             if risk < atr * 0.5:
-                print(f"    bounce BUY: sup={nearest_sup:.4f} SL too tight (risk={risk:.4f} < 0.5×ATR={atr*0.5:.4f})")
+                print(f"    bounce BUY: sup={nearest_sup:.4f} SL too tight (risk={risk:.4f} < 0.5×ATR={atr*0.5:.4f} buf={'0.5' if params.get('market_mode') == 'recovery' else '0.3'}×ATR)")
                 return None
             if risk > 0 and last['volume'] >= last['vol_ma'] * 0.8:
                 tp1 = nearest_resistance(df_1h, entry) or nearest_resistance(df_4h, entry)
