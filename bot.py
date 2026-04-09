@@ -132,7 +132,8 @@ def _update_market_mode(breadth_data):
                 f"Changes active:\n"
                 f"• BUY signals only (SELL blocked across all entry types)\n"
                 f"• RR minimum → 2.0 (all regimes)\n"
-                f"• Bounce BUY: extra gate — price above 1h EMA50 or higher low required"
+                f"• Bounce BUY: candle required + BOTH price above 1h EMA50 AND higher low\n"
+                f"• Bounce BUY SL buffer: 0.5×ATR (wider, survives wicks)"
             )
         elif prev_mode in ("bear", "recovery"):
             send_telegram(
