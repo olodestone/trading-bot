@@ -191,6 +191,7 @@ def check_trade_results(fetch_price_func, send_telegram):
 
         if price is None:
             continue
+        price = float(price)
 
         print(f"Checking {row['pair']} | Price: {price:.6f}")
 
