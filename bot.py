@@ -30,6 +30,12 @@ FUTURES_MARKETS = futures_exchange.load_markets()
 MARKET_REFRESH_INTERVAL = 86400  # 24 hours
 last_market_refresh = time.time()
 
+# Ticker cache — persists last successful fetch_tickers() result per exchange.
+# Used as fallback when the live call times out, giving volume-ranked pair data
+# instead of the raw alphabetical market list.
+_tickers_cache      = {"spot": None, "futures": None}
+_tickers_cache_time = {"spot": 0.0,  "futures": 0.0}
+
 
 # ==============================
 # MARKET REFRESH
@@ -447,16 +453,37 @@ def _get_liquid_active_pool(exchange, market_type, symbol_filter, top_n=50):
     Gates (pre-filter before momentum scoring):
       - 24h quoteVolume > $2M   : real liquidity floor
       - |24h % change| > 1.5%  : coin is MOVING today, not dead
+
+    Resilience:
+      - On first timeout: wait 5s and retry once
+      - On second failure: use cached tickers from last successful call
+        (volume-ranked, far better than alphabetical market list)
+      - Cache age logged so staleness is visible
+      - Only falls back to raw market list if cache is also empty
     """
-    try:
-        tickers = exchange.fetch_tickers()
-    except Exception as e:
-        print(f"⚠️ fetch_tickers error ({market_type}): {type(e).__name__}: {e} — using fallback")
-        if market_type == "spot":
-            return [s for s in SPOT_MARKETS
-                    if symbol_filter(s) and not _is_stable(s) and not _is_non_crypto(s)][:top_n]
-        return [s for s in FUTURES_MARKETS
-                if symbol_filter(s) and not _is_stable(s) and not _is_non_crypto(s)][:top_n]
+    global _tickers_cache, _tickers_cache_time
+
+    tickers = None
+    for attempt in range(2):
+        try:
+            tickers = exchange.fetch_tickers()
+            _tickers_cache[market_type]      = tickers
+            _tickers_cache_time[market_type] = time.time()
+            break
+        except Exception as e:
+            if attempt == 0:
+                print(f"⚠️ fetch_tickers error ({market_type}): {type(e).__name__}: {e} — retrying in 5s")
+                time.sleep(5)
+            else:
+                cache_age_min = int((time.time() - _tickers_cache_time[market_type]) / 60)
+                if _tickers_cache[market_type] is not None:
+                    print(f"⚠️ fetch_tickers failed ({market_type}) — using cached tickers ({cache_age_min} min old)")
+                    tickers = _tickers_cache[market_type]
+                else:
+                    print(f"⚠️ fetch_tickers failed ({market_type}), no cache — using market list fallback")
+                    markets = SPOT_MARKETS if market_type == "spot" else FUTURES_MARKETS
+                    return [s for s in markets
+                            if symbol_filter(s) and not _is_stable(s) and not _is_non_crypto(s)][:top_n]
 
     pool = []
     for sym, t in tickers.items():
@@ -484,11 +511,9 @@ def _get_liquid_active_pool(exchange, market_type, symbol_filter, top_n=50):
     result = [s for s, _ in pool[:top_n]]
 
     if not result:
-        print(f"⚠️ fetch_tickers ({market_type}): pool empty after filters — using fallback")
-        if market_type == "spot":
-            return [s for s in SPOT_MARKETS
-                    if symbol_filter(s) and not _is_stable(s) and not _is_non_crypto(s)][:top_n]
-        return [s for s in FUTURES_MARKETS
+        print(f"⚠️ fetch_tickers ({market_type}): pool empty after filters — using market list fallback")
+        markets = SPOT_MARKETS if market_type == "spot" else FUTURES_MARKETS
+        return [s for s in markets
                 if symbol_filter(s) and not _is_stable(s) and not _is_non_crypto(s)][:top_n]
 
     return result
@@ -743,41 +768,68 @@ def run_bot():
             if tp2 else ""
         )
 
-        msg = (
-            f"{'─' * 22}\n"
-            f"{direction}  [{trade_type.upper()}]\n"
-            f"{'─' * 22}\n"
-            f"Pair    {symbol}\n"
-            f"Market  {market_label}\n"
-            f"Time    {now_str}\n\n"
-            f"Entry   {_fmt_price(entry)}\n"
-            f"SL      {_fmt_price(sl)}  (▼ {sl_pct:.2f}%)\n"
-            f"TP1     {_fmt_price(tp)}  (▲ {tp1_pct:.2f}%)  ← close 50%\n"
-            f"{tp2_line}"
-            f"RR      1 : {rr}\n"
-            f"{'─' * 22}\n"
-            f"💰 POSITION SIZING  ({RISK_PCT*100:.0f}% risk)\n"
-            f"Risk    ${risk_dollars:.2f}  of ${ACCOUNT_BALANCE:.2f}\n"
-            f"Size    {units} units  (~${pos_value:.2f})\n"
-            f"{'─' * 22}\n"
-            f"⏳ Pending — waiting for entry to trigger"
-        )
-        print(msg)
-        send_telegram(msg)
+        if trade_type == "bounce":
+            # Bounce signals: candle confirmation already happened on this candle.
+            # Price is AT support right now — enter at market immediately.
+            # No pending queue; the setup doesn't improve by waiting.
+            msg = (
+                f"{'─' * 22}\n"
+                f"{direction}  [{trade_type.upper()}]  🟡 MARKET ENTRY\n"
+                f"{'─' * 22}\n"
+                f"Pair    {symbol}\n"
+                f"Market  {market_label}\n"
+                f"Time    {now_str}\n\n"
+                f"Entry   {_fmt_price(entry)}  ← enter NOW at market\n"
+                f"SL      {_fmt_price(sl)}  (▼ {sl_pct:.2f}%)\n"
+                f"TP1     {_fmt_price(tp)}  (▲ {tp1_pct:.2f}%)  ← close 50%\n"
+                f"{tp2_line}"
+                f"RR      1 : {rr}\n"
+                f"{'─' * 22}\n"
+                f"💰 POSITION SIZING  ({RISK_PCT*100:.0f}% risk)\n"
+                f"Risk    ${risk_dollars:.2f}  of ${ACCOUNT_BALANCE:.2f}\n"
+                f"Size    {units} units  (~${pos_value:.2f})\n"
+                f"{'─' * 22}\n"
+                f"🔔 Trade is now live. Managing SL/TP."
+            )
+            print(msg)
+            send_telegram(msg)
+            save_trade(symbol, sig, entry, sl, tp, tp2, rr, market_type, float(atr))
+        else:
+            msg = (
+                f"{'─' * 22}\n"
+                f"{direction}  [{trade_type.upper()}]\n"
+                f"{'─' * 22}\n"
+                f"Pair    {symbol}\n"
+                f"Market  {market_label}\n"
+                f"Time    {now_str}\n\n"
+                f"Entry   {_fmt_price(entry)}\n"
+                f"SL      {_fmt_price(sl)}  (▼ {sl_pct:.2f}%)\n"
+                f"TP1     {_fmt_price(tp)}  (▲ {tp1_pct:.2f}%)  ← close 50%\n"
+                f"{tp2_line}"
+                f"RR      1 : {rr}\n"
+                f"{'─' * 22}\n"
+                f"💰 POSITION SIZING  ({RISK_PCT*100:.0f}% risk)\n"
+                f"Risk    ${risk_dollars:.2f}  of ${ACCOUNT_BALANCE:.2f}\n"
+                f"Size    {units} units  (~${pos_value:.2f})\n"
+                f"{'─' * 22}\n"
+                f"⏳ Pending — waiting for entry to trigger"
+            )
+            print(msg)
+            send_telegram(msg)
 
-        pending_trades.append({
-            "pair": symbol,
-            "signal": sig,
-            "entry": entry,
-            "sl": sl,
-            "tp": tp,
-            "tp2": tp2,
-            "rr": rr,
-            "market_type": market_type,
-            "trade_type": trade_type,
-            "atr": float(atr),
-            "time": datetime.now()
-        })
+            pending_trades.append({
+                "pair": symbol,
+                "signal": sig,
+                "entry": entry,
+                "sl": sl,
+                "tp": tp,
+                "tp2": tp2,
+                "rr": rr,
+                "market_type": market_type,
+                "trade_type": trade_type,
+                "atr": float(atr),
+                "time": datetime.now()
+            })
 
     check_pending_trades()
 
