@@ -424,7 +424,7 @@ def entry_signal_bounce(df_15m, df_1h, df_4h, params):
 
     tol = atr * 0.5
 
-    near_sup = [l for l in lows_1h + lows_4h  if abs(entry - l) <= tol and l < entry * 1.001]
+    near_sup = [l for l in lows_1h + lows_4h  if abs(entry - l) <= tol and l < entry]
     near_res = [h for h in highs_1h + highs_4h if abs(entry - h) <= tol and h >= entry]
 
     # ── Confirmations ─────────────────────────────────────────────────────
@@ -456,6 +456,12 @@ def entry_signal_bounce(df_15m, df_1h, df_4h, params):
             print(f"    bounce BUY: sup={nearest_sup:.4f} dist={dist_atr}ATR | recovery gate: ema50={'✓' if close_above_ema50 else '✗'} AND higher_low={'✓' if higher_low else '✗'} → {'pass' if gate_pass else 'BLOCK'}")
             if not gate_pass:
                 return None
+
+        # Hard gate: 4h stoch overbought means price is NOT at support — it's extended.
+        # A bounce BUY at stoch_k > 70 is chasing, not buying a dip.
+        if stoch_k > 70:
+            print(f"    bounce BUY: stoch_k={stoch_k:.0f} > 70 — 4h overbought, not at support")
+            return None
 
         conf_candle = is_engulfing(df_15m, "BUY") or is_hammer
         conf_rsi    = stoch_k < 30
@@ -698,6 +704,8 @@ def entry_signal_micro_trend(df_15m, df_1h, params, market_mode="normal"):
 
         risk = abs(close - sl)
         if risk <= 0 or risk > close * 0.04:   # SL max 4% — micro entries must be tight
+            continue
+        if risk < atr * 0.5:                   # SL min 0.5×ATR — sub-noise stops are unworkable
             continue
 
         tp1 = close + atr if direction == "BUY" else close - atr

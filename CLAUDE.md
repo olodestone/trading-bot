@@ -439,6 +439,92 @@ The 1.5 floor on TP1 is a minimum — TP1 can be 1.7, 2.3, anything ≥ 1.5. It 
 
 ---
 
+## Plan 13 — Bounce Bug Fixes (SL, Pullback TP, Pending Expiry)
+
+**Problems fixed:**
+
+**Bug 1 — Bounce SELL: resistance below entry (RR=22 false signals)**
+`near_res` filter used `h > entry * 0.999`, allowing resistance 0.1% below entry. Result: SL = resistance + 0.3×ATR placed nearly at entry → risk of 0.04%, absurd RR like 22.65.
+
+Fix in `entry_signal_bounce()`:
+```python
+# Before:
+near_res = [h for h in res_levels if h > entry * 0.999]
+
+# After:
+near_res = [h for h in res_levels if h >= entry]
+```
+Resistance must be AT or above entry — can't short below your resistance.
+
+**Bug 2 — Bounce SELL firing on MACD alone (stoch=44)**
+MACD alone at neutral StochRSI = weak confirmation for a counter-trend SELL. Added `strong_conf` requirement:
+```python
+strong_conf = conf_candle or conf_rsi or (conf_macd and stoch_k > 55)
+```
+MACD-only allowed only if stoch > 55 (approaching overbought territory).
+
+**Bug 3 — Same tiny-SL bug on bounce BUY side**
+Added minimum risk floor to BUY path:
+```python
+if risk < atr * 0.5:
+    return None
+```
+Prevents support-at-entry setups from generating a trivially tight stop.
+
+**Bug 4 — Pullback TP hardcoded to 1R (always RR=1.0)**
+`generate_pullback_signal()` had `tp1 = close + 1.0 * risk` — a fixed 1R target. Changed to structural resistance/support:
+```python
+tp1 = nearest_resistance(df_1h, close) or nearest_resistance(df_4h, close)  # BUY
+tp1 = nearest_support(df_1h, close) or nearest_support(df_4h, close)        # SELL
+```
+Also added TP2 population and 1.5 RR minimum.
+
+**Bug 5 — Pending trade expiry 24h (blocked bot for 3+ hours)**
+Changed `timedelta(hours=24)` → `timedelta(hours=1)` in `bot.py`. Stale pending signals from dead moves were consuming all 5 capacity slots.
+
+---
+
+## Plan 14 — Recovery Bounce Hardening (AND Gate + Wider SL)
+
+**Problem:** Most bounce BUY trades in recovery mode were hitting SL. Three-layer root cause:
+1. Recovery gate was OR (one condition enough) — ZEC passed with ema50=✓ but higher_low=✗, price still making lower lows
+2. SL buffer 0.3×ATR too tight for choppy post-crash price action — wicks stopping out valid setups
+3. Candle confirmation not mandatory — MACD/RSI alone doesn't prove real rejection at support
+
+**Changes: `strategy.py` — `entry_signal_bounce()`**
+
+**Fix 1 — Recovery gate: OR → AND**
+```python
+# Before:
+gate_pass = close_above_ema50 or higher_low
+
+# After:
+gate_pass = close_above_ema50 and higher_low
+```
+Both must be true:
+- `close_above_ema50`: current price above 1h EMA50 — medium-term average has turned
+- `higher_low`: most recent 1h swing low is higher than the previous — structure is improving
+
+**Fix 2 — Wider SL buffer in recovery**
+```python
+sl_buf = 0.5 * atr if params.get("market_mode") == "recovery" else 0.3 * atr
+sl = nearest_sup - sl_buf
+```
+Recovery price action is choppy — wicks reach further below support. 0.5×ATR gives the trade room to breathe. Other modes keep 0.3×ATR.
+
+**Fix 3 — Candle confirmation mandatory in recovery** *(deployed prior commit)*
+```python
+if params.get("market_mode") == "recovery" and not conf_candle:
+    return None
+```
+MACD turning or RSI oversold = "less bad", not proof of reversal. A 15m bullish engulfing or hammer is required.
+
+**Also fixed: `bot.py` Telegram message** — recovery mode alert now correctly states AND gate + SL buffer instead of old OR description.
+
+**Result:** In the April 8–9 window with these gates, ZERO signals would fire — which is correct. Market was still retesting lows, no structure had formed. Bot correctly sits on hands.
+
+---
+
 ## Current Signal Flow (End to End)
 
 ```
@@ -465,6 +551,9 @@ Every 15 minutes:
    → get_regime_params(df_4h, market_mode) — HIGH/NORMAL/LOW vol + mode adjustments
    → is_trending(df_4h, adx_min) — adaptive ADX gate
    → entry_signal_bounce() — counter-trend BUY at structural support (fires first)
+       - Recovery mode: BOTH ema50 above AND higher_low required (AND gate)
+       - Recovery mode: candle mandatory (15m engulfing or hammer)
+       - Recovery mode: SL buffer 0.5×ATR (vs 0.3×ATR in other modes)
    → detect_htf_reversal() — 4 conditions: structure divergence +
      extreme StochRSI + volume surge + MACD flip
    → get_htf_bias() — 4/5 confluence (3/5 in HIGH vol; −1 more in bear mode for SELL)
@@ -513,6 +602,8 @@ The 5 confluence factors: EMA50 vs EMA200 (1h), DI+ vs DI− (4h), 1d structure,
 | After Plan 4–5 | 8.8/10 | BB squeeze, tiered TP, adaptive params, mid-cap focus |
 | After Plan 6–7 | 9.0/10 | Futures fixed, backtest engine |
 | After Plan 8 | 9.2/10 | Bear/recovery/normal market mode, sell trend fix, HTF bias bypass |
-| Current | 9.4/10 | Support bounce entry, StochRSI OB bypass, median vol_ma, TP2-primary RR gating |
+| After Plan 12 | 9.4/10 | Support bounce entry, StochRSI OB bypass, median vol_ma, TP2-primary RR gating |
+| After Plan 13 | 9.4/10 | Bounce SL bugs fixed, pullback TP structural, pending expiry 1h |
+| Current | 9.5/10 | Recovery bounce: AND gate, wider SL (0.5×ATR), candle mandatory |
 
 **Gap to 10/10:** Live order execution (currently manual alerts), session filter, account balance auto-sync, minimum order value check.

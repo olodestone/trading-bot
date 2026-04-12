@@ -17,8 +17,8 @@ from logger import send_telegram, send_csv, get_updates, TOKEN, CHAT_ID
 # ==============================
 # EXCHANGES
 # ==============================
-spot_exchange = ccxt.kucoin({"enableRateLimit": True, "rateLimit": 1200})
-futures_exchange = ccxt.mexc({"enableRateLimit": True})
+spot_exchange = ccxt.kucoin({"enableRateLimit": True, "rateLimit": 1200, "timeout": 10000})
+futures_exchange = ccxt.mexc({"enableRateLimit": True, "timeout": 10000})
 
 spot_exchange.options['adjustForTimeDifference'] = True
 futures_exchange.options['adjustForTimeDifference'] = True
