@@ -52,7 +52,7 @@ def ensure_csv():
             )
         """))
         # Add new columns to existing tables without breaking live data
-        for col, typedef in [("tp2", "FLOAT"), ("tp1_hit", "BOOLEAN")]:
+        for col, typedef in [("tp2", "FLOAT"), ("tp1_hit", "BOOLEAN"), ("risk_dollars", "FLOAT")]:
             try:
                 conn.execute(text(
                     f"ALTER TABLE {TRADES_TABLE} ADD COLUMN IF NOT EXISTS {col} {typedef}"
@@ -78,7 +78,7 @@ def ensure_csv():
 # ==============================
 # SAVE TRADE
 # ==============================
-def save_trade(pair, signal, entry, sl, tp, tp2, rr, market_type, atr=0.0):
+def save_trade(pair, signal, entry, sl, tp, tp2, rr, market_type, atr=0.0, risk_dollars=0.0):
     ensure_csv()
     engine = get_engine()
     row = pd.DataFrame([{
@@ -92,6 +92,7 @@ def save_trade(pair, signal, entry, sl, tp, tp2, rr, market_type, atr=0.0):
         "atr": round(float(atr), 8),
         "be_activated": False, "trail_sl": round(sl, 8),
         "tp1_hit": False,
+        "risk_dollars": round(float(risk_dollars), 4),
     }])
     row.to_sql(TRADES_TABLE, engine, if_exists="append", index=False)
 
@@ -168,6 +169,51 @@ def get_daily_losses():
         return len(df[(df['time'].dt.date == today) & (df['status'] == 'LOSS')])
     except Exception:
         return 0
+
+
+# ==============================
+# COMPOUNDING
+# ==============================
+def get_compounded_balance(starting_balance):
+    """
+    Theoretical account balance = starting capital + cumulative closed trade P&L.
+
+    P&L approximation per trade:
+      WIN             → rr × risk_dollars          (full target reached)
+      BE_WIN+tp1_hit  → 0.5 × rr × risk_dollars   (TP1 partial, rest at breakeven)
+      BE_WIN          → 0                           (breakeven, no P&L)
+      LOSS            → −risk_dollars
+
+    Rows without risk_dollars (pre-migration) are skipped to avoid bad data.
+    Balance is floored at $1 so sizing never breaks.
+    """
+    try:
+        engine = get_engine()
+        df = pd.read_sql(
+            f"SELECT status, rr, risk_dollars, tp1_hit FROM {TRADES_TABLE} WHERE status != 'OPEN'",
+            engine
+        )
+    except Exception:
+        return starting_balance
+
+    if df.empty:
+        return starting_balance
+
+    pnl = 0.0
+    for _, row in df.iterrows():
+        risk = float(row.get('risk_dollars') or 0)
+        if risk <= 0:
+            continue
+        rr   = float(row.get('rr') or 0)
+        tp1  = bool(row['tp1_hit']) if row.get('tp1_hit') is not None and not pd.isna(row.get('tp1_hit', float('nan'))) else False
+        if row['status'] == 'WIN':
+            pnl += rr * risk
+        elif row['status'] == 'BE_WIN':
+            pnl += 0.5 * rr * risk if tp1 else 0.0
+        elif row['status'] == 'LOSS':
+            pnl -= risk
+
+    return round(max(starting_balance + pnl, 1.0), 4)
 
 
 # ==============================

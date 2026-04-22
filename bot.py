@@ -10,6 +10,7 @@ from performance import (
     save_trade, check_trade_results, daily_report,
     ensure_csv, save_pending_trades, load_pending_trades,
     get_daily_losses, get_engine, TRADES_TABLE, get_stats_summary,
+    get_compounded_balance,
 )
 from logger import send_telegram, send_csv, get_updates, TOKEN, CHAT_ID
 
@@ -186,11 +187,47 @@ def prune_last_signals():
         del last_signals[k]
 
 
+def _restore_last_signals():
+    """Re-populate last_signals from today's DB trades after a restart."""
+    today = str(datetime.utcnow().date())
+    try:
+        engine = get_engine()
+        df = pd.read_sql(
+            f"SELECT pair, signal FROM {TRADES_TABLE} WHERE time >= %(d)s",
+            engine, params={"d": today}
+        )
+        for _, row in df.iterrows():
+            last_signals[f"{row['pair']}_{row['signal']}_{today}"] = True
+    except Exception:
+        pass
+    for t in pending_trades:
+        last_signals[f"{t['pair']}_{t['signal']}_{today}"] = True
+
+
+def _had_tp1_hit_today(symbol):
+    """True if the most recent closed trade for this pair today had tp1_hit=True."""
+    try:
+        engine = get_engine()
+        today = str(datetime.utcnow().date())
+        df = pd.read_sql(
+            f"SELECT tp1_hit FROM {TRADES_TABLE} "
+            f"WHERE pair = %(pair)s AND status != 'OPEN' AND time >= %(today)s "
+            f"ORDER BY time DESC LIMIT 1",
+            engine, params={"pair": symbol, "today": today}
+        )
+        if df.empty:
+            return False
+        val = df.iloc[0]['tp1_hit']
+        return bool(val) if val is not None and not pd.isna(val) else False
+    except Exception:
+        return False
+
+
 # ==============================
 # CAPACITY + DAILY LOSS GUARDS
 # ==============================
-MAX_CONCURRENT = 5
-MAX_DAILY_LOSSES = 3
+MAX_CONCURRENT = 10
+MAX_DAILY_LOSSES = 5
 
 # Mid-cap price filter — focus on explosive movers, exclude BTC/ETH and sub-cent noise
 
@@ -200,6 +237,7 @@ MAX_DAILY_LOSSES = 3
 # RISK_PCT = 0.02 means risk 2% of account per trade.
 # ==============================
 ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "15"))
+STARTING_BALANCE = ACCOUNT_BALANCE   # fixed origin for compounding calculation
 RISK_PCT = float(os.getenv("RISK_PCT", "0.02"))
 
 
@@ -218,6 +256,34 @@ def at_max_capacity():
 
 def daily_loss_limit_hit():
     return get_daily_losses() >= MAX_DAILY_LOSSES
+
+
+def _in_loss_cooldown():
+    """Block new signal generation for 15 min after any stop loss."""
+    try:
+        engine = get_engine()
+        cutoff = str(datetime.utcnow() - timedelta(minutes=15))
+        df = pd.read_sql(
+            f"SELECT COUNT(*) as cnt FROM {TRADES_TABLE} WHERE status = 'LOSS' AND time >= %(c)s",
+            engine, params={"c": cutoff}
+        )
+        return int(df['cnt'].iloc[0]) > 0
+    except Exception:
+        return False
+
+
+def _directional_count(sig):
+    """Open + pending trades in the given direction (BUY or SELL)."""
+    try:
+        engine = get_engine()
+        df = pd.read_sql(
+            f"SELECT COUNT(*) as cnt FROM {TRADES_TABLE} WHERE status = 'OPEN' AND signal = %(s)s",
+            engine, params={"s": sig}
+        )
+        open_count = int(df['cnt'].iloc[0])
+    except Exception:
+        open_count = 0
+    return open_count + sum(1 for t in pending_trades if t['signal'] == sig)
 
 
 # ==============================
@@ -290,20 +356,20 @@ def _handle_cancel(symbol):
 # ==============================
 # POSITION SIZING
 # ==============================
-def calc_position_size(entry, sl):
+def calc_position_size(entry, sl, rr=0.0):
     """
-    Returns (risk_dollars, units, position_value) based on ACCOUNT_BALANCE / RISK_PCT.
-    risk_dollars = how much of the account is at risk on this trade.
-    units        = how many coins/contracts to buy.
-    position_value = notional value of the position.
+    Returns (risk_dollars, units, position_value, risk_pct).
+    Risk scales with signal quality: base 2%, +0.5% per RR point above 3.0, capped at 4%.
+    RR 2.5→2%  RR 3.0→2%  RR 3.5→2.5%  RR 4.0→3%  RR 5.0+→4%
     """
-    risk_dollars = round(ACCOUNT_BALANCE * RISK_PCT, 4)
+    risk_pct = min(RISK_PCT + max(0.0, rr - 3.0) * 0.005, 0.04)
+    risk_dollars = round(ACCOUNT_BALANCE * risk_pct, 4)
     risk_per_unit = abs(entry - sl)
     if risk_per_unit <= 0:
-        return risk_dollars, 0.0, 0.0
+        return risk_dollars, 0.0, 0.0, risk_pct
     units = risk_dollars / risk_per_unit
     position_value = round(units * entry, 4)
-    return risk_dollars, round(units, 6), position_value
+    return risk_dollars, round(units, 6), position_value, risk_pct
 
 
 # ==============================
@@ -365,12 +431,18 @@ def fetch_tf(symbol, tf, market_type):
 # ==============================
 def get_price(symbol, market_type):
     key = f"{symbol}_15m_{market_type}"
-    if key not in MARKET_DATA:
+    if key in MARKET_DATA:
+        df, _ = MARKET_DATA[key]
+        if df is not None and not df.empty:
+            return df.iloc[-1]['close']
+    # MARKET_DATA not populated (e.g. max-capacity scan was skipped) — fetch live
+    ex = spot_exchange if market_type == "spot" else futures_exchange
+    try:
+        ticker = ex.fetch_ticker(symbol)
+        price = ticker.get('last') or ticker.get('close')
+        return float(price) if price else None
+    except Exception:
         return None
-    df, _ = MARKET_DATA[key]
-    if df is None or df.empty:
-        return None
-    return df.iloc[-1]['close']
 
 
 # ==============================
@@ -522,27 +594,17 @@ def _get_liquid_active_pool(exchange, market_type, symbol_filter, top_n=50):
 def get_pairs():
     """
     Pipeline:
-      1. fetch_tickers() → liquid ($2M+) + active (1.5%+ move) USDT pairs
-      2. Score top 50 by ATR% × 1h_vol × surge_multiplier
-      3. Return best 20 — these go into the strategy
+      1. fetch_tickers() → liquid ($2M+) + active (1.5%+ move) MEXC futures pairs
+      2. Score top 60 by ATR% × 1h_vol × surge_multiplier
+      3. Return best 30 — these go into the strategy
     """
     candidates = []
 
-    spot_syms = _get_liquid_active_pool(
-        spot_exchange, "spot",
-        lambda s: "/USDT" in s and ":" not in s,
-        top_n=40,
-    )
     futures_syms = _get_liquid_active_pool(
         futures_exchange, "futures",
         lambda s: "/USDT:USDT" in s,
-        top_n=40,
+        top_n=60,
     )
-
-    for symbol in spot_syms:
-        score = momentum_score(symbol, "spot")
-        if score > 0:
-            candidates.append((symbol, "spot", score))
 
     for symbol in futures_syms:
         score = momentum_score(symbol, "futures")
@@ -550,7 +612,7 @@ def get_pairs():
             candidates.append((symbol, "futures", score))
 
     candidates.sort(key=lambda x: x[2], reverse=True)
-    top = [(sym, mtype) for sym, mtype, _ in candidates[:20]]
+    top = [(sym, mtype) for sym, mtype, _ in candidates[:30]]
     print(f"📊 Top pairs: {[s for s, _ in top]}")
     return top
 
@@ -650,10 +712,11 @@ def check_pending_trades():
                 f"{'─' * 22}\n"
                 f"🔔 Trade is now live. Managing SL/TP."
             )
+            _rd, _, _, _ = calc_position_size(trade['entry'], trade['sl'], trade.get('rr', 0.0))
             save_trade(
                 trade['pair'], trade['signal'], trade['entry'],
                 trade['sl'], trade['tp'], tp2, trade['rr'],
-                trade['market_type'], trade.get('atr', 0.0)
+                trade['market_type'], trade.get('atr', 0.0), _rd
             )
         else:
             updated.append(trade)
@@ -671,6 +734,11 @@ def run_bot():
 
     if at_max_capacity():
         print(f"⚠️ Max concurrent trades ({MAX_CONCURRENT}) reached, skipping scan")
+        check_pending_trades()
+        return
+
+    if _in_loss_cooldown():
+        print("🧊 Loss cooldown active (15 min) — no new entries this scan")
         check_pending_trades()
         return
 
@@ -752,6 +820,13 @@ def run_bot():
             pass
 
         if not is_new_signal(symbol, sig):
+            # Allow re-entry if last closed trade today hit TP1 (continuation)
+            if not _had_tp1_hit_today(symbol):
+                continue
+            print(f"♻️ Re-entry allowed (TP1 hit earlier today): {symbol}")
+
+        if _directional_count(sig) >= 5:
+            print(f"⚠️ {symbol} skipped — {sig} direction full (5/5)")
             continue
 
         sl_pct = abs(sl - entry) / entry * 100
@@ -761,7 +836,31 @@ def run_bot():
         market_label = f"{'Spot' if market_type == 'spot' else 'Futures'} · {exchange}"
         now_str = datetime.utcnow().strftime("%d %b %Y · %H:%M UTC")
 
-        risk_dollars, units, pos_value = calc_position_size(entry, sl)
+        risk_dollars, units, pos_value, risk_pct = calc_position_size(entry, sl, rr)
+
+        if pos_value > ACCOUNT_BALANCE * 10:
+            print(f"⚠️ {symbol} skipped — position ${pos_value:.2f} > 10× account (${ACCOUNT_BALANCE:.2f})")
+            continue
+
+        # Contracts (MEXC uses contracts, not raw units)
+        mkt_info     = FUTURES_MARKETS.get(symbol, {})
+        contract_size = float(mkt_info.get('contractSize') or 1)
+        contracts    = round(units / contract_size, 1)
+        min_qty      = ((mkt_info.get('limits') or {}).get('amount') or {}).get('min') or 1
+        if contracts < min_qty:
+            print(f"⚠️ {symbol} skipped — {contracts} contracts below exchange minimum ({min_qty})")
+            continue
+
+        leverage = max(1, round(pos_value / ACCOUNT_BALANCE))
+        leverage_line = f"Leverage  set {leverage}×  on MEXC before entering\n"
+
+        # Funding rate + isolated margin reminder
+        try:
+            fr = futures_exchange.fetch_funding_rate(symbol)
+            fr_val = (fr.get('fundingRate') or 0) * 100
+            funding_line = f"Funding   {fr_val:+.4f}%/8h  ← use isolated margin\n"
+        except Exception:
+            funding_line = "Funding   n/a  ← use isolated margin\n"
 
         tp2_line = (
             f"TP2     {_fmt_price(tp2)}  (▲ {abs(tp2 - entry) / entry * 100:.2f}%)\n"
@@ -785,15 +884,17 @@ def run_bot():
                 f"{tp2_line}"
                 f"RR      1 : {rr}\n"
                 f"{'─' * 22}\n"
-                f"💰 POSITION SIZING  ({RISK_PCT*100:.0f}% risk)\n"
+                f"💰 POSITION SIZING  ({risk_pct*100:.0f}% risk)\n"
                 f"Risk    ${risk_dollars:.2f}  of ${ACCOUNT_BALANCE:.2f}\n"
-                f"Size    {units} units  (~${pos_value:.2f})\n"
+                f"Size    {contracts} contracts  (~${pos_value:.2f})\n"
+                f"{leverage_line}"
+                f"{funding_line}"
                 f"{'─' * 22}\n"
                 f"🔔 Trade is now live. Managing SL/TP."
             )
             print(msg)
             send_telegram(msg)
-            save_trade(symbol, sig, entry, sl, tp, tp2, rr, market_type, float(atr))
+            save_trade(symbol, sig, entry, sl, tp, tp2, rr, market_type, float(atr), risk_dollars)
         else:
             msg = (
                 f"{'─' * 22}\n"
@@ -808,9 +909,11 @@ def run_bot():
                 f"{tp2_line}"
                 f"RR      1 : {rr}\n"
                 f"{'─' * 22}\n"
-                f"💰 POSITION SIZING  ({RISK_PCT*100:.0f}% risk)\n"
+                f"💰 POSITION SIZING  ({risk_pct*100:.0f}% risk)\n"
                 f"Risk    ${risk_dollars:.2f}  of ${ACCOUNT_BALANCE:.2f}\n"
-                f"Size    {units} units  (~${pos_value:.2f})\n"
+                f"Size    {contracts} contracts  (~${pos_value:.2f})\n"
+                f"{leverage_line}"
+                f"{funding_line}"
                 f"{'─' * 22}\n"
                 f"⏳ Pending — waiting for entry to trigger"
             )
@@ -842,6 +945,7 @@ def main():
 
     ensure_csv()
     pending_trades = load_pending_trades()
+    _restore_last_signals()
     print(f"📂 Loaded {len(pending_trades)} pending trade(s) from DB")
 
     last_report_day = None
@@ -850,6 +954,10 @@ def main():
         try:
             MARKET_DATA = {}
             PRICE_CACHE = {}
+
+            global ACCOUNT_BALANCE
+            ACCOUNT_BALANCE = get_compounded_balance(STARTING_BALANCE)
+            print(f"💼 Balance: ${ACCOUNT_BALANCE:.2f}  (started ${STARTING_BALANCE:.2f})")
 
             check_telegram_commands()
 
@@ -874,8 +982,11 @@ def main():
             time.sleep(60)
             continue
 
-        print("⏳ Sleeping 15 minutes...")
-        time.sleep(900)
+        hour = datetime.utcnow().hour
+        in_session = (7 <= hour < 9) or (13 <= hour < 15)
+        sleep_secs = 300 if in_session else 900
+        print(f"⏳ Sleeping {sleep_secs // 60} minutes{'  (session active)' if in_session else ''}...")
+        time.sleep(sleep_secs)
 
 
 if __name__ == "__main__":
