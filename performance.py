@@ -201,10 +201,14 @@ def get_compounded_balance(starting_balance):
 
     pnl = 0.0
     for _, row in df.iterrows():
-        risk = float(row.get('risk_dollars') or 0)
+        risk_raw = row.get('risk_dollars')
+        if risk_raw is None or pd.isna(risk_raw):
+            continue
+        risk = float(risk_raw)
         if risk <= 0:
             continue
-        rr   = float(row.get('rr') or 0)
+        rr_raw = row.get('rr')
+        rr   = float(rr_raw) if rr_raw is not None and not pd.isna(rr_raw) else 0.0
         tp1  = bool(row['tp1_hit']) if row.get('tp1_hit') is not None and not pd.isna(row.get('tp1_hit', float('nan'))) else False
         if row['status'] == 'WIN':
             pnl += rr * risk
@@ -213,6 +217,8 @@ def get_compounded_balance(starting_balance):
         elif row['status'] == 'LOSS':
             pnl -= risk
 
+    if pd.isna(pnl):
+        pnl = 0.0
     return round(max(starting_balance + pnl, 1.0), 4)
 
 

@@ -852,7 +852,8 @@ def run_bot():
             print(f"⚠️ {symbol} skipped — {contracts} contracts below exchange minimum ({min_qty})")
             continue
 
-        leverage = max(1, round(pos_value / ACCOUNT_BALANCE))
+        safe_bal = ACCOUNT_BALANCE if not pd.isna(ACCOUNT_BALANCE) and ACCOUNT_BALANCE > 0 else STARTING_BALANCE
+        leverage = max(1, round(pos_value / safe_bal))
         leverage_line = f"Leverage  set {leverage}×  on MEXC before entering\n"
 
         # Funding rate + isolated margin reminder
@@ -958,6 +959,8 @@ def main():
 
             global ACCOUNT_BALANCE
             ACCOUNT_BALANCE = get_compounded_balance(STARTING_BALANCE)
+            if pd.isna(ACCOUNT_BALANCE) or ACCOUNT_BALANCE <= 0:
+                ACCOUNT_BALANCE = STARTING_BALANCE
             print(f"💼 Balance: ${ACCOUNT_BALANCE:.2f}  (started ${STARTING_BALANCE:.2f})")
 
             check_telegram_commands()

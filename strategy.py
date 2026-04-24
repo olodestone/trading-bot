@@ -1028,7 +1028,7 @@ def entry_signal_reversal(df_15m, df_1h, df_4h, direction, params):
         entry = last['close']
         sl = last['low'] - (0.3 * atr)
         risk = entry - sl
-        if risk <= 0:
+        if risk <= 0 or risk < atr * 0.5:
             return None
 
         # TP1: prefer nearest 1h swing high; fall back to 4h when 1h is too close
@@ -1053,7 +1053,7 @@ def entry_signal_reversal(df_15m, df_1h, df_4h, direction, params):
         entry = last['close']
         sl = last['high'] + (0.3 * atr)
         risk = sl - entry
-        if risk <= 0:
+        if risk <= 0 or risk < atr * 0.5:
             return None
 
         # TP1: prefer nearest 1h swing low; fall back to 4h when 1h is too close
