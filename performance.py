@@ -52,7 +52,9 @@ def ensure_csv():
             )
         """))
         # Add new columns to existing tables without breaking live data
-        for col, typedef in [("tp2", "FLOAT"), ("tp1_hit", "BOOLEAN"), ("risk_dollars", "FLOAT")]:
+        for col, typedef in [("tp2", "FLOAT"), ("tp1_hit", "BOOLEAN"), ("risk_dollars", "FLOAT"),
+                             ("mae", "FLOAT"), ("mfe", "FLOAT"),
+                             ("time_to_mfe", "FLOAT"), ("time_to_mae", "FLOAT")]:
             try:
                 conn.execute(text(
                     f"ALTER TABLE {TRADES_TABLE} ADD COLUMN IF NOT EXISTS {col} {typedef}"
@@ -264,21 +266,30 @@ def check_trade_results(fetch_price_func, send_telegram):
         pair = row['pair']
         direction = "LONG" if sig == "BUY" else "SHORT"
 
+        # MAE/MFE: update on every scan, overwrite when new max
+        try:
+            entry_time = pd.to_datetime(row['time']).replace(tzinfo=None)
+            hours_elapsed = round((datetime.utcnow() - entry_time).total_seconds() / 3600, 2)
+        except Exception:
+            hours_elapsed = 0.0
+        existing_mfe = float(row['mfe']) if row.get('mfe') is not None and not pd.isna(row.get('mfe', float('nan'))) else 0.0
+        existing_mae = float(row['mae']) if row.get('mae') is not None and not pd.isna(row.get('mae', float('nan'))) else 0.0
         if sig == "BUY":
-            # Breakeven: move SL to entry at 1:1
-            if not be_activated and price >= entry + risk:
-                changes['trail_sl'] = entry
-                changes['be_activated'] = True
-                trail_sl = entry
-                be_activated = True
-                send_telegram(
-                    f"🔒 BREAKEVEN SET\n"
-                    f"{pair}  {direction}\n"
-                    f"SL moved to entry @ {_fmt(entry)}"
-                )
+            cur_mfe = max((price - entry) / risk, 0.0)
+            cur_mae = max((entry - price) / risk, 0.0)
+        else:
+            cur_mfe = max((entry - price) / risk, 0.0)
+            cur_mae = max((price - entry) / risk, 0.0)
+        if cur_mfe > existing_mfe:
+            changes['mfe'] = round(cur_mfe, 3)
+            changes['time_to_mfe'] = hours_elapsed
+        if cur_mae > existing_mae:
+            changes['mae'] = round(cur_mae, 3)
+            changes['time_to_mae'] = hours_elapsed
 
-            # Trail: tighten SL at 2:1+
-            elif be_activated and price >= entry + 2 * risk:
+        if sig == "BUY":
+            # Trail: tighten SL at 2:1+ (only runs after TP1 sets BE)
+            if be_activated and price >= entry + 2 * risk:
                 new_trail = price - (1.2 * risk)
                 if new_trail > trail_sl:
                     changes['trail_sl'] = round(new_trail, 8)
@@ -310,9 +321,14 @@ def check_trade_results(fetch_price_func, send_telegram):
                     f"Close 25% @ {_fmt(tp2)}  (+{tp2_pct:.2f}%)\n"
                     f"RR 1:{row['rr']}  Trail the rest"
                 )
-            # TP1 hit (first partial — 50% out)
+            # TP1 hit — close 50%, move SL to entry (BE set here, not at 1:1)
             elif not tp1_hit and price >= tp1:
                 changes['tp1_hit'] = True
+                changes['be_activated'] = True
+                changes['trail_sl'] = entry
+                tp1_hit = True
+                be_activated = True
+                trail_sl = entry
                 tp1_pct = abs(tp1 - entry) / entry * 100
                 tp2_line = f"TP2 @ {_fmt(tp2)}" if tp2 else "No TP2 — trail remainder"
                 send_telegram(
@@ -321,25 +337,15 @@ def check_trade_results(fetch_price_func, send_telegram):
                     f"{pair}  {direction}\n"
                     f"Exit 50% @ {_fmt(tp1)}  (+{tp1_pct:.2f}%)\n"
                     f"{tp2_line}\n"
-                    f"SL trails remainder"
+                    f"SL → entry (BE set)"
                 )
                 # If no TP2, close the full trade as WIN
                 if not tp2:
                     changes['status'] = "WIN"
 
         elif sig == "SELL":
-            if not be_activated and price <= entry - risk:
-                changes['trail_sl'] = entry
-                changes['be_activated'] = True
-                trail_sl = entry
-                be_activated = True
-                send_telegram(
-                    f"🔒 BREAKEVEN SET\n"
-                    f"{pair}  {direction}\n"
-                    f"SL moved to entry @ {_fmt(entry)}"
-                )
-
-            elif be_activated and price <= entry - 2 * risk:
+            # Trail: tighten SL at 2:1+ (only runs after TP1 sets BE)
+            if be_activated and price <= entry - 2 * risk:
                 new_trail = price + (1.2 * risk)
                 if new_trail < trail_sl:
                     changes['trail_sl'] = round(new_trail, 8)
@@ -369,8 +375,14 @@ def check_trade_results(fetch_price_func, send_telegram):
                     f"Close 25% @ {_fmt(tp2)}  (+{tp2_pct:.2f}%)\n"
                     f"RR 1:{row['rr']}  Trail the rest"
                 )
+            # TP1 hit — close 50%, move SL to entry (BE set here, not at 1:1)
             elif not tp1_hit and price <= tp1:
                 changes['tp1_hit'] = True
+                changes['be_activated'] = True
+                changes['trail_sl'] = entry
+                tp1_hit = True
+                be_activated = True
+                trail_sl = entry
                 tp1_pct = abs(tp1 - entry) / entry * 100
                 tp2_line = f"TP2 @ {_fmt(tp2)}" if tp2 else "No TP2 — trail remainder"
                 send_telegram(
@@ -379,7 +391,7 @@ def check_trade_results(fetch_price_func, send_telegram):
                     f"{pair}  {direction}\n"
                     f"Exit 50% @ {_fmt(tp1)}  (+{tp1_pct:.2f}%)\n"
                     f"{tp2_line}\n"
-                    f"SL trails remainder"
+                    f"SL → entry (BE set)"
                 )
                 if not tp2:
                     changes['status'] = "WIN"
@@ -401,18 +413,16 @@ def check_trade_results(fetch_price_func, send_telegram):
 # ==============================
 # EXPECTANCY HELPER
 # ==============================
-def _expectancy(wins, losses, avg_rr):
+def _expectancy(wins, be_wins, losses, avg_win_rr, avg_be_rr=0.0):
     """
-    Expectancy = (win_rate * avg_RR) - (loss_rate * 1.0)
-    Positive = system has edge. Units are R (multiples of risk).
-    Example: 0.5 means for every $1 risked, expect $0.50 profit on average.
+    True expectancy per trade risked (in R).
+    WIN: earns avg_win_rr. BE_WIN: earns 0.5×TP1_rr (partial close, rest at entry).
+    LOSS: costs 1R.
     """
-    total = wins + losses
-    if total == 0 or avg_rr == 0:
+    total = wins + be_wins + losses
+    if total == 0:
         return 0.0
-    wr = wins / total
-    lr = losses / total
-    return round((wr * avg_rr) - (lr * 1.0), 3)
+    return round((wins * avg_win_rr + be_wins * avg_be_rr - losses * 1.0) / total, 3)
 
 
 # ==============================
@@ -440,7 +450,8 @@ def get_stats_summary():
     win_rate = (wins + be_wins) / total_closed * 100
     avg_rr = df[df['status'] == "WIN"]['rr'].mean() if wins > 0 else 0.0
     best_rr = df[df['status'] == "WIN"]['rr'].max() if wins > 0 else 0.0
-    expectancy = _expectancy(wins + be_wins, losses, avg_rr)
+    avg_be_rr = (df[df['status'] == "BE_WIN"]['rr'] * 0.5).mean() if be_wins > 0 else 0.0
+    expectancy = _expectancy(wins, be_wins, losses, avg_rr, avg_be_rr)
 
     # Streak calculation
     closed_df = df[df['status'].isin(["WIN", "BE_WIN", "LOSS"])].copy()
@@ -476,6 +487,45 @@ def get_stats_summary():
 
 
 # ==============================
+# MAE/MFE DIAGNOSTIC SECTION
+# ==============================
+def _mae_mfe_section(df_closed):
+    if df_closed.empty or 'mfe' not in df_closed.columns:
+        return ""
+    df = df_closed.dropna(subset=['mfe', 'mae'])
+    if df.empty:
+        return ""
+
+    wins   = df[df['status'] == "WIN"]
+    be     = df[df['status'] == "BE_WIN"]
+    losses = df[df['status'] == "LOSS"]
+
+    lines = ["\nMAE/MFE:"]
+
+    def _ttf(sub, col):
+        return sub[col].dropna().mean() if col in sub.columns and not sub[col].dropna().empty else 0.0
+
+    if not wins.empty:
+        lines.append(
+            f"  Wins ({len(wins)}):  avg MFE {wins['mfe'].mean():.2f}R  "
+            f"peak @{_ttf(wins, 'time_to_mfe'):.1f}h"
+        )
+    if not be.empty:
+        lines.append(
+            f"  BE   ({len(be)}):  avg MFE {be['mfe'].mean():.2f}R  "
+            f"peak @{_ttf(be, 'time_to_mfe'):.1f}h  ← exits too early?"
+        )
+    if not losses.empty:
+        lines.append(
+            f"  Loss ({len(losses)}):  avg MFE {losses['mfe'].mean():.2f}R  "
+            f"avg MAE {losses['mae'].mean():.2f}R  "
+            f"SL hit @{_ttf(losses, 'time_to_mae'):.1f}h"
+        )
+
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+# ==============================
 # DAILY REPORT
 # ==============================
 def daily_report(send_telegram):
@@ -506,7 +556,11 @@ def daily_report(send_telegram):
     all_closed = all_wins + all_be + all_losses
     all_wr = ((all_wins + all_be) / all_closed * 100) if all_closed > 0 else 0
     all_avg_rr = df[df['status'] == "WIN"]['rr'].mean() if all_wins > 0 else 0.0
-    all_expectancy = _expectancy(all_wins + all_be, all_losses, all_avg_rr)
+    all_avg_be_rr = (df[df['status'] == "BE_WIN"]['rr'] * 0.5).mean() if all_be > 0 else 0.0
+    all_expectancy = _expectancy(all_wins, all_be, all_losses, all_avg_rr, all_avg_be_rr)
+
+    df_closed_today = df_today[df_today['status'].isin(["WIN", "BE_WIN", "LOSS"])]
+    mae_mfe = _mae_mfe_section(df_closed_today)
 
     msg = f"""
 📊 DAILY REPORT ({today})
@@ -515,7 +569,7 @@ Today:
   Open: {open_t} | Closed: {closed}
   W: {wins}  BE: {be_wins}  L: {losses}
   Win Rate: {round(winrate, 1)}%
-  Avg RR (Wins): {round(avg_rr, 2)}
+  Avg RR (Wins): {round(avg_rr, 2)}{mae_mfe}
 
 All-Time:
   W: {all_wins}  BE: {all_be}  L: {all_losses}

@@ -167,22 +167,21 @@ def get_cached_tf(symbol, tf, market_type):
 # PENDING TRADES + DEDUP
 # ==============================
 pending_trades = []
-last_signals = {}  # key: "pair_signal_date" → True
+last_signals = {}  # key: "pair_signal" → datetime (UTC of first fire)
 
 
 def is_new_signal(pair, sig):
-    today = str(datetime.now().date())
-    key = f"{pair}_{sig}_{today}"
+    key = f"{pair}_{sig}"
     if key in last_signals:
         return False
-    last_signals[key] = True
+    last_signals[key] = datetime.utcnow()
     return True
 
 
 def prune_last_signals():
-    """Remove entries from previous days."""
-    today = str(datetime.now().date())
-    stale = [k for k in last_signals if not k.endswith(today)]
+    """Remove entries older than 4h so a reset setup can re-fire."""
+    cutoff = datetime.utcnow() - timedelta(hours=4)
+    stale = [k for k, ts in last_signals.items() if ts < cutoff]
     for k in stale:
         del last_signals[k]
 
@@ -193,15 +192,18 @@ def _restore_last_signals():
     try:
         engine = get_engine()
         df = pd.read_sql(
-            f"SELECT pair, signal FROM {TRADES_TABLE} WHERE time >= %(d)s",
+            f"SELECT pair, signal, time FROM {TRADES_TABLE} WHERE time >= %(d)s",
             engine, params={"d": today}
         )
         for _, row in df.iterrows():
-            last_signals[f"{row['pair']}_{row['signal']}_{today}"] = True
+            key = f"{row['pair']}_{row['signal']}"
+            t = pd.to_datetime(row['time'])
+            if not pd.isna(t):
+                last_signals[key] = t.to_pydatetime().replace(tzinfo=None)
     except Exception:
         pass
     for t in pending_trades:
-        last_signals[f"{t['pair']}_{t['signal']}_{today}"] = True
+        last_signals[f"{t['pair']}_{t['signal']}"] = t.get('time', datetime.utcnow())
 
 
 def _had_tp1_hit_today(symbol):

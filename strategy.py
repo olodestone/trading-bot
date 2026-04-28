@@ -227,14 +227,11 @@ def get_htf_bias(df_1h, df_4h, df_1d, params=None, market_mode="normal"):
     """
     4h DI direction is mandatory — never fire against the confirmed 4h trend.
     Score the remaining 4 factors: 1h/4h/1d structure + 1h EMA50/200 alignment.
-    Require 3/4 in NORMAL vol, 2/4 in HIGH vol.
 
-    Making DI mandatory rather than counted prevents a setup from passing 4/5
-    with DI pointing the wrong way — which was previously possible.
+    BUY threshold: 3/4 NORMAL vol, 2/4 HIGH vol.
+    SELL threshold: 4/4 NORMAL vol, 3/4 HIGH vol (one step harder — mixed/bullish regimes produce false sells).
 
-    Bear mode: SELL only. Threshold drops by 1 (2/4 NORMAL, 1/4 HIGH).
-    1d structure is always the last to confirm in early crash phases —
-    requiring 3/4 without 1d would block every legitimate short in the open.
+    Bear mode: SELL only. Threshold drops by 1 from the SELL baseline.
     """
     last_1h = df_1h.iloc[-1]
     last_4h = df_4h.iloc[-1]
@@ -262,20 +259,20 @@ def get_htf_bias(df_1h, df_4h, df_1d, params=None, market_mode="normal"):
     else:
         bear_score += 1
 
-    # 3/4 required in NORMAL vol, 2/4 in HIGH vol
-    base_threshold = 2 if params and params.get("high_vol") else 3
+    buy_threshold  = 2 if params and params.get("high_vol") else 3
+    sell_threshold = min(buy_threshold + 1, 4)  # SELL is one step harder than BUY
 
     if market_mode == "bear":
         # SELL only — BUY disabled at caller level.
         # Threshold drops by 1: 1d structure lags in early crash phases.
-        sell_threshold = max(base_threshold - 1, 1)
-        if di_bear and bear_score >= sell_threshold:
+        bear_sell_threshold = max(sell_threshold - 1, 1)
+        if di_bear and bear_score >= bear_sell_threshold:
             return "SELL"
         return None
 
-    if di_bull and bull_score >= base_threshold:
+    if di_bull and bull_score >= buy_threshold:
         return "BUY"
-    if di_bear and bear_score >= base_threshold:
+    if di_bear and bear_score >= sell_threshold:
         return "SELL"
     return None
 
@@ -483,7 +480,7 @@ def entry_signal_bounce(df_15m, df_1h, df_4h, params):
                 if tp1 is not None and tp1 > entry:
                     reward = tp1 - entry
                     rr = round(reward / risk, 2)
-                    if rr >= params["rr_min"]:
+                    if rr >= params["rr_min"] and rr <= 6.5:
                         tp2 = second_resistance(df_1h, tp1)
                         confs = [c for c in ["candle", "rsi_os", "macd_turn"] if [conf_candle, conf_rsi, conf_macd][["candle", "rsi_os", "macd_turn"].index(c)]]
                         print(f"    bounce BUY conf={'+'.join(confs)} stoch={stoch_k:.0f} rr={rr}")
@@ -517,7 +514,7 @@ def entry_signal_bounce(df_15m, df_1h, df_4h, params):
                 if tp1 is not None and tp1 < entry:
                     reward = entry - tp1
                     rr = round(reward / risk, 2)
-                    if rr >= params["rr_min"]:
+                    if rr >= params["rr_min"] and rr <= 6.5:
                         tp2 = second_support(df_1h, tp1)
                         confs = [c for c in ["candle", "rsi_ob", "macd_turn"] if [conf_candle, conf_rsi, conf_macd][["candle", "rsi_ob", "macd_turn"].index(c)]]
                         print(f"    bounce SELL conf={'+'.join(confs)} stoch={stoch_k:.0f} rr={rr}")
@@ -894,10 +891,14 @@ def entry_signal_trend(df_15m, df_1h, df_4h, direction, params, market_mode="nor
             if not consolidation_coil(df_15m, atr):
                 return None
 
-        entry = last['close']
-        sl    = df_15m['low'].tail(20).min() - (0.3 * atr)
+        entry  = last['close']
+        sl_buf = 0.5 * atr if params.get("high_vol") else 0.3 * atr
+        # Nearest confirmed 15m swing low as structural anchor; fall back to rolling min
+        sw_lows = [l for l in swing_lows(df_15m) if l < entry]
+        sl_level = max(sw_lows) if sw_lows else df_15m['low'].tail(20).min()
+        sl    = sl_level - sl_buf
         risk  = entry - sl
-        if risk <= 0:
+        if risk <= 0 or risk < atr * 0.4:
             return None
 
         # TP1: prefer nearest 1h swing high; fall back to 4h when 1h is too close
@@ -941,10 +942,14 @@ def entry_signal_trend(df_15m, df_1h, df_4h, direction, params, market_mode="nor
             if not consolidation_coil(df_15m, atr):
                 return None
 
-        entry = last['close']
-        sl    = df_15m['high'].tail(20).max() + (0.3 * atr)
+        entry  = last['close']
+        sl_buf = 0.5 * atr if params.get("high_vol") else 0.3 * atr
+        # Nearest confirmed 15m swing high as structural anchor; fall back to rolling max
+        sw_highs = [h for h in swing_highs(df_15m) if h > entry]
+        sl_level = min(sw_highs) if sw_highs else df_15m['high'].tail(20).max()
+        sl    = sl_level + sl_buf
         risk  = sl - entry
-        if risk <= 0:
+        if risk <= 0 or risk < atr * 0.4:
             return None
 
         # TP1: prefer nearest 1h swing low; fall back to 4h when 1h is too close
@@ -982,6 +987,8 @@ def entry_signal_trend(df_15m, df_1h, df_4h, direction, params, market_mode="nor
         tp2 = second_resistance(df_1h, tp1) if direction == "BUY" else second_support(df_1h, tp1)
 
     rr = round(reward / risk, 2)
+    if rr > 6.5:
+        return None  # SL too tight for market noise
 
     if rr >= rr_min:
         pass  # TP1 alone is sufficient
@@ -1025,9 +1032,10 @@ def entry_signal_reversal(df_15m, df_1h, df_4h, direction, params):
         if last['volume'] < last['vol_ma'] * 1.3:
             return None
 
-        entry = last['close']
-        sl = last['low'] - (0.3 * atr)
-        risk = entry - sl
+        entry  = last['close']
+        sl_buf = 0.5 * atr if params.get("high_vol") else 0.3 * atr
+        sl     = last['low'] - sl_buf
+        risk   = entry - sl
         if risk <= 0 or risk < atr * 0.5:
             return None
 
@@ -1050,9 +1058,10 @@ def entry_signal_reversal(df_15m, df_1h, df_4h, direction, params):
         if last['volume'] < last['vol_ma'] * 1.3:
             return None
 
-        entry = last['close']
-        sl = last['high'] + (0.3 * atr)
-        risk = sl - entry
+        entry  = last['close']
+        sl_buf = 0.5 * atr if params.get("high_vol") else 0.3 * atr
+        sl     = last['high'] + sl_buf
+        risk   = sl - entry
         if risk <= 0 or risk < atr * 0.5:
             return None
 
@@ -1089,6 +1098,8 @@ def entry_signal_reversal(df_15m, df_1h, df_4h, direction, params):
         tp2 = second_resistance(df_1h, tp1) if direction == "BUY" else second_support(df_1h, tp1)
 
     rr = round(reward / risk, 2)
+    if rr > 6.5:
+        return None  # SL too tight for market noise
 
     if rr >= rr_min:
         pass
