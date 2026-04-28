@@ -1332,27 +1332,39 @@ def generate_pullback_signal(df_15m, df_1h, df_4h, df_1d=None, symbol="", market
     else:
         rsi_ok = False
 
-    # ── confluence: Step-3 trigger score ──────────────────────────────────
-    confluence = 0
+    # ── State + Event + Location ───────────────────────────────────────────
+    # State: trend_ok (EMA structure)
+    # Location: rsi_ok (RSI in pullback zone)
+    # Event: rsi_cross OR conf_candle — mandatory, prevents State+State+State overtrading
+    rsi_cross   = False
+    conf_candle = False
+    ema_align   = False
     if trend_ok and rsi_ok and len(df_1h) >= 5:
         prev_1h     = df_1h.iloc[-2]
         rsi_1h_prev = prev_1h.get("rsi")
         ema20       = last_15m.get("ema20")
-        close       = last_15m["close"]
+        close_15m   = last_15m["close"]
         if not any(pd.isna(x) for x in [rsi_1h_prev, ema20]):
             if direction == "BUY":
-                rsi_in_zone = 40 <= rsi_1h <= 52
-                rsi_cross   = (rsi_1h_prev <= 45) and (rsi_1h > 45)
-                ema_align   = close > ema20
+                rsi_cross  = (rsi_1h_prev <= 45) and (rsi_1h > 45)
+                body       = abs(last_15m["close"] - last_15m["open"])
+                lower_wick = min(last_15m["open"], last_15m["close"]) - last_15m["low"]
+                upper_wick = last_15m["high"] - max(last_15m["open"], last_15m["close"])
+                is_hammer  = body > 0 and lower_wick >= 2 * body and upper_wick <= body
+                conf_candle = is_engulfing(df_15m, "BUY") or is_hammer
+                ema_align   = close_15m > ema20
             else:
-                rsi_in_zone = 48 <= rsi_1h <= 60
-                rsi_cross   = (rsi_1h_prev >= 55) and (rsi_1h < 55)
-                ema_align   = close < ema20
-            confluence = sum([rsi_in_zone, rsi_cross, ema_align])
+                rsi_cross  = (rsi_1h_prev >= 55) and (rsi_1h < 55)
+                body       = abs(last_15m["close"] - last_15m["open"])
+                upper_wick = last_15m["high"] - max(last_15m["open"], last_15m["close"])
+                lower_wick = min(last_15m["open"], last_15m["close"]) - last_15m["low"]
+                is_sstar   = body > 0 and upper_wick >= 2 * body and lower_wick <= body
+                conf_candle = is_engulfing(df_15m, "SELL") or is_sstar
+                ema_align   = close_15m < ema20
 
     # ── Route ─────────────────────────────────────────────────────────────
-    if trend_ok and rsi_ok and confluence >= 2:
-        # Full pullback setup confirmed
+    if trend_ok and rsi_ok and (rsi_cross or conf_candle):
+        # Event gate passed: RSI crossed threshold OR candle confirms reversal
         atr   = last_15m.get("atr", 0)
         close = last_15m["close"]
         if direction == "BUY":
@@ -1362,7 +1374,6 @@ def generate_pullback_signal(df_15m, df_1h, df_4h, df_1d=None, symbol="", market
         risk = abs(close - sl)
         if risk <= 0 or risk > close * 0.06:
             return None
-        # Use structural TP (nearest 1h swing level) instead of fixed 1R
         if direction == "BUY":
             tp1 = nearest_resistance(df_1h, close) or nearest_resistance(df_4h, close)
             tp2 = second_resistance(df_1h, tp1) if tp1 else None
@@ -1375,7 +1386,8 @@ def generate_pullback_signal(df_15m, df_1h, df_4h, df_1d=None, symbol="", market
         rr = round(reward / risk, 2)
         if rr < 1.5:
             return None
-        print(f"  ✅ PULLBACK {direction} {symbol} | RSI1h={rsi_1h:.1f} ADX4h={adx:.1f} conf={confluence}/3 | entry={close:.4f} sl={sl:.4f} tp1={tp1:.4f} rr={rr} | mode={market_mode}")
+        event_tag = "rsi_cross" if rsi_cross else "candle"
+        print(f"  ✅ PULLBACK {direction} {symbol} | RSI1h={rsi_1h:.1f} ADX4h={adx:.1f} event={event_tag} ema={ema_align} | entry={close:.4f} sl={sl:.4f} tp1={tp1:.4f} rr={rr} | mode={market_mode}")
         return (direction, close, sl, tp1, tp2, rr, atr, "pullback")
 
     elif trend_ok:
