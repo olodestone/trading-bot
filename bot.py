@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import os
 import signal as signal_module
 
-from strategy import apply_indicators, generate_pullback_signal
+from strategy import apply_indicators, generate_filtered_signal, generate_pullback_signal
 from performance import (
     save_trade, check_trade_results, daily_report,
     ensure_csv, save_pending_trades, load_pending_trades,
@@ -187,13 +187,13 @@ def prune_last_signals():
 
 
 def _restore_last_signals():
-    """Re-populate last_signals from today's DB trades after a restart."""
-    today = str(datetime.utcnow().date())
+    """Re-populate last_signals from the last 4h of DB trades after a restart."""
+    cutoff = str(datetime.utcnow() - timedelta(hours=4))
     try:
         engine = get_engine()
         df = pd.read_sql(
             f"SELECT pair, signal, time FROM {TRADES_TABLE} WHERE time >= %(d)s",
-            engine, params={"d": today}
+            engine, params={"d": cutoff}
         )
         for _, row in df.iterrows():
             key = f"{row['pair']}_{row['signal']}"
@@ -660,10 +660,15 @@ def is_not_late_entry(df, entry, direction, trade_type="trend"):
     if df is None or df.empty:
         return False
     price = df.iloc[-1]['close']
-    # Trend breakouts retest the breakout level — allow wider tolerance.
+    # Trend breakouts retest the breakout level — wide tolerance.
+    # Pullbacks queue at RSI/EMA zone — modest drift is fine before entry fires.
     # Reversals and bounces must be entered at the turning point — keep tight.
-    # If price has moved away from a support bounce, the edge is gone.
-    threshold = 0.015 if trade_type == "trend" else 0.003
+    if trade_type == "trend":
+        threshold = 0.015
+    elif trade_type in ("pullback",):
+        threshold = 0.007
+    else:
+        threshold = 0.003
     return abs(price - entry) / entry <= threshold
 
 
@@ -795,10 +800,17 @@ def run_bot():
         except Exception:
             pass
 
-        result = generate_pullback_signal(
+        # High-conviction path: trend breakout + reversal (BB squeeze, HTF bias, engulfing)
+        result = generate_filtered_signal(
             df_15m, df_1h, df_4h, df_1d,
             symbol=symbol, market_mode=_market_mode
         )
+        # Fallback: pullback, bounce, micro, range
+        if not result:
+            result = generate_pullback_signal(
+                df_15m, df_1h, df_4h, df_1d,
+                symbol=symbol, market_mode=_market_mode
+            )
         if not result:
             continue
 

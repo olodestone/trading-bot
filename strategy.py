@@ -1280,7 +1280,7 @@ def generate_pullback_signal(df_15m, df_1h, df_4h, df_1d=None, symbol="", market
 
     # ── ADX gate: ranging market → RANGE → else MICRO ─────────────────────
     adx = last_4h.get("adx", 0)
-    adx_min = 17 if market_mode == "bear" else 20
+    adx_min = params["adx_route"]  # regime-adaptive: 15 HIGH / 18 NORMAL / 20 LOW (bear -2)
     if pd.isna(adx) or adx < adx_min:
         range_result = entry_signal_range(df_15m, df_1h, df_4h, params, market_mode)
         if range_result:
