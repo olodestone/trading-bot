@@ -525,6 +525,90 @@ MACD turning or RSI oversold = "less bad", not proof of reversal. A 15m bullish 
 
 ---
 
+## Plan 15 — 1:1 BE, SL Floor Alignment, ATR Cap Tightening
+
+**Context:** INJ/USDT LONG [TREND] fired at entry 3.5860, SL 3.5719 (risk 0.0141 = 0.69×ATR), TP1 3.6330 (RR 3.33). Status: LOSS. MAE/MFE analysis from the DB:
+
+| | INJ (LOSS) | AXS (WIN) |
+|---|---|---|
+| mfe | 1.203R | 4.732R |
+| mae | 1.486R | NULL |
+| time_to_mfe | 1.01h | 2.27h |
+| time_to_mae | 1.78h | — |
+
+INJ MFE = 1.203R means price crossed the 1:1 level (entry + 1×risk = 3.6001) before reversing and hitting SL. AXS had essentially zero adverse excursion — went straight to TP2. Initial instinct (raise SL floor to 0.75×ATR) was wrong: the INJ trade had directional merit (1.2R MFE), it just had no intermediate protection. The correct fixes are trade management, not entry filtering.
+
+---
+
+### 15a — 1:1 Breakeven Implementation
+
+**Problem:** CLAUDE.md documented "1:1 hit → SL to breakeven" but the code only set BE at TP1 hit. INJ crossed 1:1 at 1.01h with MFE=1.203R, then reversed to a full LOSS at 1.78h. 1:1 BE converts this to BE_WIN.
+
+**Changes: `performance.py` — `check_trade_results()`**
+
+Added before trail tightening in both BUY and SELL blocks:
+```python
+# BUY
+if not be_activated and not tp1_hit and price >= entry + risk:
+    changes['be_activated'] = True
+    changes['trail_sl'] = entry
+    be_activated = True
+    trail_sl = entry
+    send_telegram("🔒 1:1 HIT — SL → Breakeven ...")
+
+# SELL (symmetric)
+if not be_activated and not tp1_hit and price <= entry - risk:
+    ...
+```
+
+AXS WIN was unaffected — MAE=NULL means price never came back toward entry after going up.
+
+**Execution sequence after this change:**
+1. 1:1 hit → BE activated, trail_sl = entry
+2. 2:1 hit → trail tightens to `price - 1.2×risk` (already BE-protected)
+3. TP1 hit → partial close 50%, trail_sl stays at entry (already set)
+4. TP2 hit → WIN
+5. trail_sl hit after BE → BE_WIN
+
+---
+
+### 15b — SL Floor Corrected to 0.5×ATR
+
+**Problem:** Initial attempt raised trend SL floor to 0.75×ATR, which would have rejected the INJ trade entirely despite its directional merit (1.2R MFE). With 1:1 BE protecting the downside, the floor can be consistent with all other entry types.
+
+**Changes: `strategy.py` — `entry_signal_trend()`**
+
+```python
+# Before:
+if risk <= 0 or risk < atr * 0.4:   # original
+# Then incorrectly changed to:
+if risk <= 0 or risk < atr * 0.75:  # Plan 15 draft (too aggressive)
+# Corrected to:
+if risk <= 0 or risk < atr * 0.5:   # consistent with bounce/reversal/micro
+```
+
+Applied to both BUY and SELL paths. 0.5×ATR is the standard minimum across all entry types — prevents genuinely sub-noise stops while allowing trades with meaningful structural anchors.
+
+---
+
+### 15c — ATR Cap Tightened: RR > 3.5 → RR > 3.0
+
+**Problem:** INJ had TP1 at RR 3.33 — below the old 3.5 cap, so the cap didn't fire. A TP1 at 3.33R means price must travel a large distance before the first partial close, leaving a wide window where a reversal turns a good setup into a full loss (exactly what happened).
+
+**Changes: `strategy.py` — `entry_signal_trend()`, `entry_signal_reversal()`**
+
+```python
+# Before:
+_ATR_CAP_RR = 3.5   # cap TP1 at 2.5×ATR when RR > 3.5
+
+# After:
+_ATR_CAP_RR = 3.0   # cap TP1 at 2.5×ATR when RR > 3.0
+```
+
+Effect: setups with structural TP1 > 3R get TP1 capped to 2.5×ATR (a nearer achievable target), and the swing level becomes TP2 (the runner). Compresses the no-protection gap between entry and first partial exit.
+
+---
+
 ## Current Signal Flow (End to End)
 
 ```
@@ -563,19 +647,19 @@ Every 15 minutes:
        - StochRSI OB: bypass allowed if close−prev_high > 0.3×ATR AND vol > 1.5×vol_ma
        - 1h MACD confirmation (trend only)
        - volume > 1.15× vol_ma (median-based, spike-resistant)
-       - structural SL (swing low/high ± 0.3 ATR)
-       - TP1 = nearest 1h swing level
-       - TP2 = second 1h swing level (runner) — computed before RR gate
+       - structural SL (swing low/high ± 0.3 ATR); minimum 0.5×ATR from entry
+       - TP1 = nearest 1h swing level; capped at 2.5×ATR if structural RR > 3.0
+       - TP2 = swing level beyond TP1 (or original swing if ATR cap fired)
        - RR gate: TP1 ≥ rr_min → pass; else TP2 ≥ rr_min AND TP1 ≥ 1.5 → pass
 
 5. Signal fires → pending queue (waits for entry to be touched)
 6. Entry hit → live trade saved to DB
 7. Trade monitored every 15 min:
-   → 1:1 hit → SL to breakeven
-   → 2:1 hit → trail tightens (price - 1.2×risk)
-   → TP1 hit → alert "Close 50%", tp1_hit=True
+   → 1:1 hit → SL to breakeven (be_activated=True, trail_sl=entry)
+   → 2:1 hit → trail tightens (price - 1.2×risk), BE must already be active
+   → TP1 hit → alert "Close 50%", tp1_hit=True, trail_sl=entry confirmed
    → TP2 hit → alert "Close 25%, trail rest", status=WIN
-   → trail_sl hit → status=BE_WIN or LOSS
+   → trail_sl hit → status=BE_WIN (if BE active) or LOSS
 ```
 
 ---
@@ -604,6 +688,7 @@ The 5 confluence factors: EMA50 vs EMA200 (1h), DI+ vs DI− (4h), 1d structure,
 | After Plan 8 | 9.2/10 | Bear/recovery/normal market mode, sell trend fix, HTF bias bypass |
 | After Plan 12 | 9.4/10 | Support bounce entry, StochRSI OB bypass, median vol_ma, TP2-primary RR gating |
 | After Plan 13 | 9.4/10 | Bounce SL bugs fixed, pullback TP structural, pending expiry 1h |
-| Current | 9.5/10 | Recovery bounce: AND gate, wider SL (0.5×ATR), candle mandatory |
+| After Plan 14 | 9.5/10 | Recovery bounce: AND gate, wider SL (0.5×ATR), candle mandatory |
+| Current | 9.6/10 | 1:1 BE implemented, SL floor 0.5×ATR consistent, ATR cap 3.0 |
 
 **Gap to 10/10:** Live order execution (currently manual alerts), session filter, account balance auto-sync, minimum order value check.

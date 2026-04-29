@@ -898,7 +898,7 @@ def entry_signal_trend(df_15m, df_1h, df_4h, direction, params, market_mode="nor
         sl_level = max(sw_lows) if sw_lows else df_15m['low'].tail(20).min()
         sl    = sl_level - sl_buf
         risk  = entry - sl
-        if risk <= 0 or risk < atr * 0.4:
+        if risk <= 0 or risk < atr * 0.5:
             return None
 
         # TP1: prefer nearest 1h swing high; fall back to 4h when 1h is too close
@@ -949,7 +949,7 @@ def entry_signal_trend(df_15m, df_1h, df_4h, direction, params, market_mode="nor
         sl_level = min(sw_highs) if sw_highs else df_15m['high'].tail(20).max()
         sl    = sl_level + sl_buf
         risk  = sl - entry
-        if risk <= 0 or risk < atr * 0.4:
+        if risk <= 0 or risk < atr * 0.5:
             return None
 
         # TP1: prefer nearest 1h swing low; fall back to 4h when 1h is too close
@@ -973,12 +973,12 @@ def entry_signal_trend(df_15m, df_1h, df_4h, direction, params, market_mode="nor
 
     rr_raw = reward / risk
 
-    # ATR cap: swing levels further than 3.5R are unlikely to be reached before
+    # ATR cap: swing levels further than 3.0R are unlikely to be reached before
     # reversal (backtest: only 2/48 trades hit TP1 at the full swing target).
-    # When RR > 3.5, cap TP1 at 2.5×ATR — a realistic near-term target — and
+    # When RR > 3.0, cap TP1 at 2.5×ATR — a realistic near-term target — and
     # promote the original swing level to TP2 as the runner.
     _ATR_TP_MULT = 2.5
-    _ATR_CAP_RR  = 3.5
+    _ATR_CAP_RR  = 3.0
     if rr_raw > _ATR_CAP_RR:
         tp2 = tp1
         tp1 = (entry + _ATR_TP_MULT * atr) if direction == "BUY" else (entry - _ATR_TP_MULT * atr)
@@ -1086,10 +1086,10 @@ def entry_signal_reversal(df_15m, df_1h, df_4h, direction, params):
 
     rr_raw = reward / risk
 
-    # ATR cap: same logic as trend — cap TP1 at 2.5×ATR when swing target > 3.5R,
+    # ATR cap: same logic as trend — cap TP1 at 2.5×ATR when swing target > 3.0R,
     # promote original swing level to TP2 as runner.
     _ATR_TP_MULT = 2.5
-    _ATR_CAP_RR  = 3.5
+    _ATR_CAP_RR  = 3.0
     if rr_raw > _ATR_CAP_RR:
         tp2 = tp1
         tp1 = (entry + _ATR_TP_MULT * atr) if direction == "BUY" else (entry - _ATR_TP_MULT * atr)

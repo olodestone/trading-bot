@@ -288,7 +288,21 @@ def check_trade_results(fetch_price_func, send_telegram):
             changes['time_to_mae'] = hours_elapsed
 
         if sig == "BUY":
-            # Trail: tighten SL at 2:1+ (only runs after TP1 sets BE)
+            # 1:1 hit → move SL to breakeven
+            if not be_activated and not tp1_hit and price >= entry + risk:
+                changes['be_activated'] = True
+                changes['trail_sl'] = entry
+                be_activated = True
+                trail_sl = entry
+                send_telegram(
+                    f"🔒 1:1 HIT — SL → Breakeven\n"
+                    f"{'─' * 22}\n"
+                    f"{pair}  {direction}\n"
+                    f"Entry @ {_fmt(entry)}  |  SL moved to entry\n"
+                    f"TP1 @ {_fmt(tp1)}  still live"
+                )
+
+            # Trail: tighten SL at 2:1+ (only runs after BE is activated)
             if be_activated and price >= entry + 2 * risk:
                 new_trail = price - (1.2 * risk)
                 if new_trail > trail_sl:
@@ -344,7 +358,21 @@ def check_trade_results(fetch_price_func, send_telegram):
                     changes['status'] = "WIN"
 
         elif sig == "SELL":
-            # Trail: tighten SL at 2:1+ (only runs after TP1 sets BE)
+            # 1:1 hit → move SL to breakeven
+            if not be_activated and not tp1_hit and price <= entry - risk:
+                changes['be_activated'] = True
+                changes['trail_sl'] = entry
+                be_activated = True
+                trail_sl = entry
+                send_telegram(
+                    f"🔒 1:1 HIT — SL → Breakeven\n"
+                    f"{'─' * 22}\n"
+                    f"{pair}  {direction}\n"
+                    f"Entry @ {_fmt(entry)}  |  SL moved to entry\n"
+                    f"TP1 @ {_fmt(tp1)}  still live"
+                )
+
+            # Trail: tighten SL at 2:1+ (only runs after BE is activated)
             if be_activated and price <= entry - 2 * risk:
                 new_trail = price + (1.2 * risk)
                 if new_trail < trail_sl:
