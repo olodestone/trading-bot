@@ -1405,3 +1405,124 @@ def generate_pullback_signal(df_15m, df_1h, df_4h, df_1d=None, symbol="", market
             _rsi_log = rsi_1h or 0
             print(f"  ✅ MICRO {m_dir} {symbol} | RSI1h={_rsi_log:.1f} ADX4h={adx:.1f} (ema-flat→micro) | entry={m_entry:.4f} sl={m_sl:.4f} tp1={m_tp1:.4f} rr={m_rr} | mode={market_mode}")
         return micro
+
+
+# ==============================
+# SIGNAL CONFIDENCE (1–5 STARS)
+# ==============================
+def compute_confidence(direction, entry, sl, tp1, tp2, rr, atr, trade_type,
+                       df_15m, df_1h, df_4h, df_1d, market_mode, btc_downtrend):
+    """
+    Returns 1–5 stars derived entirely from the exact internal values the bot
+    already computed to fire this signal. Four layers, 25 pts each, total 0–100.
+
+      Layer 1 — Macro:      market_mode + BTC EMA50/200 alignment
+      Layer 2 — Structure:  DI gap in signal direction + HTF factor count
+      Layer 3 — Entry:      ADX excess over adaptive minimum + volume ratio + trade type
+      Layer 4 — Setup:      RR excess over adaptive minimum + TP2 + SL distance vs ATR
+
+    80+ → 5  |  65–79 → 4  |  50–64 → 3  |  35–49 → 2  |  <35 → 1
+    """
+    params = get_regime_params(df_4h, market_mode)
+    score  = 0
+
+    # ── Layer 1: Macro (0–25) ──────────────────────────────────────────────
+    btc_aligned  = (direction == "BUY" and not btc_downtrend) or \
+                   (direction == "SELL" and btc_downtrend)
+    mode_aligned = (market_mode == "bear" and direction == "SELL") or \
+                   (market_mode == "recovery" and direction == "BUY")
+
+    if mode_aligned and btc_aligned:
+        score += 25
+    elif mode_aligned or (market_mode == "normal" and btc_aligned):
+        score += 18
+    elif market_mode == "normal":
+        score += 10
+    # macro against trade = 0
+
+    # ── Layer 2: Structure (0–25) ──────────────────────────────────────────
+    last_4h  = df_4h.iloc[-1]
+    last_1h  = df_1h.iloc[-1]
+    plus_di  = float(last_4h.get('plus_di', 0) or 0)
+    minus_di = float(last_4h.get('minus_di', 0) or 0)
+    di_gap   = (plus_di - minus_di) if direction == "BUY" else (minus_di - plus_di)
+
+    if di_gap > 25:
+        score += 15
+    elif di_gap > 15:
+        score += 10
+    elif di_gap > 8:
+        score += 6
+    else:
+        score += 2
+
+    # Factor count: same 4 factors as get_htf_bias
+    factor_count = 0
+    for _df in [df_1h, df_4h, df_1d]:
+        bias = structure_bias(_df)
+        if direction == "BUY" and bias == "bullish":
+            factor_count += 1
+        elif direction == "SELL" and bias == "bearish":
+            factor_count += 1
+    if direction == "BUY" and last_1h['ema50'] > last_1h['ema200']:
+        factor_count += 1
+    elif direction == "SELL" and last_1h['ema50'] < last_1h['ema200']:
+        factor_count += 1
+
+    if factor_count >= 4:
+        score += 10
+    elif factor_count >= 3:
+        score += 7
+    elif factor_count >= 2:
+        score += 4
+
+    # ── Layer 3: Entry Conditions (0–25) ──────────────────────────────────
+    adx_excess = float(params.get("adx_4h", 0)) - float(params.get("adx_min", 22))
+    if adx_excess > 20:
+        score += 10
+    elif adx_excess > 10:
+        score += 7
+    elif adx_excess > 3:
+        score += 4
+    else:
+        score += 1  # rising-ADX bypass or barely at threshold
+
+    last_15m = df_15m.iloc[-1]
+    vol_ma   = float(last_15m.get('vol_ma') or 1)
+    vol_ratio = float(last_15m['volume']) / vol_ma if vol_ma > 0 else 0
+    if vol_ratio >= 2.0:
+        score += 10
+    elif vol_ratio >= 1.5:
+        score += 7
+    elif vol_ratio >= 1.2:
+        score += 4
+    else:
+        score += 1
+
+    # Trade type reflects how many gates were required to fire
+    score += {"trend": 5, "pullback": 4, "reversal": 4, "fade": 3, "bounce": 2, "micro": 1}.get(trade_type, 3)
+
+    # ── Layer 4: Setup Quality (0–25) ──────────────────────────────────────
+    rr_excess = rr - float(params.get("rr_min", 2.5))
+    if rr_excess > 2.0:
+        score += 15
+    elif rr_excess > 1.0:
+        score += 10
+    elif rr_excess > 0.5:
+        score += 7
+    elif rr_excess >= 0:
+        score += 4
+    else:
+        score += 2  # TP2 rescued a sub-minimum TP1
+
+    if tp2 is not None:
+        score += 5
+
+    risk = abs(entry - sl)
+    sl_atr_ratio = risk / atr if atr > 0 else 0
+    if 0.7 <= sl_atr_ratio <= 1.5:
+        score += 5
+    else:
+        score += 2
+
+    return min(score, 100)

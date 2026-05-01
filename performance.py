@@ -54,7 +54,8 @@ def ensure_csv():
         # Add new columns to existing tables without breaking live data
         for col, typedef in [("tp2", "FLOAT"), ("tp1_hit", "BOOLEAN"), ("risk_dollars", "FLOAT"),
                              ("mae", "FLOAT"), ("mfe", "FLOAT"),
-                             ("time_to_mfe", "FLOAT"), ("time_to_mae", "FLOAT")]:
+                             ("time_to_mfe", "FLOAT"), ("time_to_mae", "FLOAT"),
+                             ("confidence", "INTEGER")]:
             try:
                 conn.execute(text(
                     f"ALTER TABLE {TRADES_TABLE} ADD COLUMN IF NOT EXISTS {col} {typedef}"
@@ -68,19 +69,20 @@ def ensure_csv():
                 trade_type TEXT, atr FLOAT, queued_at TEXT
             )
         """))
-        try:
-            conn.execute(text(
-                f"ALTER TABLE {PENDING_TABLE} ADD COLUMN IF NOT EXISTS tp2 FLOAT"
-            ))
-        except Exception:
-            pass
+        for col, typedef in [("tp2", "FLOAT"), ("confidence", "INTEGER")]:
+            try:
+                conn.execute(text(
+                    f"ALTER TABLE {PENDING_TABLE} ADD COLUMN IF NOT EXISTS {col} {typedef}"
+                ))
+            except Exception:
+                pass
         conn.commit()
 
 
 # ==============================
 # SAVE TRADE
 # ==============================
-def save_trade(pair, signal, entry, sl, tp, tp2, rr, market_type, atr=0.0, risk_dollars=0.0):
+def save_trade(pair, signal, entry, sl, tp, tp2, rr, market_type, atr=0.0, risk_dollars=0.0, confidence=50):
     ensure_csv()
     engine = get_engine()
     row = pd.DataFrame([{
@@ -95,6 +97,7 @@ def save_trade(pair, signal, entry, sl, tp, tp2, rr, market_type, atr=0.0, risk_
         "be_activated": False, "trail_sl": round(sl, 8),
         "tp1_hit": False,
         "risk_dollars": round(float(risk_dollars), 4),
+        "confidence": int(confidence),
     }])
     row.to_sql(TRADES_TABLE, engine, if_exists="append", index=False)
 
@@ -119,6 +122,7 @@ def save_pending_trades(pending_trades):
             "trade_type": t.get("trade_type", "trend"),
             "atr": float(t.get("atr", 0.0)),
             "queued_at": t["time"].isoformat(),
+            "confidence": int(t.get("confidence", 3)),
         })
     with engine.connect() as conn:
         conn.execute(text(f"DELETE FROM {PENDING_TABLE}"))
@@ -143,6 +147,7 @@ def load_pending_trades():
             queued_at = datetime.utcnow()
         raw_tp2 = row.get("tp2")
         tp2 = float(raw_tp2) if raw_tp2 is not None and not pd.isna(raw_tp2) else None
+        raw_conf = row.get("confidence")
         trades.append({
             "pair": row["pair"],
             "signal": row["signal"],
@@ -155,6 +160,7 @@ def load_pending_trades():
             "trade_type": row["trade_type"],
             "atr": float(row["atr"]),
             "time": queued_at,
+            "confidence": int(raw_conf) if raw_conf is not None and not pd.isna(raw_conf) else 50,
         })
     return trades
 
@@ -497,6 +503,30 @@ def get_stats_summary():
 
     edge_note = "✅ Positive edge" if expectancy > 0 else "⚠️ No edge yet — keep tracking"
 
+    # Confidence breakdown — only shown once enough trades exist
+    conf_section = ""
+    if 'confidence' in df.columns:
+        conf_df = df[df['status'].isin(["WIN", "BE_WIN", "LOSS"]) & df['confidence'].notna()].copy()
+        conf_df['confidence'] = conf_df['confidence'].astype(int)
+        if len(conf_df) >= 5:
+            buckets = [("80-100", 80, 100), ("65-79", 65, 79),
+                       ("50-64", 50, 64), ("35-49", 35, 49), ("0-34", 0, 34)]
+            conf_lines = []
+            for label, lo, hi in buckets:
+                sub = conf_df[(conf_df['confidence'] >= lo) & (conf_df['confidence'] <= hi)]
+                if len(sub) == 0:
+                    continue
+                s_wins   = len(sub[sub['status'] == "WIN"])
+                s_be     = len(sub[sub['status'] == "BE_WIN"])
+                s_losses = len(sub[sub['status'] == "LOSS"])
+                s_wr     = (s_wins + s_be) / len(sub) * 100
+                s_avg_rr = sub[sub['status'] == "WIN"]['rr'].mean() if s_wins > 0 else 0.0
+                s_avg_be = (sub[sub['status'] == "BE_WIN"]['rr'] * 0.5).mean() if s_be > 0 else 0.0
+                s_exp    = _expectancy(s_wins, s_be, s_losses, s_avg_rr, s_avg_be)
+                conf_lines.append(f"  {label}  WR {s_wr:.0f}%  {s_exp:+.2f}R  ({len(sub)})")
+            if conf_lines:
+                conf_section = f"\n{'─' * 22}\nBy confidence:\n" + "\n".join(conf_lines)
+
     return (
         f"📈 ALL-TIME STATS\n"
         f"{'─' * 22}\n"
@@ -511,6 +541,7 @@ def get_stats_summary():
         f"Streak   {streak_label}\n"
         f"{'─' * 22}\n"
         f"ℹ️ Need 30+ trades for reliable stats."
+        f"{conf_section}"
     )
 
 

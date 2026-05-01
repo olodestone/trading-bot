@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import os
 import signal as signal_module
 
-from strategy import apply_indicators, generate_filtered_signal, generate_pullback_signal
+from strategy import apply_indicators, generate_filtered_signal, generate_pullback_signal, compute_confidence
 from performance import (
     save_trade, check_trade_results, daily_report,
     ensure_csv, save_pending_trades, load_pending_trades,
@@ -403,13 +403,15 @@ def _handle_cancel(symbol):
 # ==============================
 # POSITION SIZING
 # ==============================
-def calc_position_size(entry, sl, rr=0.0):
+def calc_position_size(entry, sl, rr=0.0, conf=50):
     """
     Returns (risk_dollars, units, position_value, risk_pct).
-    Risk scales with signal quality: base 2%, +0.5% per RR point above 3.0, capped at 4%.
-    RR 2.5→2%  RR 3.0→2%  RR 3.5→2.5%  RR 4.0→3%  RR 5.0+→4%
+    Base risk scales linearly with confidence (0–100): 1% at 0, 2% at 50, 3% at 100.
+    RR bonus: +0.5% per full RR point above 3.0.  Hard cap: 5%.
     """
-    risk_pct = min(RISK_PCT + max(0.0, rr - 3.0) * 0.005, 0.04)
+    base_risk = 0.01 + (conf / 100) * 0.02
+    rr_bonus  = max(0.0, rr - 3.0) * 0.005
+    risk_pct  = min(base_risk + rr_bonus, 0.05)
     risk_dollars = round(ACCOUNT_BALANCE * risk_pct, 4)
     risk_per_unit = abs(entry - sl)
     if risk_per_unit <= 0:
@@ -765,11 +767,13 @@ def check_pending_trades():
                 f"{'─' * 22}\n"
                 f"🔔 Trade is now live. Managing SL/TP."
             )
-            _rd, _, _, _ = calc_position_size(trade['entry'], trade['sl'], trade.get('rr', 0.0))
+            _conf = trade.get('confidence', 50)
+            _rd, _, _, _ = calc_position_size(trade['entry'], trade['sl'], trade.get('rr', 0.0), conf=_conf)
             save_trade(
                 trade['pair'], trade['signal'], trade['entry'],
                 trade['sl'], trade['tp'], tp2, trade['rr'],
-                trade['market_type'], trade.get('atr', 0.0), _rd
+                trade['market_type'], trade.get('atr', 0.0), _rd,
+                confidence=_conf,
             )
         else:
             updated.append(trade)
@@ -871,6 +875,11 @@ def run_bot():
 
         sig, entry, sl, tp, tp2, rr, atr, trade_type = result
 
+        conf = compute_confidence(
+            sig, entry, sl, tp, tp2, rr, atr, trade_type,
+            df_15m, df_1h, df_4h, df_1d, _market_mode, _btc_downtrend
+        )
+
         # Skip if already pending
         if any(t['pair'] == symbol for t in pending_trades):
             print(f"⚠️ Already pending: {symbol}")
@@ -906,7 +915,7 @@ def run_bot():
         market_label = f"{'Spot' if market_type == 'spot' else 'Futures'} · {exchange}"
         now_str = datetime.utcnow().strftime("%d %b %Y · %H:%M UTC")
 
-        risk_dollars, units, pos_value, risk_pct = calc_position_size(entry, sl, rr)
+        risk_dollars, units, pos_value, risk_pct = calc_position_size(entry, sl, rr, conf=conf)
 
         if pos_value > ACCOUNT_BALANCE * 10:
             print(f"⚠️ {symbol} skipped — position ${pos_value:.2f} > 10× account (${ACCOUNT_BALANCE:.2f})")
@@ -954,6 +963,7 @@ def run_bot():
                 f"TP1     {_fmt_price(tp)}  (▲ {tp1_pct:.2f}%)  ← close 50%\n"
                 f"{tp2_line}"
                 f"RR      1 : {rr}\n"
+                f"Conf    {conf}/100\n"
                 f"{'─' * 22}\n"
                 f"💰 POSITION SIZING  ({risk_pct*100:.0f}% risk)\n"
                 f"Risk    ${risk_dollars:.2f}  of ${ACCOUNT_BALANCE:.2f}\n"
@@ -965,7 +975,7 @@ def run_bot():
             )
             print(msg)
             send_telegram(msg)
-            save_trade(symbol, sig, entry, sl, tp, tp2, rr, market_type, float(atr), risk_dollars)
+            save_trade(symbol, sig, entry, sl, tp, tp2, rr, market_type, float(atr), risk_dollars, confidence=conf)
         else:
             msg = (
                 f"{'─' * 22}\n"
@@ -979,6 +989,7 @@ def run_bot():
                 f"TP1     {_fmt_price(tp)}  (▲ {tp1_pct:.2f}%)  ← close 50%\n"
                 f"{tp2_line}"
                 f"RR      1 : {rr}\n"
+                f"Conf    {conf}/100\n"
                 f"{'─' * 22}\n"
                 f"💰 POSITION SIZING  ({risk_pct*100:.0f}% risk)\n"
                 f"Risk    ${risk_dollars:.2f}  of ${ACCOUNT_BALANCE:.2f}\n"
@@ -1002,7 +1013,8 @@ def run_bot():
                 "market_type": market_type,
                 "trade_type": trade_type,
                 "atr": float(atr),
-                "time": datetime.now()
+                "time": datetime.now(),
+                "confidence": conf,
             })
 
     check_pending_trades()

@@ -773,6 +773,68 @@ Bear mode reduces SELL threshold by 1: 1d structure lags in early crash phases.
 | After Plan 14 | 9.5/10 | Recovery bounce: AND gate, wider SL (0.5×ATR), candle mandatory |
 | After Plan 15 | 9.6/10 | 1:1 BE implemented, SL floor 0.5×ATR consistent, ATR cap 3.0 |
 | After Plan 16 | 9.7/10 | BTC 4h EMA50/EMA200 macro gate — BUY trend/reversal blocked in downtrend |
-| Current | 9.8/10 | Session gate 20–23 UTC (+0.183R vs −0.092R outside), bounce/range disabled |
+| After Plan 17 | 9.8/10 | Session gate 20–23 UTC (+0.183R vs −0.092R outside), bounce/range disabled |
+| Current | 9.9/10 | Signal confidence score 1–5 stars: position sizing scales with confidence |
 
 **Gap to 10/10:** Live order execution (currently manual alerts), account balance auto-sync, minimum order value check.
+
+---
+
+## Plan 18 — Signal Confidence Score
+
+**Goal:** Attach a 1–5 star confidence rating to every signal so the trader can see how much the bot trusts the setup, and track whether high-confidence signals produce better outcomes.
+
+**Changes: `strategy.py`, `performance.py`, `bot.py`**
+
+### How confidence is computed (`strategy.py` — `compute_confidence()`)
+
+Four layers, 25 pts each, total 0–100 → stars:
+
+| Layer | What it measures | Max |
+|---|---|---|
+| Macro | `market_mode` + BTC EMA50/EMA200 alignment with signal direction | 25 |
+| Structure | DI gap in signal direction + HTF factor count (same 4 factors as `get_htf_bias`) | 25 |
+| Entry | ADX excess over adaptive minimum + volume ratio + trade type gate count | 25 |
+| Setup | RR excess over adaptive minimum + TP2 existence + SL distance vs ATR | 25 |
+
+**Star thresholds:** 80+ = ⭐⭐⭐⭐⭐ · 65–79 = ⭐⭐⭐⭐ · 50–64 = ⭐⭐⭐ · 35–49 = ⭐⭐ · <35 = ⭐
+
+No new metrics are introduced — all inputs come from values the bot already computed to fire the signal.
+
+### Position sizing update (`bot.py` — `calc_position_size()`)
+
+Confidence now drives base risk. RR bonus still applies on top:
+
+| Stars | Base risk | RR 2.0 | RR 3.5 |
+|---|---|---|---|
+| ⭐ | 1.0% | 1.0% | 1.2% |
+| ⭐⭐ | 1.5% | 1.5% | 1.7% |
+| ⭐⭐⭐ | 2.0% | 2.0% | 2.2% |
+| ⭐⭐⭐⭐ | 2.5% | 2.5% | 2.8% |
+| ⭐⭐⭐⭐⭐ | 3.0% | 3.0% | 3.2% |
+
+Hard cap remains 5%. Previously only RR drove size (base fixed at 2%).
+
+### Telegram signal format
+
+```
+RR      1 : 3.2
+Conf    ★★★★☆
+```
+
+One line, no breakdown.
+
+### DB schema (`performance.py`)
+
+- `confidence INTEGER` column added to `trades` and `pending_trades` tables via `ALTER TABLE IF NOT EXISTS`
+- Stored as 1–5, passed through `save_trade()` and the pending→live transition in `check_pending_trades()`
+
+### `/stats` tracking
+
+After 5+ closed trades with confidence data, `/stats` appends:
+```
+By confidence:
+  ★★★★★  WR 65%  +0.38R  (n=11)
+  ★★★★   WR 52%  +0.18R  (n=19)
+  ...
+```
