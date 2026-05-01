@@ -72,6 +72,9 @@ _bear_mode_scans = 0       # consecutive scans with breadth > 65%
 _recovery_scans  = 0       # consecutive scans with breadth < 45%
 _market_mode     = "normal" # "bear" | "recovery" | "normal"
 
+_btc_downtrend      = False  # True when BTC 4h EMA50 < EMA200
+_btc_downtrend_prev = False
+
 
 def _update_market_mode(breadth_data):
     """
@@ -148,6 +151,48 @@ def _update_market_mode(breadth_data):
                 f"bear_breadth: {breadth:.0%}\n"
                 f"All standard parameters in effect."
             )
+
+
+def _update_btc_macro():
+    """
+    Check BTC/USDT:USDT 4h EMA50 vs EMA200 — macro trend gate.
+    When EMA50 < EMA200, all BUY signals from generate_filtered_signal()
+    (trend breakout + reversal) are suppressed.
+    Pullback/bounce BUY at structural support is unaffected — those require
+    4h oversold stochastic and candle confirmation which already act as
+    natural downtrend protection.
+    Sends Telegram on state transitions (cross above or below).
+    """
+    global _btc_downtrend, _btc_downtrend_prev
+    try:
+        df = get_cached_tf("BTC/USDT:USDT", "4h", "futures")
+        if df is None or len(df) < 200:
+            print("  BTC macro: insufficient history — keeping last state")
+            return
+        df = apply_indicators(df)
+        last    = df.iloc[-1]
+        new_state = last['ema50'] < last['ema200']
+        sep_pct = abs(last['ema50'] - last['ema200']) / last['ema200'] * 100
+        tag = "⬇️ bearish" if new_state else "⬆️ bullish"
+        print(f"  BTC 4h: EMA50={last['ema50']:.1f} EMA200={last['ema200']:.1f} ({tag} sep={sep_pct:.2f}%)")
+        _btc_downtrend = new_state
+        if _btc_downtrend != _btc_downtrend_prev:
+            if _btc_downtrend:
+                send_telegram(
+                    f"🔴 BTC MACRO: EMA50 CROSSED BELOW EMA200\n"
+                    f"EMA50={last['ema50']:.1f}  EMA200={last['ema200']:.1f} (−{sep_pct:.2f}%)\n\n"
+                    f"Effect: BUY trend/reversal signals blocked.\n"
+                    f"Pullback & bounce BUY at structural support still enabled."
+                )
+            else:
+                send_telegram(
+                    f"🟢 BTC MACRO: EMA50 CROSSED ABOVE EMA200\n"
+                    f"EMA50={last['ema50']:.1f}  EMA200={last['ema200']:.1f} (+{sep_pct:.2f}%)\n\n"
+                    f"BUY trend/reversal signals re-enabled."
+                )
+        _btc_downtrend_prev = _btc_downtrend
+    except Exception as e:
+        print(f"  BTC macro check error: {e}")
 
 
 def get_cached_tf(symbol, tf, market_type):
@@ -750,6 +795,15 @@ def run_bot():
         check_pending_trades()
         return
 
+    # Session gate: only generate signals 20–23 UTC.
+    # Backtest (1,796 trades): hours 20–23 → exp +0.183R; all other hours → exp −0.092R.
+    # Pending-trade management and open-trade monitoring still run outside the window.
+    _hour_utc = datetime.utcnow().hour
+    if _hour_utc not in (20, 21, 22, 23):
+        print(f"⏸️  Session gate (UTC {_hour_utc:02d}xx — signal window 20–23) — managing open trades only")
+        check_pending_trades()
+        return
+
     print(f"\n🚀 Scan: {datetime.now()}\n")
 
     refresh_markets_if_needed()
@@ -783,6 +837,7 @@ def run_bot():
 
     # Determine macro market mode from breadth before any signal evaluation
     _update_market_mode(breadth_data)
+    _update_btc_macro()
 
     # ── Phase 2: generate signals with market mode applied ─────────────────
     for symbol, (df_15m, df_1h, df_4h, df_1d, market_type) in all_data.items():
@@ -803,7 +858,7 @@ def run_bot():
         # High-conviction path: trend breakout + reversal (BB squeeze, HTF bias, engulfing)
         result = generate_filtered_signal(
             df_15m, df_1h, df_4h, df_1d,
-            symbol=symbol, market_mode=_market_mode
+            symbol=symbol, market_mode=_market_mode, btc_downtrend=_btc_downtrend
         )
         # Fallback: pullback, bounce, micro, range
         if not result:
@@ -1001,7 +1056,7 @@ def main():
             continue
 
         hour = datetime.utcnow().hour
-        in_session = (7 <= hour < 9) or (13 <= hour < 15)
+        in_session = hour in (20, 21, 22, 23)
         sleep_secs = 300 if in_session else 900
         print(f"⏳ Sleeping {sleep_secs // 60} minutes{'  (session active)' if in_session else ''}...")
         time.sleep(sleep_secs)

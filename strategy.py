@@ -1116,7 +1116,7 @@ def entry_signal_reversal(df_15m, df_1h, df_4h, direction, params):
 # ==============================
 # FINAL SIGNAL
 # ==============================
-def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d, symbol="", market_mode="normal"):
+def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d, symbol="", market_mode="normal", btc_downtrend=False):
     # Detect regime once — all signal functions share these adaptive thresholds
     params = get_regime_params(df_4h, market_mode)
 
@@ -1177,6 +1177,9 @@ def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d, symbol="", market_mode
     # Re-enabled in bear mode — the existing gates (4h structure bullish + vol surge +
     # MACD flip) are strict enough on their own; bear mode should not block this.
     reversal = detect_htf_reversal(df_4h, df_1d, params)
+    if reversal == "BUY" and btc_downtrend:
+        print(f"  ↳ {symbol}: reversal BUY blocked — BTC 4h EMA50<EMA200")
+        reversal = None
     if reversal:
         result = entry_signal_reversal(df_15m, df_1h, df_4h, reversal, params)
         if result:
@@ -1194,6 +1197,10 @@ def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d, symbol="", market_mode
         threshold = max(base_threshold - 1, 1) if market_mode == "bear" else base_threshold
         di_dir = "bull" if last_4h['plus_di'] > last_4h['minus_di'] else "bear"
         print(f"  ↳ {symbol}: HTF bias DI={di_dir}, score <{threshold}/4 [{regime_label}] ema50={'>' if last_1h['ema50'] > last_1h['ema200'] else '<'}ema200")
+        return None
+
+    if bias == "BUY" and btc_downtrend:
+        print(f"  ↳ {symbol}: BUY trend entry blocked — BTC 4h EMA50<EMA200")
         return None
 
     result = entry_signal_trend(df_15m, df_1h, df_4h, bias, params, market_mode)
@@ -1282,15 +1289,11 @@ def generate_pullback_signal(df_15m, df_1h, df_4h, df_1d=None, symbol="", market
     adx = last_4h.get("adx", 0)
     adx_min = params["adx_route"]  # regime-adaptive: 15 HIGH / 18 NORMAL / 20 LOW (bear -2)
     if pd.isna(adx) or adx < adx_min:
-        range_result = entry_signal_range(df_15m, df_1h, df_4h, params, market_mode)
-        if range_result:
-            direction, entry, sl, tp1, tp2, rr, atr, _ = range_result
-            print(f"  ✅ RANGE {direction} {symbol} | ADX4h={adx:.1f}<{adx_min} (ranging) | entry={entry:.4f} sl={sl:.4f} tp1={tp1:.4f} rr={rr} | mode={market_mode}")
-            return range_result
+        # range disabled — backtest exp=−0.182R across all conditions
         micro = entry_signal_micro_trend(df_15m, df_1h, params, market_mode)
         if micro:
             m_dir, m_entry, m_sl, m_tp1, _, m_rr, m_atr, _ = micro
-            print(f"  ✅ MICRO {m_dir} {symbol} | ADX4h={adx:.1f} (range miss) | entry={m_entry:.4f} sl={m_sl:.4f} tp1={m_tp1:.4f} rr={m_rr} | mode={market_mode}")
+            print(f"  ✅ MICRO {m_dir} {symbol} | ADX4h={adx:.1f}<{adx_min} (ranging) | entry={m_entry:.4f} sl={m_sl:.4f} tp1={m_tp1:.4f} rr={m_rr} | mode={market_mode}")
         return micro
 
     # ── trend_ok: 4h EMA50 slope clearly directional ──────────────────────
@@ -1391,13 +1394,8 @@ def generate_pullback_signal(df_15m, df_1h, df_4h, df_1d=None, symbol="", market
         return (direction, close, sl, tp1, tp2, rr, atr, "pullback")
 
     elif trend_ok:
-        # Trend is clear but RSI not in zone or confluence too low → BOUNCE
-        reason = "rsi-zone-miss" if not rsi_ok else "low-conf"
-        bounce_result = entry_signal_bounce(df_15m, df_1h, df_4h, params)
-        if bounce_result:
-            b_dir, b_entry, b_sl, b_tp1, b_tp2, b_rr, b_atr, _ = bounce_result
-            print(f"  ✅ BOUNCE {b_dir} {symbol} | RSI1h={rsi_1h:.1f} ADX4h={adx:.1f} ({reason}→bounce) | entry={b_entry:.4f} sl={b_sl:.4f} tp1={b_tp1:.4f} rr={b_rr} | mode={market_mode}")
-        return bounce_result
+        # bounce disabled — backtest exp=−0.062R across all conditions
+        return None
 
     else:
         # EMA flat / conflicting — no trend direction → MICRO

@@ -338,8 +338,9 @@ Two-pass `run_bot()`:
 
 **Bear mode changes (`strategy.py`):**
 - `get_htf_bias()`: SELL only, threshold reduced by 1 (4→3 or 3→2 in HIGH vol)
-- `get_regime_params()`: ADX min −3 (floor 14) — ADX lags in early crashes
+- `get_regime_params()`: ADX min per-regime — HIGH vol −3 (19→16), NORMAL/LOW vol −2 (22→20, 23→21); floor 14 — ADX lags in early crashes; HIGH vol crashes spike ADX faster so need a bigger reduction
 - `entry_signal_trend()` SELL: vol threshold 0.90× instead of 1.15×; BB squeeze + coil skipped
+- `entry_signal_fade_resistance()` added: SELL at 4h EMA50 resistance — price bounces into dynamic resistance in a bear, reversal candle forms, next candle confirms break below. Gates: 4h ema50 < ema200, reversal candle high within 2% of EMA50, 4h stoch_k > 60, 15m shooting star or bearish engulfing, break confirmed, vol 0.8–1.2×. This fires first inside `generate_filtered_signal()` in bear mode.
 - Reversal BUY re-enabled in bear mode (gates are already strict enough)
 
 **Recovery mode changes:**
@@ -370,7 +371,7 @@ upper_wick = last['high'] - max(last['open'], last['close'])
 is_hammer = body > 0 and lower_wick >= 2 * body and upper_wick <= body
 ```
 
-Checked before reversal in `generate_filtered_signal()`. Works in all market modes including bear.
+Called from `generate_pullback_signal()` (the fallback path). Works in all market modes including bear.
 
 **Late entry tolerance:** bounce uses 0.3% (same as reversal — must be at support).
 
@@ -609,6 +610,63 @@ Effect: setups with structural TP1 > 3R get TP1 capped to 2.5×ATR (a nearer ach
 
 ---
 
+## Plan 16 — BTC Macro Gate
+
+**Problem:** 69% of LOSS trades (9/13) had MFE < 0.3R — price moved against the signal immediately with no favorable excursion. 10 of 13 losses were BUY signals. The alt market was in a stealth downtrend that `bear_mode` didn't catch (breadth stayed under 65% while individual alts fell one by one). In "normal" mode, `generate_filtered_signal()` fires BUY trend/reversal signals freely, and they all hit SL instantly.
+
+**Root cause:** The bear_mode breadth gate (65%) is too slow for a rolling alt selloff that doesn't happen all at once. BTC 4h EMA50 vs EMA200 is a faster, cleaner macro signal — it reflects the trend that alts follow but reacts independently of alt breadth.
+
+**Changes: `strategy.py`, `bot.py`**
+
+### What's blocked
+
+`generate_filtered_signal()` when `btc_downtrend=True`:
+- HTF bias returns "BUY" → rejected before `entry_signal_trend()` fires
+- `detect_htf_reversal()` returns "BUY" → nulled before `entry_signal_reversal()` fires
+
+### What's still allowed
+
+`generate_pullback_signal()` BUY paths are **not** blocked:
+- `entry_signal_bounce()` — requires 4h stoch_k < 30 + structural support + candle confirmation
+- `entry_signal_range()` — requires stoch_k < 35 + at swing low support + reversal candle
+- `entry_signal_pullback()` — requires coin's own 4h EMA50 > EMA200, which naturally can't fire on alts following BTC down
+
+### Implementation
+
+**`strategy.py` — `generate_filtered_signal()` signature:**
+```python
+def generate_filtered_signal(..., btc_downtrend=False):
+```
+
+Two block points inside:
+```python
+# After detect_htf_reversal():
+if reversal == "BUY" and btc_downtrend:
+    reversal = None
+
+# After get_htf_bias():
+if bias == "BUY" and btc_downtrend:
+    return None
+```
+
+**`bot.py` — new module-level state + function:**
+```python
+_btc_downtrend      = False
+_btc_downtrend_prev = False
+
+def _update_btc_macro():
+    # Fetches BTC/USDT:USDT 4h, applies indicators, sets _btc_downtrend
+    # Sends Telegram on EMA50/EMA200 crossover transitions
+```
+
+Called in `run_bot()` between Phase 1 and Phase 2, after `_update_market_mode()`.
+
+**Telegram alerts on transition only:**
+- `🔴 BTC MACRO: EMA50 CROSSED BELOW EMA200` → BUY trend/reversal blocked
+- `🟢 BTC MACRO: EMA50 CROSSED ABOVE EMA200` → BUY re-enabled
+
+---
+
 ## Current Signal Flow (End to End)
 
 ```
@@ -631,26 +689,44 @@ Every 15 minutes:
    → compute bear_breadth from 1h EMA50/EMA200 across all pairs
    → _update_market_mode() → "bear" / "recovery" / "normal"
 
-4. Phase 2 — generate_filtered_signal() per pair:
-   → get_regime_params(df_4h, market_mode) — HIGH/NORMAL/LOW vol + mode adjustments
-   → is_trending(df_4h, adx_min) — adaptive ADX gate
-   → entry_signal_bounce() — counter-trend BUY at structural support (fires first)
-       - Recovery mode: BOTH ema50 above AND higher_low required (AND gate)
-       - Recovery mode: candle mandatory (15m engulfing or hammer)
-       - Recovery mode: SL buffer 0.5×ATR (vs 0.3×ATR in other modes)
-   → detect_htf_reversal() — 4 conditions: structure divergence +
-     extreme StochRSI + volume surge + MACD flip
-   → get_htf_bias() — 4/5 confluence (3/5 in HIGH vol; −1 more in bear mode for SELL)
-   → entry_signal_trend() or entry_signal_reversal():
-       - 15m close > prev_high (BUY) / close < prev_low (SELL)
-       - BB squeeze + consolidation coil (trend only; skipped in HIGH vol + bear SELL)
-       - StochRSI OB: bypass allowed if close−prev_high > 0.3×ATR AND vol > 1.5×vol_ma
-       - 1h MACD confirmation (trend only)
-       - volume > 1.15× vol_ma (median-based, spike-resistant)
-       - structural SL (swing low/high ± 0.3 ATR); minimum 0.5×ATR from entry
-       - TP1 = nearest 1h swing level; capped at 2.5×ATR if structural RR > 3.0
-       - TP2 = swing level beyond TP1 (or original swing if ATR cap fired)
-       - RR gate: TP1 ≥ rr_min → pass; else TP2 ≥ rr_min AND TP1 ≥ 1.5 → pass
+4. Phase 2 — two signal functions per pair (A then B):
+
+   A. generate_filtered_signal() — high-conviction entries:
+      → get_regime_params(df_4h, market_mode) — HIGH/NORMAL/LOW vol + mode adjustments
+      → BTC macro gate: if BTC 4h EMA50 < EMA200 → BUY signals blocked (trend + reversal)
+      → ADX routing: if not trending → skip this path entirely
+      → Bear mode only: entry_signal_fade_resistance() — SELL at 4h EMA50 resistance
+          (4h ema50<ema200 + reversal candle at EMA50 + break confirmed + vol 0.8–1.2×)
+      → detect_htf_reversal() — 4 conditions: structure divergence +
+        extreme StochRSI + volume surge + MACD flip
+      → get_htf_bias() — DI mandatory + scored factors:
+          BUY  normal vol: 3/4 remaining = 4 total; HIGH vol: 2/4 = 3 total
+          SELL normal vol: 4/4 remaining = 5 total; HIGH vol: 3/4 = 4 total
+          Bear mode: SELL only, sell threshold −1
+      → entry_signal_trend() or entry_signal_reversal():
+          - 15m close > prev_high (BUY) / close < prev_low (SELL)
+          - BB squeeze + consolidation coil (trend only; skipped in HIGH vol + bear SELL + strong 4h trend)
+          - StochRSI hard gate at 85 (not adaptive): bypass if close−prev_high > 0.3×ATR AND vol > 1.5×vol_ma
+          - 1h MACD confirmation (trend only)
+          - volume > 1.15× vol_ma (0.90× bear SELL; 0.80× low-liquidity window 01–07 UTC)
+          - structural SL (swing low/high ± 0.3 ATR); minimum 0.5×ATR from entry
+          - TP1 = nearest 1h swing level; capped at 2.5×ATR if structural RR > 3.0
+          - TP2 = swing level beyond TP1 (or original swing if ATR cap fired)
+          - RR gate: TP1 ≥ rr_min → pass; else TP2 ≥ rr_min AND TP1 ≥ 1.5 → pass
+
+   B. generate_pullback_signal() — fallback if A returns None:
+      → get_regime_params(df_4h, market_mode)
+      → If ADX < adx_route threshold → entry_signal_range() → entry_signal_micro_trend()
+      → If ADX ≥ threshold:
+          - trend_ok = 4h EMA50 slope clearly directional
+          - rsi_ok   = 1h RSI in pullback zone (40–48 BUY, 52–60 SELL)
+          - Bear mode: SELL only; recovery mode: BUY only
+          - trend_ok AND rsi_ok AND (rsi_cross OR conf_candle) → PULLBACK entry
+          - trend_ok only (rsi zone miss / low conf) → entry_signal_bounce():
+              Recovery mode: BOTH price above 1h EMA50 AND higher_low (AND gate)
+              Recovery mode: candle confirmation mandatory (15m engulfing or hammer)
+              Recovery mode: SL buffer 0.5×ATR (vs 0.3×ATR other modes)
+          - EMA flat/conflicting → entry_signal_micro_trend()
 
 5. Signal fires → pending queue (waits for entry to be touched)
 6. Entry hit → live trade saved to DB
@@ -666,14 +742,20 @@ Every 15 minutes:
 
 ## HTF Bias Confluence Thresholds
 
-| Condition | Threshold |
-|---|---|
-| Normal vol, any mode | 4/5 |
-| HIGH vol regime | 3/5 |
-| Bear mode, normal vol | 3/5 (4−1) |
-| Bear mode, HIGH vol | 2/5 (3−1) |
+DI+ vs DI− (4h) is a **mandatory gate** — always required, not scored. The 4 remaining factors are scored:
+1h structure, 4h structure, 1d structure, 1h EMA50 vs EMA200.
 
-The 5 confluence factors: EMA50 vs EMA200 (1h), DI+ vs DI− (4h), 1d structure, 4h structure, 1h MACD direction.
+| Direction | Condition | Scored factors needed |
+|---|---|---|
+| BUY | Normal vol | DI bull + 3/4 |
+| BUY | HIGH vol | DI bull + 2/4 |
+| SELL | Normal vol | DI bear + 4/4 (all) |
+| SELL | HIGH vol | DI bear + 3/4 |
+| SELL (bear mode) | Normal vol | DI bear + 3/4 (−1 from SELL baseline) |
+| SELL (bear mode) | HIGH vol | DI bear + 2/4 (−1 from SELL baseline) |
+
+SELL is one step harder than BUY — mixed/bullish regimes produce false sells.
+Bear mode reduces SELL threshold by 1: 1d structure lags in early crash phases.
 
 ---
 
@@ -689,6 +771,8 @@ The 5 confluence factors: EMA50 vs EMA200 (1h), DI+ vs DI− (4h), 1d structure,
 | After Plan 12 | 9.4/10 | Support bounce entry, StochRSI OB bypass, median vol_ma, TP2-primary RR gating |
 | After Plan 13 | 9.4/10 | Bounce SL bugs fixed, pullback TP structural, pending expiry 1h |
 | After Plan 14 | 9.5/10 | Recovery bounce: AND gate, wider SL (0.5×ATR), candle mandatory |
-| Current | 9.6/10 | 1:1 BE implemented, SL floor 0.5×ATR consistent, ATR cap 3.0 |
+| After Plan 15 | 9.6/10 | 1:1 BE implemented, SL floor 0.5×ATR consistent, ATR cap 3.0 |
+| After Plan 16 | 9.7/10 | BTC 4h EMA50/EMA200 macro gate — BUY trend/reversal blocked in downtrend |
+| Current | 9.8/10 | Session gate 20–23 UTC (+0.183R vs −0.092R outside), bounce/range disabled |
 
-**Gap to 10/10:** Live order execution (currently manual alerts), session filter, account balance auto-sync, minimum order value check.
+**Gap to 10/10:** Live order execution (currently manual alerts), account balance auto-sync, minimum order value check.
