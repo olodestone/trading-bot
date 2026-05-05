@@ -643,17 +643,27 @@ def _get_liquid_active_pool(exchange, market_type, symbol_filter, top_n=50):
 def get_pairs():
     """
     Pipeline:
-      1. fetch_tickers() → liquid ($2M+) + active (1.5%+ move) MEXC futures pairs
-      2. Score top 60 by ATR% × 1h_vol × surge_multiplier
-      3. Return best 30 — these go into the strategy
+      1. fetch_tickers() from both KuCoin spot and MEXC futures
+      2. Score all candidates by ATR% × 1h_vol × surge_multiplier
+      3. Return best 30 from combined pool (best momentum wins regardless of exchange)
     """
     candidates = []
 
+    spot_syms = _get_liquid_active_pool(
+        spot_exchange, "spot",
+        lambda s: "/USDT" in s and ":USDT" not in s,
+        top_n=50,
+    )
     futures_syms = _get_liquid_active_pool(
         futures_exchange, "futures",
         lambda s: "/USDT:USDT" in s,
-        top_n=60,
+        top_n=50,
     )
+
+    for symbol in spot_syms:
+        score = momentum_score(symbol, "spot")
+        if score > 0:
+            candidates.append((symbol, "spot", score))
 
     for symbol in futures_syms:
         score = momentum_score(symbol, "futures")
@@ -694,13 +704,14 @@ def entry_hit(df, entry, direction, trade_type):
         )
 
     if trade_type == "bounce":
-        # Entry at support — price dips to the level and shows a bullish close.
-        # No need for prev_high break like reversal; the bounce candle already
-        # confirmed the setup at signal time.
         if direction == "BUY":
             return last['low'] <= entry and last['close'] > last['open']
+        return last['high'] >= entry and last['close'] < last['open']
 
-    return False
+    # pullback, micro, range, fade: limit order — price must touch the entry level
+    if direction == "BUY":
+        return last['low'] <= entry
+    return last['high'] >= entry
 
 
 def is_not_late_entry(df, entry, direction, trade_type="trend"):
@@ -799,14 +810,18 @@ def run_bot():
         check_pending_trades()
         return
 
-    # Session gate: only generate signals 20–23 UTC.
-    # Backtest (1,796 trades): hours 20–23 → exp +0.183R; all other hours → exp −0.092R.
-    # Pending-trade management and open-trade monitoring still run outside the window.
+    # Session gate — 3-tier model:
+    #   00–07 UTC: blocked (deep Asia, thin liquidity)
+    #   08–17 UTC: filtered (confidence ≥ 60 required — quality-gated EU/US overlap)
+    #   18–23 UTC: full (all signals — premium window, best historical expectancy)
     _hour_utc = datetime.utcnow().hour
-    if _hour_utc not in (20, 21, 22, 23):
-        print(f"⏸️  Session gate (UTC {_hour_utc:02d}xx — signal window 20–23) — managing open trades only")
+    if 0 <= _hour_utc <= 7:
+        print(f"⏸️  Session gate (UTC {_hour_utc:02d}xx — blocked 00-07) — managing open trades only")
         check_pending_trades()
         return
+    _session_filtered = 8 <= _hour_utc <= 17
+    if _session_filtered:
+        print(f"📊 Off-peak session (UTC {_hour_utc:02d}xx — signals require confidence ≥ 60)")
 
     print(f"\n🚀 Scan: {datetime.now()}\n")
 
@@ -880,6 +895,16 @@ def run_bot():
             df_15m, df_1h, df_4h, df_1d, _market_mode, _btc_downtrend
         )
 
+        # Quality gate: all sessions — signals below 55 lack enough confluence to trust
+        if conf < 55:
+            print(f"⚠️ {symbol} skipped — low confidence ({conf} < 55 min)")
+            continue
+
+        # Off-peak session (08-17 UTC): raise bar further — only excellent setups
+        if _session_filtered and conf < 65:
+            print(f"⚠️ {symbol} skipped — off-peak ({_hour_utc:02d}xx UTC, conf={conf} < 65)")
+            continue
+
         # Skip if already pending
         if any(t['pair'] == symbol for t in pending_trades):
             print(f"⚠️ Already pending: {symbol}")
@@ -921,26 +946,35 @@ def run_bot():
             print(f"⚠️ {symbol} skipped — position ${pos_value:.2f} > 10× account (${ACCOUNT_BALANCE:.2f})")
             continue
 
-        # Contracts (MEXC uses contracts, not raw units)
-        mkt_info     = FUTURES_MARKETS.get(symbol, {})
-        contract_size = float(mkt_info.get('contractSize') or 1)
-        contracts    = round(units / contract_size, 1)
-        min_qty      = ((mkt_info.get('limits') or {}).get('amount') or {}).get('min') or 1
-        if contracts < min_qty:
-            print(f"⚠️ {symbol} skipped — {contracts} contracts below exchange minimum ({min_qty})")
-            continue
-
-        safe_bal = ACCOUNT_BALANCE if not pd.isna(ACCOUNT_BALANCE) and ACCOUNT_BALANCE > 0 else STARTING_BALANCE
-        leverage = max(1, round(pos_value / safe_bal))
-        leverage_line = f"Leverage  set {leverage}×  on MEXC before entering\n"
-
-        # Funding rate + isolated margin reminder
-        try:
-            fr = futures_exchange.fetch_funding_rate(symbol)
-            fr_val = (fr.get('fundingRate') or 0) * 100
-            funding_line = f"Funding   {fr_val:+.4f}%/8h  ← use isolated margin\n"
-        except Exception:
-            funding_line = "Funding   n/a  ← use isolated margin\n"
+        # Sizing — spot uses raw units (KuCoin), futures uses contracts (MEXC)
+        if market_type == "spot":
+            mkt_info  = SPOT_MARKETS.get(symbol, {})
+            min_qty   = ((mkt_info.get('limits') or {}).get('amount') or {}).get('min') or 0.001
+            quantity  = round(units, 4)
+            if quantity < min_qty:
+                print(f"⚠️ {symbol} skipped — {quantity} units below exchange minimum ({min_qty})")
+                continue
+            size_line     = f"Size    {quantity} units  (~${pos_value:.2f})\n"
+            leverage_line = ""
+            funding_line  = ""
+        else:
+            mkt_info      = FUTURES_MARKETS.get(symbol, {})
+            contract_size = float(mkt_info.get('contractSize') or 1)
+            contracts     = round(units / contract_size, 1)
+            min_qty       = ((mkt_info.get('limits') or {}).get('amount') or {}).get('min') or 1
+            if contracts < min_qty:
+                print(f"⚠️ {symbol} skipped — {contracts} contracts below exchange minimum ({min_qty})")
+                continue
+            safe_bal      = ACCOUNT_BALANCE if not pd.isna(ACCOUNT_BALANCE) and ACCOUNT_BALANCE > 0 else STARTING_BALANCE
+            leverage      = max(1, round(pos_value / safe_bal))
+            leverage_line = f"Leverage  set {leverage}×  on MEXC before entering\n"
+            size_line     = f"Size    {contracts} contracts  (~${pos_value:.2f})\n"
+            try:
+                fr       = futures_exchange.fetch_funding_rate(symbol)
+                fr_val   = (fr.get('fundingRate') or 0) * 100
+                funding_line = f"Funding   {fr_val:+.4f}%/8h  ← use isolated margin\n"
+            except Exception:
+                funding_line = "Funding   n/a  ← use isolated margin\n"
 
         tp2_line = (
             f"TP2     {_fmt_price(tp2)}  (▲ {abs(tp2 - entry) / entry * 100:.2f}%)\n"
@@ -967,7 +1001,7 @@ def run_bot():
                 f"{'─' * 22}\n"
                 f"💰 POSITION SIZING  ({risk_pct*100:.0f}% risk)\n"
                 f"Risk    ${risk_dollars:.2f}  of ${ACCOUNT_BALANCE:.2f}\n"
-                f"Size    {contracts} contracts  (~${pos_value:.2f})\n"
+                f"{size_line}"
                 f"{leverage_line}"
                 f"{funding_line}"
                 f"{'─' * 22}\n"
@@ -993,7 +1027,7 @@ def run_bot():
                 f"{'─' * 22}\n"
                 f"💰 POSITION SIZING  ({risk_pct*100:.0f}% risk)\n"
                 f"Risk    ${risk_dollars:.2f}  of ${ACCOUNT_BALANCE:.2f}\n"
-                f"Size    {contracts} contracts  (~${pos_value:.2f})\n"
+                f"{size_line}"
                 f"{leverage_line}"
                 f"{funding_line}"
                 f"{'─' * 22}\n"
@@ -1068,9 +1102,16 @@ def main():
             continue
 
         hour = datetime.utcnow().hour
-        in_session = hour in (20, 21, 22, 23)
-        sleep_secs = 300 if in_session else 900
-        print(f"⏳ Sleeping {sleep_secs // 60} minutes{'  (session active)' if in_session else ''}...")
+        if hour in (18, 19, 20, 21, 22, 23):
+            sleep_secs = 300    # premium window: scan every 5 min
+            session_tag = "premium"
+        elif 8 <= hour <= 17:
+            sleep_secs = 600    # filtered window: scan every 10 min
+            session_tag = "filtered"
+        else:
+            sleep_secs = 900    # blocked: check every 15 min (trade management only)
+            session_tag = "blocked"
+        print(f"⏳ Sleeping {sleep_secs // 60} min  [{session_tag}]...")
         time.sleep(sleep_secs)
 
 

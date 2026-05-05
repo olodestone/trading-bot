@@ -468,7 +468,7 @@ def entry_signal_bounce(df_15m, df_1h, df_4h, params):
         if params.get("market_mode") == "recovery" and not conf_candle:
             print(f"    bounce BUY: recovery — candle required (stoch={stoch_k:.0f} macd={'↑' if conf_macd else '↓'})")
             return None
-        if conf_candle or conf_rsi or conf_macd:
+        if sum([conf_candle, conf_rsi, conf_macd]) >= 2:
             sl_buf = 0.5 * atr if params.get("market_mode") == "recovery" else 0.3 * atr
             sl   = nearest_sup - sl_buf
             risk = entry - sl
@@ -500,9 +500,8 @@ def entry_signal_bounce(df_15m, df_1h, df_4h, params):
         conf_candle = is_engulfing(df_15m, "SELL") or is_shooting_star
         conf_rsi    = stoch_k > 70
         conf_macd   = macd_turning_down
-        # MACD turn alone is too weak — require candle or RSI OB, or MACD only when approaching OB
-        strong_conf = conf_candle or conf_rsi or (conf_macd and stoch_k > 55)
-        if strong_conf:
+        # Require 2 of 3 confirmations — MACD contributes only when stoch approaching OB
+        if sum([conf_candle, conf_rsi, conf_macd and stoch_k > 55]) >= 2:
             sl   = nearest_res + 0.3 * atr
             risk = sl - entry
             # Minimum SL distance: 0.5×ATR — resistance at entry creates a trivially tight stop
@@ -882,7 +881,7 @@ def entry_signal_trend(df_15m, df_1h, df_4h, direction, params, market_mode="nor
         if last['volume'] < last['vol_ma'] * vol_thresh:
             return None
 
-        # Compression → expansion: coil before the breakout.
+        # Compression → expansion: BOTH required before a trend breakout entry.
         # Skipped in HIGH vol (crash/breakout already underway — no coil forms).
         # Skipped when 4h ADX > 28 (strong trend continuation off a pullback).
         if not params.get("high_vol") and not strong_4h_trend:
@@ -1289,12 +1288,8 @@ def generate_pullback_signal(df_15m, df_1h, df_4h, df_1d=None, symbol="", market
     adx = last_4h.get("adx", 0)
     adx_min = params["adx_route"]  # regime-adaptive: 15 HIGH / 18 NORMAL / 20 LOW (bear -2)
     if pd.isna(adx) or adx < adx_min:
-        # range disabled — backtest exp=−0.182R across all conditions
-        micro = entry_signal_micro_trend(df_15m, df_1h, params, market_mode)
-        if micro:
-            m_dir, m_entry, m_sl, m_tp1, _, m_rr, m_atr, _ = micro
-            print(f"  ✅ MICRO {m_dir} {symbol} | ADX4h={adx:.1f}<{adx_min} (ranging) | entry={m_entry:.4f} sl={m_sl:.4f} tp1={m_tp1:.4f} rr={m_rr} | mode={market_mode}")
-        return micro
+        print(f"  ↳ {symbol}: ADX {adx:.1f} <{adx_min} [{market_mode}] ranging — skip")
+        return None
 
     # ── trend_ok: 4h EMA50 slope clearly directional ──────────────────────
     ema50_now  = last_4h["ema50"]
@@ -1394,17 +1389,10 @@ def generate_pullback_signal(df_15m, df_1h, df_4h, df_1d=None, symbol="", market
         return (direction, close, sl, tp1, tp2, rr, atr, "pullback")
 
     elif trend_ok:
-        # bounce disabled — backtest exp=−0.062R across all conditions
-        return None
+        return None  # bounce disabled — backtest exp=−0.062R across all conditions
 
     else:
-        # EMA flat / conflicting — no trend direction → MICRO
-        micro = entry_signal_micro_trend(df_15m, df_1h, params, market_mode)
-        if micro:
-            m_dir, m_entry, m_sl, m_tp1, _, m_rr, m_atr, _ = micro
-            _rsi_log = rsi_1h or 0
-            print(f"  ✅ MICRO {m_dir} {symbol} | RSI1h={_rsi_log:.1f} ADX4h={adx:.1f} (ema-flat→micro) | entry={m_entry:.4f} sl={m_sl:.4f} tp1={m_tp1:.4f} rr={m_rr} | mode={market_mode}")
-        return micro
+        return None  # EMA flat/conflicting — no directional bias for pullback
 
 
 # ==============================

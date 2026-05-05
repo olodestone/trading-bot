@@ -774,7 +774,9 @@ Bear mode reduces SELL threshold by 1: 1d structure lags in early crash phases.
 | After Plan 15 | 9.6/10 | 1:1 BE implemented, SL floor 0.5×ATR consistent, ATR cap 3.0 |
 | After Plan 16 | 9.7/10 | BTC 4h EMA50/EMA200 macro gate — BUY trend/reversal blocked in downtrend |
 | After Plan 17 | 9.8/10 | Session gate 20–23 UTC (+0.183R vs −0.092R outside), bounce/range disabled |
-| Current | 9.9/10 | Signal confidence score 1–5 stars: position sizing scales with confidence |
+| After Plan 18 | 9.9/10 | Signal confidence score 1–5 stars: position sizing scales with confidence |
+| After Plan 19 | 9.9/10 | KuCoin spot restored, 3-tier session gate, entry_hit bug fix |
+| Current | 9.9/10 | Quality gate conf ≥ 55 to fire, BB+coil AND restored, BTC block restored, bounce/micro disabled |
 
 **Gap to 10/10:** Live order execution (currently manual alerts), account balance auto-sync, minimum order value check.
 
@@ -838,3 +840,97 @@ By confidence:
   ★★★★   WR 52%  +0.18R  (n=19)
   ...
 ```
+
+---
+
+## Plan 19 — Signal Recovery (5 Fixes)
+
+**Problem:** Signal generation had collapsed to near-zero due to compounding over-restriction across Plans 16–17. All-time: W:9 BE:19 L:31 (+0.655R expectancy) — edge exists but bot barely trades.
+
+**Root causes identified:**
+1. Session gate (20–23 UTC only) blocked 83% of the day
+2. BB squeeze AND coil both required — extremely rare simultaneous occurrence  
+3. KuCoin spot silently dropped from `get_pairs()` — half the candidate universe gone
+4. Bounce disabled in pullback path (`elif trend_ok: return None`)
+5. BTC macro gate hard-blocked ALL BUY signals when EMA50 < EMA200
+
+---
+
+### Fix 1 — Session gate: 3-tier model (`bot.py`)
+
+**Before:** signals only 20–23 UTC  
+**After:**
+```
+00–07 UTC: blocked (deep Asia, thin liquidity)
+08–17 UTC: filtered — confidence ≥ 60 required (EU/US overlap, quality-gated)
+18–23 UTC: full — all signals (premium window unchanged)
+```
+Sleep interval: 5 min (18–23), 10 min (08–17), 15 min (00–07).
+
+---
+
+### Fix 2 — BB squeeze: AND → OR (`strategy.py — entry_signal_trend()`)
+
+**Before:** BB squeeze AND consolidation coil both required  
+**After:** BB squeeze OR consolidation coil (either proves compression before the breakout)
+
+Also updated rejection log to report `"no squeeze/coil"` as a single gate.
+
+---
+
+### Fix 3 — KuCoin spot restored (`bot.py — get_pairs()`)
+
+Added KuCoin spot scan (top 50) alongside MEXC futures (top 50). Combined pool scored by momentum, best 30 returned. Spot signals use raw units (no contracts/leverage/funding in message). `entry_hit()` extended to handle pullback/micro/range/fade trade types (were silently returning False — pending trades for these types would expire without ever triggering).
+
+---
+
+### Fix 4 — Bounce re-enabled at 2/3 confirmations (`strategy.py`)
+
+**`entry_signal_bounce()` — BUY and SELL:**
+- Before: 1 of 3 confirmations required (candle OR stoch OR MACD)
+- After: `sum([conf_candle, conf_rsi, conf_macd]) >= 2` for BUY; `sum([conf_candle, conf_rsi, conf_macd and stoch_k > 55]) >= 2` for SELL
+
+**`generate_pullback_signal()` — `elif trend_ok` branch:**
+- Before: `return None` (disabled)
+- After: calls `entry_signal_bounce()` with the 2/3 requirement
+
+---
+
+### Fix 5 — BTC macro gate: hard block → confidence penalty (`strategy.py`)
+
+**Before:** BTC EMA50 < EMA200 → `reversal = None` + `return None` for all BUY signals  
+**After:** Print log only (`"BTC 4h EMA50<EMA200 (confidence penalized)"`) — no hard block
+
+`compute_confidence()` Layer 1 already gives 0/25 macro points when BTC misaligned with direction (vs 18/25 when aligned), effectively reducing these signals by 1–2 stars and sizing them smaller. The hard block was redundant.
+
+---
+
+## Plan 20 — Signal Quality Gate
+
+**Problem:** Plan 19 went in the wrong direction — it increased signal quantity. The actual issue is signal accuracy (W:9 BE:19 L:31 all-time, too many losses).
+
+**Core insight:** The confidence score (0–100) existed only as a sizing tool — a 25-conf signal still fired at 1% risk. That's wrong. Low-confidence signals should not fire at all.
+
+**Changes:**
+
+### Confidence floor — ALL sessions (`bot.py`)
+```python
+if conf < 55:
+    # discard — not enough confluence across macro/structure/entry/setup
+    continue
+if _session_filtered and conf < 65:
+    # off-peak (08-17 UTC): raise bar further
+    continue
+```
+
+### BB squeeze AND coil restored (`strategy.py — entry_signal_trend()`)
+Reverted Plan 19 Fix 2. Both compression signals required — either alone is weaker evidence.
+
+### BTC hard block restored (`strategy.py — generate_filtered_signal()`)
+Reverted Plan 19 Fix 5. `reversal = None` and `return None` both restored. Alts follow BTC down — blocking BUY in confirmed BTC downtrend prevents systematic losses.
+
+### Bounce disabled (`strategy.py — generate_pullback_signal()`)
+Reverted Plan 19 Fix 4. `elif trend_ok: return None` restored. Backtest: −0.062R expectancy.
+
+### Micro trend disabled (`strategy.py — generate_pullback_signal()`)
+Both micro calls removed (ranging-ADX path and EMA-flat path). Micro has 1.2R minimum RR — lowest bar of any entry type. Not aligned with preferred profile (strong ADX, clean structure, RSI mid-range).
