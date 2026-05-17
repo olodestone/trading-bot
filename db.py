@@ -66,6 +66,7 @@ def ensure_tables():
                 ("mae", "FLOAT"), ("mfe", "FLOAT"),
                 ("time_to_mfe", "FLOAT"), ("time_to_mae", "FLOAT"),
                 ("confidence", "INTEGER"),
+                ("plan", "INTEGER"),
             ]:
                 try:
                     cur.execute(
@@ -96,7 +97,7 @@ def ensure_tables():
 # TRADE CRUD
 # ──────────────────────────────────────────────────────────────────────────────
 def save_trade(pair, signal, entry, sl, tp, tp2, rr, market_type,
-               atr=0.0, risk_dollars=0.0, confidence=50):
+               atr=0.0, risk_dollars=0.0, confidence=50, plan=None):
     ensure_tables()
     with _conn() as conn:
         with conn.cursor() as cur:
@@ -104,12 +105,12 @@ def save_trade(pair, signal, entry, sl, tp, tp2, rr, market_type,
                 INSERT INTO {TRADES_TABLE}
                   (time, pair, signal, entry, sl, tp, tp2, rr, status,
                    market_type, atr, be_activated, trail_sl, tp1_hit,
-                   risk_dollars, confidence)
+                   risk_dollars, confidence, plan)
                 VALUES
                   (%(time)s, %(pair)s, %(signal)s, %(entry)s, %(sl)s,
                    %(tp)s, %(tp2)s, %(rr)s, 'OPEN',
                    %(market_type)s, %(atr)s, false, %(sl)s, false,
-                   %(risk_dollars)s, %(confidence)s)
+                   %(risk_dollars)s, %(confidence)s, %(plan)s)
             """, {
                 "time":         str(datetime.utcnow()),
                 "pair":         pair,
@@ -123,6 +124,7 @@ def save_trade(pair, signal, entry, sl, tp, tp2, rr, market_type,
                 "atr":          round(float(atr), 8),
                 "risk_dollars": round(float(risk_dollars), 4),
                 "confidence":   int(confidence),
+                "plan":         int(plan) if plan is not None else None,
             })
         conn.commit()
 

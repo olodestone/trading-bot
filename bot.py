@@ -55,6 +55,7 @@ RISK_PCT         = float(os.getenv("RISK_PCT", "0.02"))
 
 MAX_CONCURRENT   = 10
 MAX_DAILY_LOSSES = 5
+BOT_PLAN         = 23   # increment when deploying a new plan — used to tag trades in DB
 
 WORKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screener_worker.py")
 
@@ -335,7 +336,7 @@ def check_pending_trades():
             trade["pair"], trade["signal"], trade["entry"],
             trade["sl"], trade["tp"], tp2, trade["rr"],
             trade["market_type"], trade.get("atr", 0.0), _rd,
-            confidence=_conf,
+            confidence=_conf, plan=BOT_PLAN,
         )
 
     pending_trades = updated
@@ -591,7 +592,7 @@ def _process_scan_results(scan_data):
             print(msg)
             send_telegram(msg)
             save_trade(symbol, sig, entry, sl, tp, tp2, rr, market_type,
-                       float(atr), risk_dollars, confidence=conf)
+                       float(atr), risk_dollars, confidence=conf, plan=BOT_PLAN)
         else:
             msg = (
                 f"{'─'*22}\n{direction}  [{trade_type.upper()}]\n{'─'*22}\n"

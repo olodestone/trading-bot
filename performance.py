@@ -129,6 +129,33 @@ def get_stats_summary():
             if lines:
                 conf_section = f"\n{'─'*22}\nBy confidence:\n" + "\n".join(lines)
 
+    plan_section = ""
+    if "plan" in df.columns:
+        closed_df = df[df["status"].isin(["WIN", "BE_WIN", "LOSS"])].copy()
+        closed_df["plan_label"] = closed_df["plan"].apply(
+            lambda p: f"Plan {int(p)}" if pd.notna(p) else "pre-23"
+        )
+        unique_plans = sorted(closed_df["plan_label"].unique())
+        if len(unique_plans) > 1:
+            lines = []
+            for label in unique_plans:
+                sub = closed_df[closed_df["plan_label"] == label]
+                if len(sub) == 0:
+                    continue
+                sw  = len(sub[sub["status"] == "WIN"])
+                sb  = len(sub[sub["status"] == "BE_WIN"])
+                sl_ = len(sub[sub["status"] == "LOSS"])
+                swr = (sw + sb) / len(sub) * 100
+                s_rr  = sub[sub["status"] == "WIN"]["rr"].mean() if sw > 0 else 0.0
+                s_be  = (sub[sub["status"] == "BE_WIN"]["rr"] * 0.5).mean() if sb > 0 else 0.0
+                s_exp = _expectancy(sw, sb, sl_, s_rr, s_be)
+                lines.append(
+                    f"  {label:<10}  W{sw} BE{sb} L{sl_}  "
+                    f"WR {swr:.0f}%  {s_exp:+.2f}R"
+                )
+            if lines:
+                plan_section = f"\n{'─'*22}\nBy plan:\n" + "\n".join(lines)
+
     return (
         f"ALL-TIME STATS\n{'─'*22}\n"
         f"Trades   {total} closed\n"
@@ -141,6 +168,7 @@ def get_stats_summary():
         f"Streak   {streak_label}\n{'─'*22}\n"
         f"Need 30+ trades for reliable stats."
         f"{conf_section}"
+        f"{plan_section}"
     )
 
 
