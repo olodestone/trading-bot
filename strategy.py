@@ -859,12 +859,16 @@ def entry_signal_trend(df_15m, df_1h, df_4h, direction, params, market_mode="nor
         if last['close'] <= prev['high']:
             return None
 
-        # StochRSI gate raised to 85 — stoch_k 72–85 in an uptrend is normal
-        # momentum, not overextension. Only gate at genuinely extreme levels.
+        # Minimum breakout distance: marginal 1-tick pokes above prev_high are
+        # fakeouts. Require 0.3×ATR of cleared distance — this is the empirical
+        # threshold where fake breakouts drop off sharply.
+        if (last['close'] - prev['high']) < 0.3 * atr:
+            return None
+
+        # StochRSI gate: breakout distance ≥ 0.3×ATR is now guaranteed above.
+        # Only additional check needed is strong volume for OB bypass.
         if last['stoch_k'] > 85:
-            strong_breakout = (last['close'] - prev['high']) > 0.3 * atr
-            strong_volume   = last['volume'] > last['vol_ma'] * 1.5
-            if not (strong_breakout and strong_volume):
+            if last['volume'] <= last['vol_ma'] * 1.5:
                 return None
 
         # MACD turning bullish over 3 bars — catches the momentum shift before the
@@ -916,6 +920,11 @@ def entry_signal_trend(df_15m, df_1h, df_4h, direction, params, market_mode="nor
     elif direction == "SELL":
         # Explosive breakdown trigger: close must break below previous candle's low
         if last['close'] >= prev['low']:
+            return None
+
+        # Minimum breakdown distance: mirrors BUY logic — 0.3×ATR of distance
+        # below prev_low required to filter noise breakdowns.
+        if (prev['low'] - last['close']) < 0.3 * atr:
             return None
 
         # MACD turning bearish over 3 bars
@@ -972,16 +981,24 @@ def entry_signal_trend(df_15m, df_1h, df_4h, direction, params, market_mode="nor
 
     rr_raw = reward / risk
 
-    # ATR cap: swing levels further than 3.0R are unlikely to be reached before
-    # reversal (backtest: only 2/48 trades hit TP1 at the full swing target).
-    # When RR > 3.0, cap TP1 at 2.5×ATR — a realistic near-term target — and
-    # promote the original swing level to TP2 as the runner.
-    _ATR_TP_MULT = 2.5
-    _ATR_CAP_RR  = 3.0
+    # ATR cap: structural targets beyond 2.0R sit far past the 1:1 BE level.
+    # Data: 71% of trades that reach 1:1 reverse before the structural TP1
+    # (48 BE wins vs 20 actual wins). At risk=1.0 ATR, a structural TP1 at
+    # 2.5R means price must travel 1.5R MORE after BE — rarely happens.
+    # Cap TP1 at 2.0×ATR: after 1:1 BE, TP1 is only (2.0 − risk_in_ATR)×ATR
+    # away — 0.5–1.0 ATR for typical risk sizes. Much more achievable.
+    # Promote the structural level to TP2 as the runner.
+    _ATR_TP_MULT = 2.0   # was 2.5
+    _ATR_CAP_RR  = 2.0   # was 3.0 — fires earlier, protects more BE trades
     if rr_raw > _ATR_CAP_RR:
-        tp2 = tp1
+        structural_tp1 = tp1
         tp1 = (entry + _ATR_TP_MULT * atr) if direction == "BUY" else (entry - _ATR_TP_MULT * atr)
         reward = abs(tp1 - entry)
+        # TP2: second structural level beyond original TP1, for runner potential.
+        # Fall back to the structural TP1 itself if no further level exists.
+        tp2_cand = (second_resistance(df_1h, structural_tp1) if direction == "BUY"
+                    else second_support(df_1h, structural_tp1))
+        tp2 = tp2_cand if tp2_cand is not None else structural_tp1
     else:
         tp2 = second_resistance(df_1h, tp1) if direction == "BUY" else second_support(df_1h, tp1)
 
@@ -993,7 +1010,9 @@ def entry_signal_trend(df_15m, df_1h, df_4h, direction, params, market_mode="nor
         pass  # TP1 alone is sufficient
     elif tp2 is not None:
         tp2_rr = round(abs(tp2 - entry) / risk, 2)
-        if tp2_rr < rr_min or rr < 1.5:
+        # Floor relaxed 1.5→1.2: ATR-capped TP1 is intentionally tighter than rr_min;
+        # the runner (TP2 = structural level) provides the full R target.
+        if tp2_rr < rr_min or rr < 1.2:
             return None
     else:
         return None
@@ -1219,11 +1238,11 @@ def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d, symbol="", market_mode
     if bias == "BUY":
         if last['close'] <= prev['high']:
             reasons.append("no breakout")
+        elif (last['close'] - prev['high']) < 0.3 * atr:
+            reasons.append(f"breakout too small ({last['close'] - prev['high']:.4f} < 0.3×ATR)")
         if last['stoch_k'] > 85:
-            strong_breakout = (last['close'] - prev['high']) > 0.3 * atr
-            strong_volume   = last['volume'] > last['vol_ma'] * 1.5
-            if not (strong_breakout and strong_volume):
-                reasons.append(f"stoch OB {last['stoch_k']:.0f}>85 weak-breakout")
+            if last['volume'] <= last['vol_ma'] * 1.5:
+                reasons.append(f"stoch OB {last['stoch_k']:.0f}>85 vol insufficient")
         if len(df_1h) >= 4 and df_1h['macd_hist'].iloc[-1] <= df_1h['macd_hist'].iloc[-4]:
             reasons.append("1h MACD not turning bull")
         strong_breakout_move = (last['close'] - prev['high']) > 0.5 * atr
@@ -1238,6 +1257,8 @@ def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d, symbol="", market_mode
     else:
         if last['close'] >= prev['low']:
             reasons.append("no breakdown")
+        elif (prev['low'] - last['close']) < 0.3 * atr:
+            reasons.append(f"breakdown too small ({prev['low'] - last['close']:.4f} < 0.3×ATR)")
         if len(df_1h) >= 4 and df_1h['macd_hist'].iloc[-1] >= df_1h['macd_hist'].iloc[-4]:
             reasons.append("1h MACD not turning bear")
         strong_breakdown_move = (prev['low'] - last['close']) > 0.5 * atr

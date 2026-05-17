@@ -542,6 +542,18 @@ def main(output_path):
 
             sig, entry, sl, tp, tp2, rr, atr, trade_type = result
 
+            # For trend entries: record the breakout/breakdown level.
+            # Pending entry check uses this to reject entries where price
+            # has already fallen below the breakout (failed breakout).
+            entry_valid_above = None
+            entry_valid_below = None
+            if trade_type == "trend":
+                prev_candle = df_15m.iloc[-2]
+                if sig == "BUY":
+                    entry_valid_above = float(prev_candle["high"])
+                else:
+                    entry_valid_below = float(prev_candle["low"])
+
             conf = compute_confidence(
                 sig, entry, sl, tp, tp2, rr, atr, trade_type,
                 df_15m, df_1h, df_4h, df_1d, market_mode, btc_downtrend
@@ -561,18 +573,20 @@ def main(output_path):
                 mkt_info = {"min_qty": 1, "contract_size": 1}
 
             signals.append({
-                "pair":        symbol,
-                "market_type": market_type,
-                "signal":      sig,
-                "entry":       float(entry),
-                "sl":          float(sl),
-                "tp":          float(tp),
-                "tp2":         float(tp2) if tp2 is not None else None,
-                "rr":          float(rr),
-                "atr":         float(atr),
-                "trade_type":  trade_type,
-                "confidence":  int(conf),
-                "market_info": mkt_info,
+                "pair":              symbol,
+                "market_type":       market_type,
+                "signal":            sig,
+                "entry":             float(entry),
+                "sl":                float(sl),
+                "tp":                float(tp),
+                "tp2":               float(tp2) if tp2 is not None else None,
+                "rr":                float(rr),
+                "atr":               float(atr),
+                "trade_type":        trade_type,
+                "confidence":        int(conf),
+                "market_info":       mkt_info,
+                "entry_valid_above": entry_valid_above,
+                "entry_valid_below": entry_valid_below,
             })
             print(f"  SIGNAL: {symbol} {sig} [{trade_type}] conf={conf}", flush=True)
 

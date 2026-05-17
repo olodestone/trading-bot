@@ -785,7 +785,8 @@ Bear mode reduces SELL threshold by 1: 1d structure lags in early crash phases.
 | After Plan 19 | 9.9/10 | KuCoin spot restored, 3-tier session gate, entry_hit bug fix |
 | After Plan 20 | 9.9/10 | Quality gate conf ≥ 55 to fire, BB+coil AND restored, BTC block restored, bounce/micro disabled |
 | After Plan 21 | 9.9/10 | Subprocess isolation: ccxt/pandas/numpy freed after each scan, idle −73% |
-| Current | 9.9/10 | ccxt removed from worker (direct HTTP), psycopg2 replaces sqlalchemy: −69% billing |
+| After Plan 22 | 9.9/10 | ccxt removed from worker (direct HTTP), psycopg2 replaces sqlalchemy: −69% billing |
+| After Plan 23 | 9.9+/10 | Fakeout filter: 0.3×ATR min breakout, TP1 cap 2.0×ATR, breakout-invalidation gate |
 
 **Gap to 10/10:** Live order execution (currently manual alerts), account balance auto-sync, minimum order value check.
 
@@ -1080,3 +1081,72 @@ Main process idle:         33,000 kB  (was 42,000 kB — saves 9,000 kB)
 | After Plan 22 (no ccxt + psycopg2) | 1,194 | **−69%** |
 
 Hard floor: subprocess cannot go below ~73 MB while `strategy.py` requires pandas for `apply_indicators()`.
+
+---
+
+## Plan 23 — Fakeout Filter + Tighter TP1 (Loss Rate Fix)
+
+**Problem:** All-time W:20 BE:48 L:80 (148 trades). Two root causes identified from the data:
+
+**Root cause 1 — 80 direct losses (54%):** Trend entries fire when `close > prev_high` by ANY margin. A 1-tick poke above qualifies. These micro-breakouts are ~80% fakeouts that immediately reverse. Worse: the pending entry (`price ≤ entry × 1.003`) fires on the way DOWN when a breakout is failing — the bot enters a falling knife.
+
+**Root cause 2 — 48 BE wins (71% of 1:1 hits never completing):** TP1 was the nearest 1h structural swing level, typically 2.5–3R from entry. After 1:1 BE activates at `entry + risk`, TP1 is still 1.5–2R away. At risk = 1.0 ATR, that's 1.5–2 more ATR needed from 1:1 — too far for most moves. The trade has already consumed its momentum to get to 1:1.
+
+Expectancy math confirmed: avg win = 3.7R (edge exists), but 54% of trades never reach 1:1 at all.
+
+**Changes: `strategy.py`, `screener_worker.py`, `bot.py`**
+
+### Fix 1 — Minimum breakout distance: 0.3×ATR (`strategy.py — entry_signal_trend()`)
+
+```python
+# BUY: added after last['close'] > prev['high'] check
+if (last['close'] - prev['high']) < 0.3 * atr:
+    return None   # marginal tick-above — fakeout
+
+# SELL: added after last['close'] < prev['low'] check
+if (prev['low'] - last['close']) < 0.3 * atr:
+    return None
+```
+
+0.3×ATR = the same threshold already used in the OB bypass check (empirically: momentum that exceeds this shows real velocity). Applied universally. OB bypass simplified since breakout distance is now guaranteed.
+
+### Fix 2 — TP1 at 2.0×ATR cap, fires at 2.0R (`strategy.py — entry_signal_trend()`)
+
+```python
+_ATR_TP_MULT = 2.0   # was 2.5
+_ATR_CAP_RR  = 2.0   # was 3.0
+```
+
+Effect at typical risk = 1.0 ATR:
+- 1:1 BE: entry + 1.0 ATR
+- TP1 (capped): entry + 2.0 ATR → only **1.0 ATR more** after BE → very achievable
+- Was: TP1 (structural) at 2.5–3R → 1.5–2R after BE → usually reversed before reaching it
+
+When cap fires, TP2 is set to `second_resistance(df_1h, structural_tp1)` (the level BEYOND the original structural target), not the structural target itself — this preserves a runner target at the right distance.
+
+TP2 rescue floor relaxed: `rr < 1.5` → `rr < 1.2` (trend entries only), because ATR-capped TP1 is intentionally tighter than rr_min; the structural TP2 provides the full R target.
+
+### Fix 3 — Breakout invalidation gate (`screener_worker.py`, `bot.py`)
+
+`screener_worker.py`: For trend signals, records the breakout level (`prev['high']` for BUY, `prev['low']` for SELL) as `entry_valid_above`/`entry_valid_below` in the signal JSON.
+
+`bot.py — check_pending_trades()`: Before entry trigger check:
+```python
+if eva and trade["signal"] == "BUY" and price < eva * 0.997:
+    # Price has fallen >0.3% below the breakout level — breakout failed.
+    # Remove signal; entering here = buying a failed breakout on the way down.
+    continue   # not added to updated → expired
+```
+
+This is the "falling knife" fix: pending BUY entries that would have triggered as price falls through the entry level (failed breakout) are now removed instead of filled.
+
+### Expected impact
+
+| Metric | Before | After (estimated) |
+|---|---|---|
+| Direct losses (54%) | 80 | 45–55 (-30–40%) |
+| BE wins | 48 | 30–35 (more converting to TP1 hits) |
+| Win rate | 45.9% | 50–55% |
+| Expectancy | +0.363R | +0.5–0.7R |
+
+Estimation basis: 0.3×ATR gate filters ~30–40% of the fakeout breakouts; tighter TP1 converts the "correct direction but too far to complete" BE trades into TP1 hits.

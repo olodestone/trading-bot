@@ -288,6 +288,20 @@ def check_pending_trades():
             continue
 
         price = get_price(symbol, market_type)
+
+        # Trend breakout validation: if the breakout level (prev_high for BUY,
+        # prev_low for SELL) has been violated by >0.3%, the breakout failed.
+        # Entering now would be buying a falling knife — remove the signal.
+        eva = trade.get("entry_valid_above")
+        evb = trade.get("entry_valid_below")
+        if price is not None:
+            if eva and trade["signal"] == "BUY" and price < eva * 0.997:
+                print(f"Breakout invalidated: {symbol} price {price:.6f} < breakout level {eva:.6f} — removed")
+                continue
+            if evb and trade["signal"] == "SELL" and price > evb * 1.003:
+                print(f"Breakdown invalidated: {symbol} price {price:.6f} > breakdown level {evb:.6f} — removed")
+                continue
+
         if not _check_entry_hit(price, trade["entry"], trade["signal"],
                                 trade.get("trade_type", "trend")):
             updated.append(trade)
@@ -594,12 +608,20 @@ def _process_scan_results(scan_data):
             print(msg)
             send_telegram(msg)
             pending_trades.append({
-                "pair": symbol, "signal": sig,
-                "entry": entry, "sl": sl, "tp": tp, "tp2": tp2,
-                "rr": rr, "market_type": market_type,
-                "trade_type": trade_type,
-                "atr": float(atr), "time": datetime.now(),
-                "confidence": conf,
+                "pair":              symbol,
+                "signal":            sig,
+                "entry":             entry,
+                "sl":                sl,
+                "tp":                tp,
+                "tp2":               tp2,
+                "rr":                rr,
+                "market_type":       market_type,
+                "trade_type":        trade_type,
+                "atr":               float(atr),
+                "time":              datetime.now(),
+                "confidence":        conf,
+                "entry_valid_above": s.get("entry_valid_above"),
+                "entry_valid_below": s.get("entry_valid_below"),
             })
 
     check_pending_trades()
