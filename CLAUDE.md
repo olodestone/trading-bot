@@ -8,11 +8,18 @@ Deployed on Heroku as a worker process. KuCoin (spot) + MEXC (futures).
 ## Architecture Overview
 
 ```
-bot.py          — Main loop, exchange connections, pair selection, trade management
-strategy.py     — All signal logic: indicators, regime detection, entry/exit rules
-performance.py  — Database (PostgreSQL), trade saving, TP/SL monitoring, reports
-logger.py       — Telegram alerts
-backtest.py     — Historical validation engine (runs locally, not on Heroku)
+bot.py               — Lightweight main loop (~33 MB idle). No ccxt/pandas/numpy.
+                        Spawns screener_worker.py each scan cycle via subprocess.
+screener_worker.py   — Isolated scan subprocess. Loads numpy+pandas+strategy,
+                        runs the full signal scan, writes JSON to tmp file, exits.
+                        Memory freed by OS on subprocess exit.
+db.py                — Hot-path DB layer (psycopg2 only, no pandas). Used by bot.py
+                        every cycle for trade CRUD, pending trades, guards.
+performance.py       — Stats-only module (pandas). Lazy-imported once daily for
+                        daily_report and /stats. Never loaded at startup.
+strategy.py          — All signal logic: indicators, regime detection, entry/exit rules
+logger.py            — Telegram alerts
+backtest.py          — Historical validation engine (runs locally, not on Heroku)
 ```
 
 ---
@@ -776,7 +783,9 @@ Bear mode reduces SELL threshold by 1: 1d structure lags in early crash phases.
 | After Plan 17 | 9.8/10 | Session gate 20–23 UTC (+0.183R vs −0.092R outside), bounce/range disabled |
 | After Plan 18 | 9.9/10 | Signal confidence score 1–5 stars: position sizing scales with confidence |
 | After Plan 19 | 9.9/10 | KuCoin spot restored, 3-tier session gate, entry_hit bug fix |
-| Current | 9.9/10 | Quality gate conf ≥ 55 to fire, BB+coil AND restored, BTC block restored, bounce/micro disabled |
+| After Plan 20 | 9.9/10 | Quality gate conf ≥ 55 to fire, BB+coil AND restored, BTC block restored, bounce/micro disabled |
+| After Plan 21 | 9.9/10 | Subprocess isolation: ccxt/pandas/numpy freed after each scan, idle −73% |
+| Current | 9.9/10 | ccxt removed from worker (direct HTTP), psycopg2 replaces sqlalchemy: −69% billing |
 
 **Gap to 10/10:** Live order execution (currently manual alerts), account balance auto-sync, minimum order value check.
 
@@ -934,3 +943,140 @@ Reverted Plan 19 Fix 4. `elif trend_ok: return None` restored. Backtest: −0.06
 
 ### Micro trend disabled (`strategy.py — generate_pullback_signal()`)
 Both micro calls removed (ranging-ADX path and EMA-flat path). Micro has 1.2R minimum RR — lowest bar of any entry type. Not aligned with preferred profile (strong ADX, clean structure, RSI mid-range).
+
+---
+
+## Plan 21 — Subprocess Memory Isolation
+
+**Problem:** `bot.py` imported ccxt, pandas, numpy, and strategy at startup and kept them in RAM permanently — including during idle periods between scans. Measured idle RSS: ~158 MB constant.
+
+**Root cause:** A single long-running process cannot free library memory between tasks. The OS only reclaims pages on process exit.
+
+**Solution:** Four strategies applied across a full architectural rewrite.
+
+### New files
+
+| File | Role |
+|---|---|
+| `screener_worker.py` | Isolated subprocess: loads heavy libs, runs full scan, writes JSON, exits |
+| `db.py` | Hot-path DB layer — psycopg2/sqlalchemy, no pandas. Used every cycle. |
+
+### Modified files
+
+**`bot.py`** — rewritten as lightweight orchestrator:
+- Imports at startup: `requests`, `psycopg2`, `sqlalchemy` (via db.py), `logger` — no ccxt/pandas/numpy
+- Spawns `screener_worker.py` via `subprocess.run([sys.executable, WORKER_SCRIPT, tmp_path], timeout=240)`
+- Reads JSON result, processes signals, manages pending trades — all without heavy libs
+- `get_price()` replaced with direct `requests.get()` to KuCoin/MEXC REST APIs (Strategy 2)
+
+**`performance.py`** — stripped to stats-only:
+- Removed: `save_trade`, `check_trade_results`, `save_pending_trades`, `load_pending_trades`, `get_daily_losses`, `get_compounded_balance` → all moved to `db.py`
+- Kept: `get_stats_summary()`, `daily_report()` — lazy-imported once daily, acceptable one-time pandas load
+
+### Strategy 1 — Subprocess isolation (`screener_worker.py`)
+- Worker spawned with `subprocess.run()`, timeout=240s
+- `tempfile.mkstemp()` for temp JSON path (not deprecated `mktemp`)
+- `try/finally: os.unlink(tmp_path)` guarantees cleanup on timeout or exception
+- `_NumpyEncoder` handles numpy int/float/ndarray types in JSON output
+
+### Strategy 2 — Replace library calls with HTTP (`bot.py`)
+- `get_price()`: `requests.get()` to KuCoin `/api/v1/market/stats` and MEXC `/api/v1/contract/ticker`
+- Funding rate: `requests.get()` to MEXC `/api/v1/contract/funding_rate/{symbol}`
+- Zero ccxt/pandas in main process idle path
+
+### Strategy 3 — Explicit cleanup inside loops (`screener_worker.py`)
+- Variables initialised to `None` before every `try` block
+- `del df_15m, df_1h, df_4h, df_1d` in `finally` (not just `except`) — runs on `continue`, exception, and normal exit
+- `gc.collect()` every 10 pairs in Phase 1; after worker exit in main process
+- Phase 2 uses `all_data.pop(symbol)` so each pair's DataFrames are freed immediately after processing
+
+### Strategy 4 — Clear cached data after use (`screener_worker.py`)
+- `spot.markets = {}; del spot_raw` after extracting needed fields from `load_markets()`
+- `del tickers` after pool is built in `_get_liquid_active_pool()`
+- `spot_ex.last_response_headers = None` after Phase 1
+- `breadth_data.clear()` after market mode computed
+- `MARKET_DATA.clear(); _RUN_CACHE.clear()` before writing output JSON
+
+### RSS measurements (logged every scan)
+
+```
+[worker] RSS before imports:  8,500 kB
+[worker] RSS after imports:   109,300 kB  (+100,800 kB)
+[worker] RSS after scan:      119,700 kB  (delta +10,400 kB)
+[main]   RSS: 42,000 → 42,200 kB (delta +200 kB after worker exit)
+[main]   RSS idle: 42,100 kB — sleeping 5 min [premium]
+```
+
+**Result:** Main process idle: **42 MB** (was 158 MB). −73% idle RAM.
+
+**Billing model (MB·h/day):**
+- Old bot constant 158 MB: 3,792 MB·h
+- After Plan 21: 1,608 MB·h — **−58%**
+
+---
+
+## Plan 22 — ccxt Removal + psycopg2
+
+**Problem:** Worker subprocess still imported ccxt (58 MB) even though ccxt was only used for `fetch_ohlcv` and `fetch_tickers` — thin wrappers around public REST endpoints. Main process used sqlalchemy (19 MB) when psycopg2 (10 MB) covers all its needs.
+
+**Key measurement:** Once a library is imported in a subprocess, Python's allocator does not return those pages to the OS even after `del + gc.collect()`. The only way to reduce RSS is to never import the library in the first place.
+
+### ccxt removed from `screener_worker.py`
+
+Replaced with direct HTTP via `requests` (already resident — zero marginal cost):
+
+| ccxt call | Replacement |
+|---|---|
+| `kucoin.fetch_tickers()` | `GET api.kucoin.com/api/v1/market/allTickers` |
+| `kucoin.fetch_ohlcv(sym, tf)` | `GET api.kucoin.com/api/v1/market/candles` |
+| `mexc.fetch_tickers()` | `GET contract.mexc.com/api/v1/contract/ticker` |
+| `mexc.fetch_ohlcv(sym, tf)` | `GET contract.mexc.com/api/v1/contract/kline/{sym}` |
+
+Rate limiter: separate 120ms gap per exchange (8 req/s each) — well within public endpoint limits. Uses a shared `requests.Session()` to reuse TCP connections.
+
+KuCoin response quirk: columns are `[time_s, open, close, high, low, vol, turnover]` in descending order — reversed and reordered to standard `[ts_ms, open, high, low, close, vol]`.
+
+`load_markets()` also removed — market info (min_qty, contract_size) replaced with hardcoded defaults (`0.001` spot, `1` futures) matching the existing fallback values.
+
+### Breadth + BTC macro: pure-Python EMA
+
+Stage A (market mode) and BTC macro no longer call `apply_indicators()`. Instead:
+
+```python
+def _ema_py(closes, period):
+    k = 2.0 / (period + 1)
+    ema = closes[0]
+    for c in closes[1:]:
+        ema = c * k + ema * (1 - k)
+    return ema
+```
+
+Fetches raw OHLCV (list of lists), extracts close prices, computes EMA50/EMA200, discards the list. No DataFrame allocated. 31 pairs × ~0 MB retained vs 31 `apply_indicators()` calls.
+
+### Two-stage scan structure
+
+- **Stage A (breadth + BTC):** pure Python EMA on raw close lists — no DataFrames, minimal RAM
+- **Stage B (signals):** one pair at a time using `all_data.pop(symbol)` — DataFrames freed after each pair
+
+### psycopg2 replaces sqlalchemy in `db.py` and `bot.py`
+
+- `db.py`: all SQL uses `%(param)s` style; `psycopg2.extras.RealDictCursor` for dict-like row access
+- `bot.py`: `_fetchone`/`_fetchall` rewritten with psycopg2 directly; `from sqlalchemy import text` removed
+- `get_engine()` shim kept in `db.py` for `performance.py`'s `pd.read_sql()` calls
+
+### RSS measurements
+
+```
+Subprocess WITHOUT ccxt:  72,600 kB  (was 109,300 kB — saves 36,700 kB)
+Main process idle:         33,000 kB  (was 42,000 kB — saves 9,000 kB)
+```
+
+**Billing model (MB·h/day):**
+
+| Scenario | MB·h/day | vs original |
+|---|---|---|
+| Old bot (158 MB constant) | 3,792 | — |
+| After Plan 21 (subprocess) | 1,608 | −58% |
+| After Plan 22 (no ccxt + psycopg2) | 1,194 | **−69%** |
+
+Hard floor: subprocess cannot go below ~73 MB while `strategy.py` requires pandas for `apply_indicators()`.
