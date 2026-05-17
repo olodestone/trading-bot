@@ -13,6 +13,7 @@ Library loads in this file:
 import gc
 import json
 import os
+import re
 import signal as signal_module
 import subprocess
 import sys
@@ -55,7 +56,17 @@ RISK_PCT         = float(os.getenv("RISK_PCT", "0.02"))
 
 MAX_CONCURRENT   = 10
 MAX_DAILY_LOSSES = 5
-BOT_PLAN         = 23   # increment when deploying a new plan — used to tag trades in DB
+def _detect_plan() -> int:
+    """Return the highest Plan N found in CLAUDE.md — auto-increments on every plan addition."""
+    try:
+        _claude_md = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CLAUDE.md")
+        with open(_claude_md) as _f:
+            _nums = re.findall(r"^## Plan (\d+)", _f.read(), re.MULTILINE)
+        return max(int(n) for n in _nums) if _nums else 0
+    except Exception:
+        return 0
+
+BOT_PLAN = _detect_plan()
 
 WORKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screener_worker.py")
 

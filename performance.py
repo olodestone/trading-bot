@@ -8,9 +8,22 @@ acceptable for once-daily use.
 All hot-path DB operations (save_trade, check_trade_results, pending trades,
 compounded balance, daily loss count) live in db.py without pandas.
 """
+import os
+import re
 import pandas as pd
 from datetime import datetime
 from db import get_engine, TRADES_TABLE, PENDING_TABLE
+
+
+def _current_plan() -> int | None:
+    """Return highest Plan N from CLAUDE.md, or None on failure."""
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CLAUDE.md")
+        with open(path) as f:
+            nums = re.findall(r"^## Plan (\d+)", f.read(), re.MULTILINE)
+        return max(int(n) for n in nums) if nums else None
+    except Exception:
+        return None
 
 
 def _fmt(p):
@@ -74,23 +87,42 @@ def get_stats_summary():
     if df.empty:
         return "STATS\n\nNo closed trades yet."
 
-    wins       = len(df[df["status"] == "WIN"])
-    be_wins    = len(df[df["status"] == "BE_WIN"])
-    losses     = len(df[df["status"] == "LOSS"])
-    total      = wins + be_wins + losses
-    if total == 0:
+    all_closed = df[df["status"].isin(["WIN", "BE_WIN", "LOSS"])].copy()
+    if all_closed.empty:
         return "STATS\n\nNo closed trades yet."
 
-    win_rate  = (wins + be_wins) / total * 100
-    avg_rr    = df[df["status"] == "WIN"]["rr"].mean() if wins > 0 else 0.0
-    best_rr   = df[df["status"] == "WIN"]["rr"].max()  if wins > 0 else 0.0
-    avg_be_rr = (df[df["status"] == "BE_WIN"]["rr"] * 0.5).mean() if be_wins > 0 else 0.0
-    exp       = _expectancy(wins, be_wins, losses, avg_rr, avg_be_rr)
+    # Headline uses current plan only; falls back to all-time if no plan data
+    cur_plan = _current_plan()
+    if cur_plan is not None and "plan" in df.columns:
+        headline_df = all_closed[all_closed["plan"] == cur_plan]
+        plan_label  = f"PLAN {cur_plan} STATS"
+    else:
+        headline_df = all_closed
+        plan_label  = "ALL-TIME STATS"
 
-    closed_df = df[df["status"].isin(["WIN", "BE_WIN", "LOSS"])].copy()
-    closed_df["time"] = pd.to_datetime(closed_df["time"], errors="coerce")
-    closed_df = closed_df.sort_values("time")
-    results = closed_df["status"].apply(
+    if headline_df.empty:
+        # New plan just started — show waiting message + historical by-plan below
+        history_section = _plan_breakdown(all_closed, cur_plan)
+        return (
+            f"{plan_label}\n{'─'*22}\n"
+            f"No closed trades yet — watching for Plan {cur_plan} results.\n"
+            f"{history_section}"
+        )
+
+    wins       = len(headline_df[headline_df["status"] == "WIN"])
+    be_wins    = len(headline_df[headline_df["status"] == "BE_WIN"])
+    losses     = len(headline_df[headline_df["status"] == "LOSS"])
+    total      = wins + be_wins + losses
+    win_rate   = (wins + be_wins) / total * 100
+    avg_rr     = headline_df[headline_df["status"] == "WIN"]["rr"].mean() if wins > 0 else 0.0
+    best_rr    = headline_df[headline_df["status"] == "WIN"]["rr"].max()  if wins > 0 else 0.0
+    avg_be_rr  = (headline_df[headline_df["status"] == "BE_WIN"]["rr"] * 0.5).mean() if be_wins > 0 else 0.0
+    exp        = _expectancy(wins, be_wins, losses, avg_rr, avg_be_rr)
+
+    headline_df = headline_df.sort_values(
+        pd.to_datetime(headline_df["time"], errors="coerce")
+    ) if "time" in headline_df.columns else headline_df
+    results = headline_df["status"].apply(
         lambda s: "W" if s in ("WIN", "BE_WIN") else "L"
     ).tolist()
 
@@ -104,11 +136,11 @@ def get_stats_summary():
                     else f"{cur_streak}L" if results else "—")
 
     edge_note = "Positive edge" if exp > 0 else "No edge yet -- keep tracking"
+    sample_note = "" if total >= 30 else f"\n⚠ {total}/30 trades — early sample"
 
     conf_section = ""
-    if "confidence" in df.columns:
-        conf_df = df[df["status"].isin(["WIN", "BE_WIN", "LOSS"]) &
-                     df["confidence"].notna()].copy()
+    if "confidence" in headline_df.columns:
+        conf_df = headline_df[headline_df["confidence"].notna()].copy()
         conf_df["confidence"] = conf_df["confidence"].astype(int)
         if len(conf_df) >= 5:
             buckets = [("80-100", 80, 100), ("65-79", 65, 79),
@@ -118,9 +150,9 @@ def get_stats_summary():
                 sub = conf_df[(conf_df["confidence"] >= lo) & (conf_df["confidence"] <= hi)]
                 if len(sub) == 0:
                     continue
-                sw = len(sub[sub["status"] == "WIN"])
-                sb = len(sub[sub["status"] == "BE_WIN"])
-                sl = len(sub[sub["status"] == "LOSS"])
+                sw     = len(sub[sub["status"] == "WIN"])
+                sb     = len(sub[sub["status"] == "BE_WIN"])
+                sl     = len(sub[sub["status"] == "LOSS"])
                 swr    = (sw + sb) / len(sub) * 100
                 s_rr   = sub[sub["status"] == "WIN"]["rr"].mean() if sw > 0 else 0.0
                 s_be   = (sub[sub["status"] == "BE_WIN"]["rr"] * 0.5).mean() if sb > 0 else 0.0
@@ -129,35 +161,10 @@ def get_stats_summary():
             if lines:
                 conf_section = f"\n{'─'*22}\nBy confidence:\n" + "\n".join(lines)
 
-    plan_section = ""
-    if "plan" in df.columns:
-        closed_df = df[df["status"].isin(["WIN", "BE_WIN", "LOSS"])].copy()
-        closed_df["plan_label"] = closed_df["plan"].apply(
-            lambda p: f"Plan {int(p)}" if pd.notna(p) else "pre-23"
-        )
-        unique_plans = sorted(closed_df["plan_label"].unique())
-        if len(unique_plans) > 1:
-            lines = []
-            for label in unique_plans:
-                sub = closed_df[closed_df["plan_label"] == label]
-                if len(sub) == 0:
-                    continue
-                sw  = len(sub[sub["status"] == "WIN"])
-                sb  = len(sub[sub["status"] == "BE_WIN"])
-                sl_ = len(sub[sub["status"] == "LOSS"])
-                swr = (sw + sb) / len(sub) * 100
-                s_rr  = sub[sub["status"] == "WIN"]["rr"].mean() if sw > 0 else 0.0
-                s_be  = (sub[sub["status"] == "BE_WIN"]["rr"] * 0.5).mean() if sb > 0 else 0.0
-                s_exp = _expectancy(sw, sb, sl_, s_rr, s_be)
-                lines.append(
-                    f"  {label:<10}  W{sw} BE{sb} L{sl_}  "
-                    f"WR {swr:.0f}%  {s_exp:+.2f}R"
-                )
-            if lines:
-                plan_section = f"\n{'─'*22}\nBy plan:\n" + "\n".join(lines)
+    history_section = _plan_breakdown(all_closed, cur_plan)
 
     return (
-        f"ALL-TIME STATS\n{'─'*22}\n"
+        f"{plan_label}\n{'─'*22}\n"
         f"Trades   {total} closed\n"
         f"W: {wins}  BE: {be_wins}  L: {losses}\n"
         f"Win Rate {win_rate:.1f}%\n"
@@ -165,11 +172,42 @@ def get_stats_summary():
         f"Best RR  {best_rr:.2f}\n{'─'*22}\n"
         f"Expectancy  {exp:+.3f}R\n"
         f"{edge_note}\n"
-        f"Streak   {streak_label}\n{'─'*22}\n"
-        f"Need 30+ trades for reliable stats."
+        f"Streak   {streak_label}"
+        f"{sample_note}"
         f"{conf_section}"
-        f"{plan_section}"
+        f"{history_section}"
     )
+
+
+def _plan_breakdown(closed_df: "pd.DataFrame", cur_plan: int | None) -> str:
+    """Return a 'By plan' section string, always showing all plans."""
+    if "plan" not in closed_df.columns or closed_df.empty:
+        return ""
+    labelled = closed_df.copy()
+    # Determine the label for NULL plan rows (pre-current-plan history)
+    null_label = f"pre-{cur_plan}" if cur_plan is not None else "pre-plan"
+    labelled["plan_label"] = labelled["plan"].apply(
+        lambda p: f"Plan {int(p)}" if pd.notna(p) else null_label
+    )
+    unique = sorted(labelled["plan_label"].unique())
+    if len(unique) <= 1 and cur_plan is not None:
+        # Only one plan exists — no breakdown adds value yet
+        return ""
+    lines = []
+    for label in unique:
+        sub = labelled[labelled["plan_label"] == label]
+        sw   = len(sub[sub["status"] == "WIN"])
+        sb   = len(sub[sub["status"] == "BE_WIN"])
+        sl_  = len(sub[sub["status"] == "LOSS"])
+        swr  = (sw + sb) / len(sub) * 100
+        s_rr = sub[sub["status"] == "WIN"]["rr"].mean() if sw > 0 else 0.0
+        s_be = (sub[sub["status"] == "BE_WIN"]["rr"] * 0.5).mean() if sb > 0 else 0.0
+        s_exp = _expectancy(sw, sb, sl_, s_rr, s_be)
+        lines.append(
+            f"  {label:<10}  W{sw} BE{sb} L{sl_}  "
+            f"WR {swr:.0f}%  {s_exp:+.2f}R"
+        )
+    return f"\n{'─'*22}\nBy plan:\n" + "\n".join(lines)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
