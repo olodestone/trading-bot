@@ -326,6 +326,7 @@ def _get_liquid_active_pool(fetch_tickers_fn, symbol_filter, top_n=50):
         if not symbol_filter(sym):   continue
         if _is_stable(sym):          continue
         if _is_non_crypto(sym):      continue
+        if sym.split("/")[0].endswith("STOCK"): continue   # synthetic stock perpetuals
         vol_24h = t.get("quoteVolume") or 0
         if vol_24h == 0:
             vol_24h = (t.get("last") or 0) * (t.get("baseVolume") or 0)

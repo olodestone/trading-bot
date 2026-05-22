@@ -1,7 +1,7 @@
 # Claude Trading Bot — Development Log
 
 Railway worker process. KuCoin (spot) + MEXC (futures).
-Current plan: **25** | Rating: **9.9+/10**
+Current plan: **26** | Rating: **9.9+/10** | Mode: **PAPER TRADING ($100)**
 
 ---
 
@@ -223,9 +223,11 @@ Now requires `ema50 < ema200 * 0.985`. True bear (2–10%+ below) still blocked.
 3/4 is a fully-trending market requirement. In recovery, price rises but structure hasn't formed
 consistent higher-highs across 1h/4h/1d yet. Pairs correctly score 2/4 (EMA + one TF). 3/4 was impossible.
 
-**BB squeeze AND coil both required (Plan 20)**
-Either alone is weak. Both together confirm compression before the breakout.
-High-vol regime skips both — crash/breakout markets don't consolidate first.
+**BB squeeze OR coil (Plan 26, changed from AND)**
+0.3×ATR minimum breakout already validates real velocity — the compression gate just confirms
+price paused before this move. Either BB squeeze OR coil is sufficient evidence of that pause.
+AND was over-filtering strong-trend continuations where price pulls back but doesn't fully coil.
+High-vol and strong_4h_trend (ADX>28) still bypass both entirely.
 
 **0.3×ATR minimum breakout distance (Plan 23)**
 Micro tick-above (close > prev_high by 1 tick) is ~80% fakeout. 0.3×ATR = real velocity.
@@ -250,8 +252,10 @@ Floor prevents them from being sent at all. Off-peak (08-17 UTC) raises to 65.
 **Position sizing from confidence (Plan 18)**
 conf/100 × 2% scales base risk. Stars 1–5 = 1%–3% base risk. RR bonus on top. Hard cap 5%.
 
-**Bounce disabled in pullback path (Plan 20)**
-Backtest showed −0.062R expectancy. `elif trend_ok: return None` is intentional.
+**Bounce re-enabled in pullback path (Plan 26)**
+The −0.062R backtest was from the pre-Plan-13 buggy version (SL placed below entry, no risk floor).
+Current bounce has AND gate, mandatory candle in recovery, 0.5×ATR SL buffer, 2/3 confirmation.
+`elif trend_ok: return entry_signal_bounce(df_15m, df_1h, df_4h, params)`
 
 **Pending expiry 1h trend / 3h bounce (Plan 13)**
 Was 24h — stale signals from dead moves consumed all capacity slots for hours.
@@ -272,6 +276,7 @@ Was 24h — stale signals from dead moves consumed all capacity slots for hours.
 | Plan 23 | 9.9+/10 | Fakeout filter 0.3×ATR, TP1 cap 2.0×ATR, breakout-invalidation gate |
 | Plan 24 | 9.9+/10 | BTC gate 1.5% threshold, recovery HTF 2/4 — zero-signal deadlock fixed |
 | Plan 25 | 9.9+/10 | _RUN_CACHE per-pair eviction — peak worker RAM N×4 DFs → ~4 DFs |
+| Plan 26 | 9.9+/10 | Paper trading mode ($100, MAX_CONCURRENT 5), stock filter, BB/coil OR, bounce re-enabled |
 
 **Gap to 10/10:** Live order execution (currently manual alerts), account balance auto-sync, min order value check.
 

@@ -50,11 +50,12 @@ def _rss_kb():
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
-ACCOUNT_BALANCE  = float(os.getenv("ACCOUNT_BALANCE", "15"))
+ACCOUNT_BALANCE  = float(os.getenv("ACCOUNT_BALANCE", "100"))
 STARTING_BALANCE = ACCOUNT_BALANCE
 RISK_PCT         = float(os.getenv("RISK_PCT", "0.02"))
+PAPER_TRADING    = os.getenv("PAPER_TRADING", "true").lower() == "true"
 
-MAX_CONCURRENT   = 10
+MAX_CONCURRENT   = 5
 MAX_DAILY_LOSSES = 5
 def _detect_plan() -> int:
     """Return the highest Plan N found in CLAUDE.md — auto-increments on every plan addition."""
@@ -329,8 +330,9 @@ def check_pending_trades():
         market_label = "Spot" if market_type == "spot" else "Futures"
         tp2          = trade.get("tp2")
         tp2_line     = f"TP2     {_fmt_price(tp2)}\n" if tp2 else ""
+        paper_entry_tag = "📄 PAPER TRADE\n" if PAPER_TRADING else ""
         send_telegram(
-            f"ENTRY TRIGGERED\n{'─'*22}\n"
+            f"{paper_entry_tag}ENTRY TRIGGERED\n{'─'*22}\n"
             f"{symbol}  {direction}  [{market_label}]\n\n"
             f"Entry   {_fmt_price(trade['entry'])}\n"
             f"SL      {_fmt_price(trade['sl'])}\n"
@@ -587,9 +589,10 @@ def _process_scan_results(scan_data):
             if tp2 else ""
         )
 
+        paper_prefix = "📄 PAPER TRADE\n" if PAPER_TRADING else ""
         if trade_type == "bounce":
             msg = (
-                f"{'─'*22}\n{direction}  [{trade_type.upper()}]  MARKET ENTRY\n{'─'*22}\n"
+                f"{paper_prefix}{'─'*22}\n{direction}  [{trade_type.upper()}]  MARKET ENTRY\n{'─'*22}\n"
                 f"Pair    {symbol}\nMarket  {mkt_label}\nTime    {now_str}\n\n"
                 f"Entry   {_fmt_price(entry)}  <- enter NOW at market\n"
                 f"SL      {_fmt_price(sl)}  (v {sl_pct:.2f}%)\n"
@@ -606,7 +609,7 @@ def _process_scan_results(scan_data):
                        float(atr), risk_dollars, confidence=conf, plan=BOT_PLAN)
         else:
             msg = (
-                f"{'─'*22}\n{direction}  [{trade_type.upper()}]\n{'─'*22}\n"
+                f"{paper_prefix}{'─'*22}\n{direction}  [{trade_type.upper()}]\n{'─'*22}\n"
                 f"Pair    {symbol}\nMarket  {mkt_label}\nTime    {now_str}\n\n"
                 f"Entry   {_fmt_price(entry)}\n"
                 f"SL      {_fmt_price(sl)}  (v {sl_pct:.2f}%)\n"

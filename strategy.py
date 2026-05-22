@@ -890,13 +890,13 @@ def entry_signal_trend(df_15m, df_1h, df_4h, direction, params, market_mode="nor
         if last['volume'] < last['vol_ma'] * vol_thresh:
             return None
 
-        # Compression → expansion: BOTH required before a trend breakout entry.
+        # Compression → expansion: at least ONE of BB squeeze OR coil required.
+        # Either alone proves the market paused before this breakout.
+        # 0.3×ATR minimum breakout (above) already validates real velocity.
         # Skipped in HIGH vol (crash/breakout already underway — no coil forms).
         # Skipped when 4h ADX > 28 (strong trend continuation off a pullback).
         if not params.get("high_vol") and not strong_4h_trend:
-            if not is_bb_squeeze(df_15m):
-                return None
-            if not consolidation_coil(df_15m, atr):
+            if not is_bb_squeeze(df_15m) and not consolidation_coil(df_15m, atr):
                 return None
 
         entry  = last['close']
@@ -949,10 +949,9 @@ def entry_signal_trend(df_15m, df_1h, df_4h, direction, params, market_mode="nor
 
         # Bear mode: skip BB squeeze and coil — crashes move in steps, not coils.
         # HIGH vol already bypasses these; strong_4h_trend bypass mirrors BUY logic.
+        # OR logic: either BB squeeze or consolidation coil sufficient evidence.
         if market_mode != "bear" and not params.get("high_vol") and not strong_4h_trend:
-            if not is_bb_squeeze(df_15m):
-                return None
-            if not consolidation_coil(df_15m, atr):
+            if not is_bb_squeeze(df_15m) and not consolidation_coil(df_15m, atr):
                 return None
 
         entry  = last['close']
@@ -1255,10 +1254,8 @@ def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d, symbol="", market_mode
         if last['volume'] < last['vol_ma'] * vol_thresh:
             reasons.append(f"vol low {last['volume']/last['vol_ma']:.2f}x (need {vol_thresh}x)")
         if not params.get("high_vol") and not strong_4h_trend:
-            if not is_bb_squeeze(df_15m):
-                reasons.append("no BB squeeze")
-            if not consolidation_coil(df_15m, atr):
-                reasons.append("no coil")
+            if not is_bb_squeeze(df_15m) and not consolidation_coil(df_15m, atr):
+                reasons.append("no BB squeeze or coil")
     else:
         if last['close'] >= prev['low']:
             reasons.append("no breakdown")
@@ -1274,10 +1271,8 @@ def generate_filtered_signal(df_15m, df_1h, df_4h, df_1d, symbol="", market_mode
         if last['volume'] < last['vol_ma'] * vol_thresh:
             reasons.append(f"vol low {last['volume']/last['vol_ma']:.2f}x (need {vol_thresh}x)")
         if market_mode != "bear" and not params.get("high_vol") and not strong_4h_trend:
-            if not is_bb_squeeze(df_15m):
-                reasons.append("no BB squeeze")
-            if not consolidation_coil(df_15m, atr):
-                reasons.append("no coil")
+            if not is_bb_squeeze(df_15m) and not consolidation_coil(df_15m, atr):
+                reasons.append("no BB squeeze or coil")
     print(f"  ↳ {symbol}: {bias} entry rejected [{regime_label}] — {', '.join(reasons) if reasons else 'RR/TP failed'}")
 
     return None
@@ -1415,7 +1410,10 @@ def generate_pullback_signal(df_15m, df_1h, df_4h, df_1d=None, symbol="", market
         return (direction, close, sl, tp1, tp2, rr, atr, "pullback")
 
     elif trend_ok:
-        return None  # bounce disabled — backtest exp=−0.062R across all conditions
+        # Bounce re-enabled: previous -0.062R backtest was from pre-Plan-13/14 buggy SL.
+        # Current bounce has AND gate, mandatory candle in recovery, 0.5×ATR SL buffer,
+        # 2/3 confirmation requirement, and 0.5×ATR minimum risk floor — all fixed.
+        return entry_signal_bounce(df_15m, df_1h, df_4h, params)
 
     else:
         return None  # EMA flat/conflicting — no directional bias for pullback
