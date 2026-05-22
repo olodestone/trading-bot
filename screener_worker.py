@@ -597,6 +597,10 @@ def main(output_path):
             print(f"  Error {symbol}: {e}", flush=True)
         finally:
             del df_15m, df_1h, df_4h, df_1d
+            # Evict this pair from cache immediately — no need to keep 30 pairs of
+            # DataFrames alive simultaneously. Peak RSS drops from N×4 DFs to ~4 DFs.
+            for _tf in ("15m", "1h", "4h", "1d"):
+                _RUN_CACHE.pop(f"{symbol}_{_tf}_{market_type}", None)
 
         if (i + 1) % 10 == 0:
             gc.collect()
