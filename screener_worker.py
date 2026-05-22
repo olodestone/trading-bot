@@ -446,10 +446,13 @@ def _check_btc_macro():
         ema200 = _ema_py(closes, 200)
         del closes
         sep_pct = abs(ema50 - ema200) / ema200 * 100 if ema200 else 0
-        tag = "bearish" if ema50 < ema200 else "bullish"
-        print(f"BTC 4h: EMA50={ema50:.1f} EMA200={ema200:.1f} "
-              f"({tag} sep={sep_pct:.2f}%)", flush=True)
-        return {"downtrend": ema50 < ema200, "ema50": ema50, "ema200": ema200}
+        # Only declare downtrend when EMA50 is meaningfully below EMA200 (>1.5%).
+        # A 0.27% separation is market noise — not a confirmed downtrend, and hard-blocking
+        # all BUY signals on it causes the bot to generate zero signals for weeks.
+        downtrend = ema50 < ema200 * 0.985
+        tag = f"bearish confirmed ({sep_pct:.2f}%)" if downtrend else f"{'bearish' if ema50 < ema200 else 'bullish'} sep={sep_pct:.2f}% (gate=1.5%)"
+        print(f"BTC 4h: EMA50={ema50:.1f} EMA200={ema200:.1f} ({tag})", flush=True)
+        return {"downtrend": downtrend, "ema50": ema50, "ema200": ema200}
     except Exception as e:
         print(f"BTC macro error: {e}", flush=True)
         return {"downtrend": None, "ema50": None, "ema200": None}

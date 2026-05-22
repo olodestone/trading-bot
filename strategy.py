@@ -259,7 +259,12 @@ def get_htf_bias(df_1h, df_4h, df_1d, params=None, market_mode="normal"):
     else:
         bear_score += 1
 
-    buy_threshold  = 2 if params and params.get("high_vol") else 3
+    if params and params.get("high_vol"):
+        buy_threshold = 2   # HIGH vol: explosive moves, use lower bar
+    elif market_mode == "recovery":
+        buy_threshold = 2   # RECOVERY: structure forming but not confirmed — DI+EMA sufficient
+    else:
+        buy_threshold = 3
     sell_threshold = min(buy_threshold + 1, 4)  # SELL is one step harder than BUY
 
     if market_mode == "bear":
