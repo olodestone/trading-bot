@@ -1,32 +1,40 @@
 # Claude Trading Bot — Development Log
 
 Railway worker process. KuCoin (spot) + MEXC (futures).
-Current plan: **26** | Rating: **9.9+/10** | Mode: **PAPER TRADING ($100)**
+Current plan: **27** | Rating: **9.9+/10** | Mode: **PAPER TRADING ($100)**
 
 ---
 
 ## Architecture
 
 ```
-bot.py               — Lightweight main loop (~33 MB idle). No ccxt/pandas/numpy.
-                        Spawns screener_worker.py each scan cycle via subprocess.
+bot.py               — Lightweight main loop (~42 MB idle, permanent). No ccxt/pandas/numpy.
+                        Spawns screener_worker.py each scan and report_worker.py once daily.
 screener_worker.py   — Isolated scan subprocess. Loads numpy+pandas+strategy,
                         runs the full signal scan, writes JSON to tmp file, exits.
                         OS reclaims all memory on subprocess exit.
+report_worker.py     — Isolated report subprocess. Loads pandas+sqlalchemy, runs
+                        daily_report or get_stats_summary, sends via Telegram, exits.
+                        Keeps pandas permanently out of the main process.
 db.py                — Hot-path DB layer (psycopg2 only, no pandas). Used every cycle
                         for trade CRUD, pending trades, guards.
-performance.py       — Stats-only (pandas). Lazy-imported once daily for daily_report
-                        and /stats. Never loaded at startup.
+performance.py       — Stats-only (pandas). Only ever imported inside report_worker.py.
 strategy.py          — All signal logic: indicators, regime detection, entry/exit rules
 logger.py            — Telegram alerts
 backtest.py          — Walk-forward validation engine (runs locally, not on Railway)
 ```
 
 ### RAM Profile
-- Main process idle: ~42 MB before first daily_report; ~105 MB after (pandas loaded by
-  daily_report on first startup cycle and never unloaded — Python does not unload modules)
-- Worker at import: ~73 MB | after scan: ~83 MB | freed fully on exit
-- Billing: ~1,480 MB·h/day (was 3,792 MB·h — **−61%**)
+- Main process idle: **~42 MB permanent** — pandas/numpy never imported here
+- Scan worker: ~83 MB peak | freed fully on exit (spawned per scan cycle)
+- Report worker: ~100 MB peak | freed fully on exit (spawned once daily + /stats)
+- Billing: **~1,271 MB·h/day** (was 3,792 MB·h — **−66%**)
+
+| State | MB·h/day | Reduction |
+|---|---|---|
+| Original (158 MB constant) | 3,792 | baseline |
+| Plans 21-22 actual (105 MB — pandas from daily_report) | 2,783 | −27% |
+| Plan 27 (42 MB — report in subprocess) | 1,271 | **−66%** |
 
 ### Running
 
@@ -278,6 +286,7 @@ Was 24h — stale signals from dead moves consumed all capacity slots for hours.
 | Plan 24 | 9.9+/10 | BTC gate 1.5% threshold, recovery HTF 2/4 — zero-signal deadlock fixed |
 | Plan 25 | 9.9+/10 | _RUN_CACHE per-pair eviction — peak worker RAM N×4 DFs → ~4 DFs |
 | Plan 26 | 9.9+/10 | Paper trading mode ($100, MAX_CONCURRENT 5), stock filter, BB/coil OR, bounce re-enabled |
+| Plan 27 | 9.9+/10 | report_worker subprocess — pandas out of main process, 42 MB permanent (−66% vs original) |
 
 **Gap to 10/10:** Live order execution (currently manual alerts), account balance auto-sync, min order value check.
 

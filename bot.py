@@ -69,7 +69,8 @@ def _detect_plan() -> int:
 
 BOT_PLAN = _detect_plan()
 
-WORKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screener_worker.py")
+WORKER_SCRIPT  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screener_worker.py")
+REPORT_SCRIPT  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "report_worker.py")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -465,6 +466,28 @@ def _run_screener():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# REPORT SUBPROCESS  (daily_report + /stats — keeps pandas out of main process)
+# ──────────────────────────────────────────────────────────────────────────────
+def _run_report(mode="daily"):
+    """
+    Spawn report_worker.py as a subprocess.
+    Pandas + sqlalchemy load inside the child, run the report, process exits.
+    Main process never imports pandas — stays at ~42 MB permanently.
+    """
+    try:
+        subprocess.run(
+            [sys.executable, REPORT_SCRIPT, mode],
+            env=os.environ.copy(),
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"Report worker timed out (120s) — mode={mode}")
+    except Exception as e:
+        print(f"Report worker error ({mode}): {e}")
+    gc.collect()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # SIGNAL PROCESSING  (called after _run_screener returns JSON)
 # ──────────────────────────────────────────────────────────────────────────────
 def _process_scan_results(scan_data):
@@ -663,8 +686,7 @@ def check_telegram_commands():
         if text_msg == "/status":
             _handle_status()
         elif text_msg == "/stats":
-            from performance import get_stats_summary
-            send_telegram(get_stats_summary())
+            _run_report("stats")
         elif text_msg == "/help":
             send_telegram(
                 "Commands:\n"
@@ -757,13 +779,8 @@ def main():
 
             today = datetime.now().date()
             if last_report_day != today:
-                # Lazy-import performance — loads pandas only here (once per day)
-                from performance import daily_report
-                daily_report(send_telegram)
-                from logger import send_csv
-                send_csv(TOKEN, CHAT_ID)
+                _run_report("daily")   # pandas loaded in subprocess, freed on exit
                 last_report_day = today
-                gc.collect()  # collect after pandas-heavy daily report
 
             save_pending_trades(pending_trades)
 
