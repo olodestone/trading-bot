@@ -1,295 +1,153 @@
 # Claude Trading Bot — Development Log
 
-This file documents every improvement made to the bot, plan by plan, in order.
-Deployed on Heroku as a worker process. KuCoin (spot) + MEXC (futures).
+Railway worker process. KuCoin (spot) + MEXC (futures).
+Current plan: **25** | Rating: **9.9+/10**
 
 ---
 
-## Architecture Overview
+## Architecture
 
 ```
 bot.py               — Lightweight main loop (~33 MB idle). No ccxt/pandas/numpy.
                         Spawns screener_worker.py each scan cycle via subprocess.
 screener_worker.py   — Isolated scan subprocess. Loads numpy+pandas+strategy,
                         runs the full signal scan, writes JSON to tmp file, exits.
-                        Memory freed by OS on subprocess exit.
-db.py                — Hot-path DB layer (psycopg2 only, no pandas). Used by bot.py
-                        every cycle for trade CRUD, pending trades, guards.
-performance.py       — Stats-only module (pandas). Lazy-imported once daily for
-                        daily_report and /stats. Never loaded at startup.
+                        OS reclaims all memory on subprocess exit.
+db.py                — Hot-path DB layer (psycopg2 only, no pandas). Used every cycle
+                        for trade CRUD, pending trades, guards.
+performance.py       — Stats-only (pandas). Lazy-imported once daily for daily_report
+                        and /stats. Never loaded at startup.
 strategy.py          — All signal logic: indicators, regime detection, entry/exit rules
 logger.py            — Telegram alerts
-backtest.py          — Historical validation engine (runs locally, not on Heroku)
+backtest.py          — Walk-forward validation engine (runs locally, not on Railway)
 ```
 
----
+### RAM Profile
+- Main process idle: ~33 MB (no ccxt/pandas/numpy)
+- Worker at import: ~73 MB | after scan: ~83 MB | freed fully on exit
+- Billing: ~1,194 MB·h/day (was 3,792 MB·h — **−69%**)
 
-## Plan 1 — Volume Floor Fix
+### Running
 
-**Problem:** Bot was scanning only the first 80 symbols from KuCoin by alphabetical/API order. During low-volume periods (e.g. April 2026 tariff selloff), most alts dropped below the $150K/h volume gate leaving only XMR/USDT.
-
-**Changes: `bot.py`**
-- Lowered 1h volume floor from `$150K` to `$75K`
-- Expanded symbol scan from `[:80]` to `[:150]` spot, `[:120]` futures
-
----
-
-## Plan 2 — Volume-Based Pair Discovery
-
-**Problem:** Alphabetical scan meant BTC, ETH, SOL were excluded or ranked unfairly. Position in the market dict determined what the bot saw, not actual liquidity.
-
-**Changes: `bot.py`**
-
-Replaced `get_pairs()` approach with a two-stage pipeline:
-
-**Stage 1 — `_get_liquid_active_pool()`**
-- Single `fetch_tickers()` API call — gets 24h data for ALL pairs simultaneously
-- Filters: stablecoin blocklist + `$2M` 24h volume gate + `|1.5%|` movement gate
-- Sorts survivors by 24h volume descending — BTC/ETH/SOL rank naturally at top
-- Returns top 40 per exchange
-
-**Stage 2 — `momentum_score()`**
-- Requires 180 days of 1d history — blocks newly listed and manipulated tokens before they waste fetch calls
-- Scores each of the 40 by `ATR% × 3h_avg_volume × surge_multiplier`
-- Surge multiplier: if last 1h volume > 20-candle average → coin is heating up NOW (capped 3×)
-- Returns top 20 for strategy evaluation
-
----
-
-## Plan 3 — Stablecoin + Non-Crypto Blocklist
-
-**Problem:** USDC/USDT, DAI/USDT, XAUT/USDT (gold), USOIL, UKOIL, SILVER perpetuals appearing in the pair pool, wasting fetch calls and polluting the scan.
-
-**Changes: `bot.py`**
-
-Added two blocklists applied at the ticker stage:
-
-```python
-_STABLES = {USDC, DAI, BUSD, TUSD, FDUSD, FRAX, USDP, UST, USDD, SUSD,
-            GUSD, LUSD, PYUSD, USDJ, CUSD, CEUR, EURS, ALUSD, USDN, MUSD, USDX}
-
-_NON_CRYPTO = {XAUT, PAXG, CACHE, XAU, XAG, XAGT,     # gold/silver tokens
-               SILVER, GOLD,                             # metal perpetuals
-               USOIL, UKOIL, OIL, BRENT, WTI,           # oil perpetuals
-               WHEAT, CORN, SOYB}                        # agricultural
-```
-
----
-
-## Plan 4 — Strategy Upgrades for Mid-Cap Explosive Moves
-
-**Goal:** Increase RR and signal quality. Focus on coins that coil then break out violently.
-
-### 4a — BB Squeeze Detection (`strategy.py`)
-
-New function `is_bb_squeeze(df)`:
-- Detects when at least 4 of the last 5 candles had Bollinger Band width below 85% of its 50-candle average (compression)
-- AND current candle shows BBW expanding (breakout beginning)
-- Applied as a hard gate on trend entries
-
-### 4b — Consolidation Coil (`strategy.py`)
-
-New function `consolidation_coil(df, atr)`:
-- Checks that at least 4 consecutive candles before the current one had range `< 0.6 × ATR`
-- Confirms the tight coil before the breakout
-- Applied alongside BB squeeze on trend entries
-
-### 4c — Entry Trigger Change (`strategy.py`)
-
-Replaced EMA9/21 crossover check with breakout trigger:
-- **BUY**: `last['close'] > prev['high']` — current 15m candle closes above previous high
-- **SELL**: `last['close'] < prev['low']` — current 15m candle closes below previous low
-
-Faster, more explosive entry timing. Confirms momentum rather than lagging EMA alignment.
-
-### 4d — Tiered Take Profits (`strategy.py`, `performance.py`, `bot.py`)
-
-Added TP1 + TP2 system:
-- **TP1** = nearest swing high/low on 1h (existing logic) → alert: "Close 50%"
-- **TP2** = second swing high/low beyond TP1 → alert: "Close 25%, trail rest"
-- If no TP2 exists, full position exits at TP1
-
-New functions in `strategy.py`:
-- `second_resistance(df_1h, tp1)` — next swing high above TP1
-- `second_support(df_1h, tp1)` — next swing low below TP1
-
-DB changes in `performance.py`:
-- Added `tp2 FLOAT` and `tp1_hit BOOLEAN` columns to trades table
-- `ALTER TABLE IF NOT EXISTS` used for safe migration on existing live DB
-- `check_trade_results()` updated with full tiered logic
-
-Signal return value: now 8-tuple `(direction, entry, sl, tp1, tp2, rr, atr, trade_type)`
-
-### 4e — RR Minimum Raised
-
-- Old: `rr < 2.0` → reject
-- New: `rr < 2.5` → reject
-- Only the cleanest setups with genuine structural room qualify
-
----
-
-## Plan 5 — Adaptive Strategy Parameters
-
-**Problem:** Fixed ADX threshold (22), StochRSI limits (72/28), and RR minimum (2.5) treat all market conditions identically. High-volatility regimes need looser filters (more signals, bigger moves). Low-volatility regimes need tighter filters (only the cleanest setups).
-
-**Changes: `strategy.py`**
-
-New function `get_regime_params(df_4h)`:
-- Computes current ATR percentile rank against the pair's own 4h ATR history
-- Returns adaptive thresholds:
-
-| Regime | ATR rank | ADX min | StochRSI OB/OS | Min RR |
-|---|---|---|---|---|
-| HIGH volatility | > 70th pct | 18 | 78 / 22 | 2.0 |
-| NORMAL | 30–70th pct | 22 | 72 / 28 | 2.5 |
-| LOW volatility | < 30th pct | 25 | 68 / 32 | 3.0 |
-
-Computed once in `generate_filtered_signal()` and threaded into:
-- `is_trending()` — adaptive ADX gate
-- `detect_htf_reversal()` — adaptive StochRSI extremes
-- `entry_signal_trend()` — adaptive StochRSI + RR minimum
-- `entry_signal_reversal()` — adaptive StochRSI + RR minimum
-- `get_htf_bias()` — threshold drops to 3/5 in HIGH vol regime (market already moving, stricter confluence would miss the whole move)
-
-**High-vol regime bypasses:**
-- BB squeeze + consolidation coil gates skipped when `high_vol=True` — crash/breakout markets won't consolidate first
-- SELL trend: StochRSI oversold check permanently removed — in a sustained downtrend the 15m stoch pins near 0 and would block all short entries; oversold filtering is correct for reversals but wrong for trend-following
-
-**Late entry tolerance** (`is_not_late_entry`): tiered by trade type
-- Trend entries: 1.5% tolerance — breakouts often retest the breakout level
-- Reversal entries: 0.3% tolerance — must be entered at the turning point
-
----
-
-## Plan 6 — MEXC Futures fetch_tickers Fix
-
-**Problem:** Three layered bugs caused `fetch_tickers failed (futures): empty pool` on every scan:
-
-**Bug 1 — Wrong exchange type**
-`futures_exchange = ccxt.mexc(...)` had no `defaultType` set. MEXC defaulted to spot when `fetch_tickers()` was called, returning symbols like `BTC/USDT`. The futures filter `"/USDT:USDT" in s` rejected every single one.
-
-Fix:
-```python
-futures_exchange.options['defaultType'] = 'swap'
-```
-
-**Bug 2 — quoteVolume is None on MEXC futures**
-MEXC futures tickers return `quoteVolume = None`. The old code did `None or 0 = 0` → failed `$2M` gate → empty pool.
-
-Fix: fallback to `baseVolume × last_price`:
-```python
-vol_24h = t.get("quoteVolume") or 0
-if vol_24h == 0:
-    vol_24h = (t.get("last") or 0) * (t.get("baseVolume") or 0)
-```
-
-**Bug 3 — percentage is None on MEXC futures**
-`abs(None or 0) = 0` → always failed the 1.5% movement gate.
-
-Fix: only apply movement filter when data is actually available:
-```python
-pct_raw = t.get("percentage")
-if pct_raw is not None and abs(pct_raw) < 1.5:
-    continue
-```
-
-**Also fixed:** error logging split into two separate blocks so fetch errors and empty-pool errors print with the actual exception type, not the same generic message.
-
----
-
-## Plan 7 — Backtest Engine
-
-**File:** `backtest.py` (runs locally, not on Heroku)
-
-**Design principles:**
-- Imports `apply_indicators` and `generate_filtered_signal` directly from `strategy.py` — zero duplication, auto-reflects any strategy change
-- Walk-forward simulation: at each 15m candle `i`, slices all dataframes to `df.iloc[:i+1]` — zero lookahead bias
-- Same trade management logic as `performance.py`: breakeven at 1:1, trail tightens at 2:1, TP1 partial, TP2 runner
-- Adaptive params run automatically inside `generate_filtered_signal`
-
-**How to run:**
 ```bash
-cd /home/entitypak/claude/claude-trading-bot
-
-# Default: 8 pairs, 90 days, KuCoin spot
-python backtest.py
-
-# Custom
-python backtest.py --days 180 --symbols SOL/USDT AAVE/USDT LINK/USDT ATOM/USDT
-
-# MEXC futures
-python backtest.py --futures --days 90
+cd claude-trading-bot
+pip install -r requirements.txt
+python bot.py
 ```
-
-**Report output:** Win rate, total R, expectancy, profit factor, max drawdown, Sharpe ratio, per-symbol breakdown, best/worst trade, edge grade (A/B/C/F). Full trade log saved as CSV.
-
-**Minimum for reliable stats:** 30+ trades. Run `--days 180` or add more symbols if count is low.
 
 ---
 
-## Current Signal Flow (End to End)
+## Signal Flow (End to End)
 
 ```
-Every 15 minutes:
+Every scan cycle (session-gated):
 
-1. fetch_tickers() [one API call per exchange]
-   → block stablecoins + non-crypto commodities
-   → gate: $2M 24h volume (baseVolume×price fallback for MEXC)
-   → gate: |1.5%| movement (skipped if data unavailable)
-   → sort by 24h volume
-   → top 40 per exchange
+SESSION GATE
+  00–07 UTC: blocked — trade management only, 15-min sleep
+  08–17 UTC: filtered — conf ≥ 65 required, 10-min sleep
+  18–23 UTC: full — conf ≥ 55, 5-min sleep
 
-2. momentum_score() for each of the 40
-   → gate: 180 days 1d history (filters new/manipulated listings)
-   → score = ATR% × 3h_vol × surge_mult
-   → gate: $75K/h 1h volume
-   → top 20 proceed
+1. get_pairs()  [screener_worker.py]
+   → fetch_tickers(): block stablecoins + non-crypto commodities
+   → $2M 24h volume gate (baseVolume×price fallback for MEXC futures)
+   → |1.5%| movement gate (skipped if data unavailable)
+   → sort by volume → top 50 KuCoin spot + top 50 MEXC futures
+   → momentum_score(): 180d history gate, score = ATR%×3h_vol×surge_mult, $75K/h gate
+   → top 30 combined
 
-3. For each of the 20 pairs:
-   → fetch 15m / 1h / 4h / 1d candles
-   → apply_indicators() on all 4 timeframes
+2. Stage A — breadth + BTC macro (pure Python EMA — zero DataFrames)
+   → bear_breadth = fraction of pairs with 1h EMA50 < EMA200
+   → market_mode:
+       "bear"     — breadth > 65% for 2+ consecutive scans
+       "recovery" — breadth ≤ 45% for 3+ consecutive scans
+       "normal"   — otherwise
+   → btc_downtrend = BTC 4h EMA50 < EMA200 × 0.985  (>1.5% separation required)
 
-4. generate_filtered_signal():
-   → get_regime_params(df_4h) — detect HIGH/NORMAL/LOW volatility
-   → is_trending(df_4h, adx_min) — adaptive ADX gate
-   → detect_htf_reversal() — 4 conditions: structure divergence +
-     extreme StochRSI + volume surge + MACD flip
-   → get_htf_bias() — 4/5 confluence (3/5 in HIGH vol regime)
-   → entry_signal_trend() or entry_signal_reversal():
-       - close > prev_high (BUY) / close < prev_low (SELL)
-       - BB squeeze + consolidation coil (trend only; skipped in HIGH vol)
-       - StochRSI not overbought for BUY (adaptive); no OS check for SELL trend
-       - 1h MACD confirmation (trend only)
-       - volume > 1.15× vol_ma
-       - structural SL (swing low/high ± 0.3 ATR)
-       - TP1 = nearest 1h swing level
-       - TP2 = second 1h swing level (runner)
-       - RR ≥ adaptive minimum (2.0 / 2.5 / 3.0)
+3. Stage B — signal scan (one pair at a time; _RUN_CACHE evicted per pair)
+   → fetch 15m/1h/4h/1d → apply_indicators()
+   → diagnostic log: ADX4h, RSI1h, EMA bull/bear
 
-5. Signal fires → pending queue (waits for entry to be touched)
-6. Entry hit → live trade saved to DB
-7. Trade monitored every 15 min:
-   → 1:1 hit → SL to breakeven
-   → 2:1 hit → trail tightens (price - 1.2×risk)
-   → TP1 hit → alert "Close 50%", tp1_hit=True
-   → TP2 hit → alert "Close 25%, trail rest", status=WIN
-   → trail_sl hit → status=BE_WIN or LOSS
+   A. generate_filtered_signal() — high-conviction entries
+      → get_regime_params(df_4h, market_mode):
+            HIGH vol (ATR >70th pct): ADX-3, StochOB/OS 85/15, RR 2.0
+            NORMAL  (30–70th pct):   ADX base, StochOB/OS 72/28, RR 2.5
+            LOW vol (<30th pct):     ADX+3, StochOB/OS 68/32, RR 3.0
+            Bear/recovery mode:      RR forced 2.0 all regimes
+            Bear mode:               ADX-2 additional
+      → BTC macro gate: downtrend=True → block BUY trend + BUY reversal
+      → Bear mode only: entry_signal_fade_resistance() — SELL at 4h EMA50 resistance
+      → detect_htf_reversal() — 4 conditions: structure divergence +
+        extreme StochRSI + volume surge + MACD flip
+      → get_htf_bias() — DI mandatory + 4 scored factors
+          (1h struct, 4h struct, 1d struct, 1h EMA50/200):
+            BUY  normal vol: 3/4 | HIGH vol: 2/4 | recovery: 2/4
+            SELL normal vol: 4/4 | HIGH vol: 3/4 | bear: −1 from baseline
+      → entry_signal_trend() or entry_signal_reversal():
+            - close > prev_high (BUY) / close < prev_low (SELL)
+            - min breakout distance 0.3×ATR  ← fakeout filter
+            - BB squeeze AND consolidation coil (trend only; skipped HIGH vol + bear SELL)
+            - StochRSI hard gate 85: bypass if breakout >0.3×ATR AND vol >1.5×vol_ma
+            - 1h MACD confirmation (trend only)
+            - volume > 1.15× vol_ma  (0.90× bear SELL)
+            - structural SL (swing ± 0.3×ATR); minimum 0.5×ATR from entry
+            - TP1 = nearest 1h swing; capped at 2.0×ATR when structural RR > 2.0
+            - TP2 = next swing beyond TP1 (if ATR cap fired: level beyond original target)
+            - RR gate: TP1 ≥ rr_min → pass; else TP2 ≥ rr_min AND TP1 ≥ 1.2 → pass
+
+   B. generate_pullback_signal() — fallback if A returns None
+      → get_regime_params()
+      → ADX < threshold → entry_signal_range()
+      → ADX ≥ threshold:
+            - trend_ok = 4h EMA50 slope directional
+            - rsi_ok   = 1h RSI in pullback zone (40–48 BUY, 52–60 SELL)
+            - Bear: SELL only; recovery: BUY only
+            - trend_ok AND rsi_ok AND (rsi_cross OR conf_candle) → PULLBACK entry
+            - trend_ok only → DISABLED (bounce: backtest −0.062R)
+            - EMA flat → DISABLED (micro: RR minimum too low)
+
+4. compute_confidence() → 0–100  (4 layers × 25 pts each)
+   Macro:     market_mode + BTC alignment with signal direction
+   Structure: DI gap + HTF factor count
+   Entry:     ADX excess + volume ratio + gate count
+   Setup:     RR excess + TP2 existence + SL/ATR ratio
+
+   → discard if conf < 55  (all sessions)
+   → discard if conf < 65  (08–17 UTC filtered session)
+
+5. Trend signals: record entry_valid_above (prev_high for BUY) / entry_valid_below (prev_low for SELL)
+
+6. Signal → pending queue
+   Expiry: 1h (trend/reversal/pullback) | 3h (bounce)
+
+7. check_pending_trades() every cycle:
+   → breakout invalidation: BUY removed if price < breakout×0.997  (falling knife)
+   → breakdown invalidation: SELL removed if price > breakdown×1.003
+   → entry hit: price ≤ entry×1.003 (BUY) / price ≥ entry×0.997 (SELL)
+   → late-entry guard: |price − entry| / entry ≤ 1.5%
+   → entry triggered → save_trade() + Telegram alert
+
+8. check_trade_results() every cycle:
+   → 1:1 hit   → SL to breakeven (be_activated=True, trail_sl=entry)
+   → 2:1 hit   → trail tightens to price − 1.2×risk
+   → TP1 hit   → Telegram "Close 50%", tp1_hit=True
+   → TP2 hit   → Telegram "Close 25%, trail rest", status=WIN
+   → trail hit → status=BE_WIN (if BE active) or LOSS
 ```
 
 ---
 
 ## Database Schema (PostgreSQL)
 
-**trades table:**
+**trades:**
 ```
 time, pair, signal, entry, sl, tp, tp2, rr, status,
-market_type, atr, be_activated, trail_sl, tp1_hit
+market_type, atr, be_activated, trail_sl, tp1_hit, confidence, plan
 ```
 
-**pending_trades table:**
+**pending_trades:**
 ```
 pair, signal, entry, sl, tp, tp2, rr, market_type,
-trade_type, atr, queued_at
+trade_type, atr, queued_at, confidence
 ```
 
 Status values: `OPEN`, `WIN`, `BE_WIN`, `LOSS`
@@ -301,7 +159,7 @@ Status values: `OPEN`, `WIN`, `BE_WIN`, `LOSS`
 | Command | Action |
 |---|---|
 | `/status` | Open + pending trades with entry/RR |
-| `/stats` | All-time win rate, expectancy, streak |
+| `/stats` | Win rate, expectancy, per-plan and per-confidence breakdown |
 | `/cancel SYMBOL` | Remove a pending signal |
 | `/help` | Command list |
 
@@ -312,457 +170,91 @@ Status values: `OPEN`, `WIN`, `BE_WIN`, `LOSS`
 | Var | Default | Purpose |
 |---|---|---|
 | `ACCOUNT_BALANCE` | 15 | Account size for position sizing |
-| `RISK_PCT` | 0.02 | Risk per trade (2%) |
+| `RISK_PCT` | 0.02 | Risk per trade (base, overridden by confidence) |
 | `DATABASE_URL` | — | PostgreSQL connection string |
 | `TOKEN` | — | Telegram bot token |
 | `CHAT_ID` | — | Telegram chat ID |
 
 ---
 
-## Plan 8 — Bear / Recovery / Normal Market Mode
-
-**Problem:** Bot fired zero signals during April 5-6 2026 tariff selloff crash. No bear-specific logic existed — all gates were tuned for normal trending markets.
-
-**Changes: `bot.py`, `strategy.py`**
-
-New module-level state in `bot.py`:
-```python
-_bear_mode_scans = 0
-_recovery_scans  = 0
-_market_mode     = "normal"
-```
-
-New function `_update_market_mode(breadth_data)`:
-- Computes `bear_breadth` = fraction of top-20 pairs where `ema50 < ema200` on 1h
-- `breadth > 65%` for 2+ scans → `"bear"` mode
-- `breadth ≤ 45%` for 3+ scans → `"recovery"` mode (boundary is ≤, not <, so 9/20=45% counts)
-- Otherwise → `"normal"` mode
-- Sends Telegram alert on every mode transition
-
-Two-pass `run_bot()`:
-- Phase 1: fetch + apply indicators for all pairs, build `breadth_data{}`
-- Phase 2: `_update_market_mode()`, then generate signals with `market_mode` passed in
-
-**Bear mode changes (`strategy.py`):**
-- `get_htf_bias()`: SELL only, threshold reduced by 1 (4→3 or 3→2 in HIGH vol)
-- `get_regime_params()`: ADX min per-regime — HIGH vol −3 (19→16), NORMAL/LOW vol −2 (22→20, 23→21); floor 14 — ADX lags in early crashes; HIGH vol crashes spike ADX faster so need a bigger reduction
-- `entry_signal_trend()` SELL: vol threshold 0.90× instead of 1.15×; BB squeeze + coil skipped
-- `entry_signal_fade_resistance()` added: SELL at 4h EMA50 resistance — price bounces into dynamic resistance in a bear, reversal candle forms, next candle confirms break below. Gates: 4h ema50 < ema200, reversal candle high within 2% of EMA50, 4h stoch_k > 60, 15m shooting star or bearish engulfing, break confirmed, vol 0.8–1.2×. This fires first inside `generate_filtered_signal()` in bear mode.
-- Reversal BUY re-enabled in bear mode (gates are already strict enough)
-
-**Recovery mode changes:**
-- `get_regime_params()`: forces `rr_min = 2.0` across all regimes
-
----
-
-## Plan 9 — Support Bounce Entry Type
-
-**Problem:** BUY signals at support during downtrend couldn't fire — reversal required 4h already bullish, which isn't true at first touch of support.
-
-**Changes: `strategy.py`**
-
-New function `entry_signal_bounce(df_15m, df_1h, df_4h, params)`:
-- Gate 1: `last_4h['stoch_k'] < 20` — 4h must be oversold (at support, not mid-range)
-- Gate 2: `4h macd_hist` improving (turning less negative) — momentum inflecting
-- Gate 3: prior 1h swing low within 1.5% of entry — price at actual structural support
-- Gate 4: 15m bullish engulfing OR hammer — reversal candle confirmation
-- Gate 5: `volume > vol_ma × 1.5` — real buying interest
-- SL: `df_15m['low'].tail(10).min() − (0.3 × ATR)`
-- RR minimum: `params["rr_min"] + 0.5` — counter-trend premium (HIGH→2.5, NORMAL→3.0, LOW→3.5)
-
-Hammer detection:
-```python
-body = abs(last['close'] - last['open'])
-lower_wick = min(last['open'], last['close']) - last['low']
-upper_wick = last['high'] - max(last['open'], last['close'])
-is_hammer = body > 0 and lower_wick >= 2 * body and upper_wick <= body
-```
-
-Called from `generate_pullback_signal()` (the fallback path). Works in all market modes including bear.
-
-**Late entry tolerance:** bounce uses 0.3% (same as reversal — must be at support).
-
----
-
-## Plan 10 — StochRSI Smarter OB Usage
-
-**Problem:** StochRSI OB was a hard block on BUY. But OB on a genuine momentum breakout confirms the move — blocking it was wrong.
-
-**Changes: `strategy.py` — `entry_signal_trend()`**
-
-```python
-if last['stoch_k'] > stoch_ob:
-    strong_breakout = (last['close'] - prev['high']) > 0.3 * atr
-    strong_volume   = last['volume'] > last['vol_ma'] * 1.5
-    if not (strong_breakout and strong_volume):
-        return None
-    # else: OB is confirming momentum, allow
-```
-
-Rejection log updated: `"stoch OB 92>68 weak-breakout"` — shows OB was considered but bypass didn't trigger.
-
-Rule: OB + weak breakout → reject. OB + strong breakout (close > prev_high by 0.3 ATR) + strong volume (1.5×) → allow.
-
----
-
-## Plan 11 — Median vol_ma (Volume Illusion Fix)
-
-**Problem:** `vol_ma = rolling(20).mean()` was destroyed by crash/bounce spike candles. 3-5 massive candles in the 20-candle window inflated the mean so badly that normal candles showed as 0.00x–0.07x, blocking all volume gates.
-
-**Changes: `strategy.py` — `apply_indicators()`**
-
-```python
-# Before:
-df['vol_ma'] = df['volume'].rolling(20).mean()
-
-# After:
-df['vol_ma'] = df['volume'].rolling(20).median()
-```
-
-Median of 20 values = 10th value. Up to 9 spike candles cannot move it. Volume data is right-skewed — median is the statistically correct central tendency estimator. Confirmed working in logs: BTC, DOT, ETH/spot vol rejections disappeared after deployment.
-
----
-
-## Plan 12 — TP2-Primary RR Gating
-
-**Problem:** RR gate only checked TP1. A setup with TP1 RR 1.8 and TP2 RR 4.0 was rejected even though the trade plan (50% at TP1, runner to TP2) proved structural room.
-
-**Changes: `strategy.py` — `entry_signal_trend()`, `entry_signal_reversal()`, `entry_signal_bounce()`**
-
-TP2 computed before RR gate in all three functions. Logic:
-
-```python
-if rr >= rr_min:
-    pass  # TP1 sufficient on its own — original behavior
-elif tp2 is not None:
-    tp2_rr = round(abs(tp2 - entry) / risk, 2)
-    if tp2_rr < rr_min or rr < 1.5:
-        return None
-    # TP2 proves structure has room — allow with TP1 ≥ 1.5 floor
-else:
-    return None  # No TP2 to rescue marginal TP1
-```
-
-The 1.5 floor on TP1 is a minimum — TP1 can be 1.7, 2.3, anything ≥ 1.5. It just ensures the first partial close is meaningful. TP1 ≥ rr_min bypasses TP2 check entirely.
-
----
-
-## Plan 13 — Bounce Bug Fixes (SL, Pullback TP, Pending Expiry)
-
-**Problems fixed:**
-
-**Bug 1 — Bounce SELL: resistance below entry (RR=22 false signals)**
-`near_res` filter used `h > entry * 0.999`, allowing resistance 0.1% below entry. Result: SL = resistance + 0.3×ATR placed nearly at entry → risk of 0.04%, absurd RR like 22.65.
-
-Fix in `entry_signal_bounce()`:
-```python
-# Before:
-near_res = [h for h in res_levels if h > entry * 0.999]
-
-# After:
-near_res = [h for h in res_levels if h >= entry]
-```
-Resistance must be AT or above entry — can't short below your resistance.
-
-**Bug 2 — Bounce SELL firing on MACD alone (stoch=44)**
-MACD alone at neutral StochRSI = weak confirmation for a counter-trend SELL. Added `strong_conf` requirement:
-```python
-strong_conf = conf_candle or conf_rsi or (conf_macd and stoch_k > 55)
-```
-MACD-only allowed only if stoch > 55 (approaching overbought territory).
-
-**Bug 3 — Same tiny-SL bug on bounce BUY side**
-Added minimum risk floor to BUY path:
-```python
-if risk < atr * 0.5:
-    return None
-```
-Prevents support-at-entry setups from generating a trivially tight stop.
-
-**Bug 4 — Pullback TP hardcoded to 1R (always RR=1.0)**
-`generate_pullback_signal()` had `tp1 = close + 1.0 * risk` — a fixed 1R target. Changed to structural resistance/support:
-```python
-tp1 = nearest_resistance(df_1h, close) or nearest_resistance(df_4h, close)  # BUY
-tp1 = nearest_support(df_1h, close) or nearest_support(df_4h, close)        # SELL
-```
-Also added TP2 population and 1.5 RR minimum.
-
-**Bug 5 — Pending trade expiry 24h (blocked bot for 3+ hours)**
-Changed `timedelta(hours=24)` → `timedelta(hours=1)` in `bot.py`. Stale pending signals from dead moves were consuming all 5 capacity slots.
-
----
-
-## Plan 14 — Recovery Bounce Hardening (AND Gate + Wider SL)
-
-**Problem:** Most bounce BUY trades in recovery mode were hitting SL. Three-layer root cause:
-1. Recovery gate was OR (one condition enough) — ZEC passed with ema50=✓ but higher_low=✗, price still making lower lows
-2. SL buffer 0.3×ATR too tight for choppy post-crash price action — wicks stopping out valid setups
-3. Candle confirmation not mandatory — MACD/RSI alone doesn't prove real rejection at support
-
-**Changes: `strategy.py` — `entry_signal_bounce()`**
-
-**Fix 1 — Recovery gate: OR → AND**
-```python
-# Before:
-gate_pass = close_above_ema50 or higher_low
-
-# After:
-gate_pass = close_above_ema50 and higher_low
-```
-Both must be true:
-- `close_above_ema50`: current price above 1h EMA50 — medium-term average has turned
-- `higher_low`: most recent 1h swing low is higher than the previous — structure is improving
-
-**Fix 2 — Wider SL buffer in recovery**
-```python
-sl_buf = 0.5 * atr if params.get("market_mode") == "recovery" else 0.3 * atr
-sl = nearest_sup - sl_buf
-```
-Recovery price action is choppy — wicks reach further below support. 0.5×ATR gives the trade room to breathe. Other modes keep 0.3×ATR.
-
-**Fix 3 — Candle confirmation mandatory in recovery** *(deployed prior commit)*
-```python
-if params.get("market_mode") == "recovery" and not conf_candle:
-    return None
-```
-MACD turning or RSI oversold = "less bad", not proof of reversal. A 15m bullish engulfing or hammer is required.
-
-**Also fixed: `bot.py` Telegram message** — recovery mode alert now correctly states AND gate + SL buffer instead of old OR description.
-
-**Result:** In the April 8–9 window with these gates, ZERO signals would fire — which is correct. Market was still retesting lows, no structure had formed. Bot correctly sits on hands.
-
----
-
-## Plan 15 — 1:1 BE, SL Floor Alignment, ATR Cap Tightening
-
-**Context:** INJ/USDT LONG [TREND] fired at entry 3.5860, SL 3.5719 (risk 0.0141 = 0.69×ATR), TP1 3.6330 (RR 3.33). Status: LOSS. MAE/MFE analysis from the DB:
-
-| | INJ (LOSS) | AXS (WIN) |
-|---|---|---|
-| mfe | 1.203R | 4.732R |
-| mae | 1.486R | NULL |
-| time_to_mfe | 1.01h | 2.27h |
-| time_to_mae | 1.78h | — |
-
-INJ MFE = 1.203R means price crossed the 1:1 level (entry + 1×risk = 3.6001) before reversing and hitting SL. AXS had essentially zero adverse excursion — went straight to TP2. Initial instinct (raise SL floor to 0.75×ATR) was wrong: the INJ trade had directional merit (1.2R MFE), it just had no intermediate protection. The correct fixes are trade management, not entry filtering.
-
----
-
-### 15a — 1:1 Breakeven Implementation
-
-**Problem:** CLAUDE.md documented "1:1 hit → SL to breakeven" but the code only set BE at TP1 hit. INJ crossed 1:1 at 1.01h with MFE=1.203R, then reversed to a full LOSS at 1.78h. 1:1 BE converts this to BE_WIN.
-
-**Changes: `performance.py` — `check_trade_results()`**
-
-Added before trail tightening in both BUY and SELL blocks:
-```python
-# BUY
-if not be_activated and not tp1_hit and price >= entry + risk:
-    changes['be_activated'] = True
-    changes['trail_sl'] = entry
-    be_activated = True
-    trail_sl = entry
-    send_telegram("🔒 1:1 HIT — SL → Breakeven ...")
-
-# SELL (symmetric)
-if not be_activated and not tp1_hit and price <= entry - risk:
-    ...
-```
-
-AXS WIN was unaffected — MAE=NULL means price never came back toward entry after going up.
-
-**Execution sequence after this change:**
-1. 1:1 hit → BE activated, trail_sl = entry
-2. 2:1 hit → trail tightens to `price - 1.2×risk` (already BE-protected)
-3. TP1 hit → partial close 50%, trail_sl stays at entry (already set)
-4. TP2 hit → WIN
-5. trail_sl hit after BE → BE_WIN
-
----
-
-### 15b — SL Floor Corrected to 0.5×ATR
-
-**Problem:** Initial attempt raised trend SL floor to 0.75×ATR, which would have rejected the INJ trade entirely despite its directional merit (1.2R MFE). With 1:1 BE protecting the downside, the floor can be consistent with all other entry types.
-
-**Changes: `strategy.py` — `entry_signal_trend()`**
-
-```python
-# Before:
-if risk <= 0 or risk < atr * 0.4:   # original
-# Then incorrectly changed to:
-if risk <= 0 or risk < atr * 0.75:  # Plan 15 draft (too aggressive)
-# Corrected to:
-if risk <= 0 or risk < atr * 0.5:   # consistent with bounce/reversal/micro
-```
-
-Applied to both BUY and SELL paths. 0.5×ATR is the standard minimum across all entry types — prevents genuinely sub-noise stops while allowing trades with meaningful structural anchors.
-
----
-
-### 15c — ATR Cap Tightened: RR > 3.5 → RR > 3.0
-
-**Problem:** INJ had TP1 at RR 3.33 — below the old 3.5 cap, so the cap didn't fire. A TP1 at 3.33R means price must travel a large distance before the first partial close, leaving a wide window where a reversal turns a good setup into a full loss (exactly what happened).
-
-**Changes: `strategy.py` — `entry_signal_trend()`, `entry_signal_reversal()`**
-
-```python
-# Before:
-_ATR_CAP_RR = 3.5   # cap TP1 at 2.5×ATR when RR > 3.5
-
-# After:
-_ATR_CAP_RR = 3.0   # cap TP1 at 2.5×ATR when RR > 3.0
-```
-
-Effect: setups with structural TP1 > 3R get TP1 capped to 2.5×ATR (a nearer achievable target), and the swing level becomes TP2 (the runner). Compresses the no-protection gap between entry and first partial exit.
-
----
-
-## Plan 16 — BTC Macro Gate
-
-**Problem:** 69% of LOSS trades (9/13) had MFE < 0.3R — price moved against the signal immediately with no favorable excursion. 10 of 13 losses were BUY signals. The alt market was in a stealth downtrend that `bear_mode` didn't catch (breadth stayed under 65% while individual alts fell one by one). In "normal" mode, `generate_filtered_signal()` fires BUY trend/reversal signals freely, and they all hit SL instantly.
-
-**Root cause:** The bear_mode breadth gate (65%) is too slow for a rolling alt selloff that doesn't happen all at once. BTC 4h EMA50 vs EMA200 is a faster, cleaner macro signal — it reflects the trend that alts follow but reacts independently of alt breadth.
-
-**Changes: `strategy.py`, `bot.py`**
-
-### What's blocked
-
-`generate_filtered_signal()` when `btc_downtrend=True`:
-- HTF bias returns "BUY" → rejected before `entry_signal_trend()` fires
-- `detect_htf_reversal()` returns "BUY" → nulled before `entry_signal_reversal()` fires
-
-### What's still allowed
-
-`generate_pullback_signal()` BUY paths are **not** blocked:
-- `entry_signal_bounce()` — requires 4h stoch_k < 30 + structural support + candle confirmation
-- `entry_signal_range()` — requires stoch_k < 35 + at swing low support + reversal candle
-- `entry_signal_pullback()` — requires coin's own 4h EMA50 > EMA200, which naturally can't fire on alts following BTC down
-
-### Implementation
-
-**`strategy.py` — `generate_filtered_signal()` signature:**
-```python
-def generate_filtered_signal(..., btc_downtrend=False):
-```
-
-Two block points inside:
-```python
-# After detect_htf_reversal():
-if reversal == "BUY" and btc_downtrend:
-    reversal = None
-
-# After get_htf_bias():
-if bias == "BUY" and btc_downtrend:
-    return None
-```
-
-**`bot.py` — new module-level state + function:**
-```python
-_btc_downtrend      = False
-_btc_downtrend_prev = False
-
-def _update_btc_macro():
-    # Fetches BTC/USDT:USDT 4h, applies indicators, sets _btc_downtrend
-    # Sends Telegram on EMA50/EMA200 crossover transitions
-```
-
-Called in `run_bot()` between Phase 1 and Phase 2, after `_update_market_mode()`.
-
-**Telegram alerts on transition only:**
-- `🔴 BTC MACRO: EMA50 CROSSED BELOW EMA200` → BUY trend/reversal blocked
-- `🟢 BTC MACRO: EMA50 CROSSED ABOVE EMA200` → BUY re-enabled
-
----
-
-## Current Signal Flow (End to End)
-
-```
-Every 15 minutes:
-
-1. fetch_tickers() [one API call per exchange]
-   → block stablecoins + non-crypto commodities
-   → gate: $2M 24h volume (baseVolume×price fallback for MEXC)
-   → gate: |1.5%| movement (skipped if data unavailable)
-   → sort by 24h volume
-   → top 40 per exchange
-
-2. momentum_score() for each of the 40
-   → gate: 180 days 1d history (filters new/manipulated listings)
-   → score = ATR% × 3h_vol × surge_mult
-   → gate: $75K/h 1h volume
-   → top 20 proceed
-
-3. Phase 1: fetch 15m/1h/4h/1d for all 20 pairs, apply_indicators()
-   → compute bear_breadth from 1h EMA50/EMA200 across all pairs
-   → _update_market_mode() → "bear" / "recovery" / "normal"
-
-4. Phase 2 — two signal functions per pair (A then B):
-
-   A. generate_filtered_signal() — high-conviction entries:
-      → get_regime_params(df_4h, market_mode) — HIGH/NORMAL/LOW vol + mode adjustments
-      → BTC macro gate: if BTC 4h EMA50 < EMA200 → BUY signals blocked (trend + reversal)
-      → ADX routing: if not trending → skip this path entirely
-      → Bear mode only: entry_signal_fade_resistance() — SELL at 4h EMA50 resistance
-          (4h ema50<ema200 + reversal candle at EMA50 + break confirmed + vol 0.8–1.2×)
-      → detect_htf_reversal() — 4 conditions: structure divergence +
-        extreme StochRSI + volume surge + MACD flip
-      → get_htf_bias() — DI mandatory + scored factors:
-          BUY  normal vol: 3/4 remaining = 4 total; HIGH vol: 2/4 = 3 total
-          SELL normal vol: 4/4 remaining = 5 total; HIGH vol: 3/4 = 4 total
-          Bear mode: SELL only, sell threshold −1
-      → entry_signal_trend() or entry_signal_reversal():
-          - 15m close > prev_high (BUY) / close < prev_low (SELL)
-          - BB squeeze + consolidation coil (trend only; skipped in HIGH vol + bear SELL + strong 4h trend)
-          - StochRSI hard gate at 85 (not adaptive): bypass if close−prev_high > 0.3×ATR AND vol > 1.5×vol_ma
-          - 1h MACD confirmation (trend only)
-          - volume > 1.15× vol_ma (0.90× bear SELL; 0.80× low-liquidity window 01–07 UTC)
-          - structural SL (swing low/high ± 0.3 ATR); minimum 0.5×ATR from entry
-          - TP1 = nearest 1h swing level; capped at 2.5×ATR if structural RR > 3.0
-          - TP2 = swing level beyond TP1 (or original swing if ATR cap fired)
-          - RR gate: TP1 ≥ rr_min → pass; else TP2 ≥ rr_min AND TP1 ≥ 1.5 → pass
-
-   B. generate_pullback_signal() — fallback if A returns None:
-      → get_regime_params(df_4h, market_mode)
-      → If ADX < adx_route threshold → entry_signal_range() → entry_signal_micro_trend()
-      → If ADX ≥ threshold:
-          - trend_ok = 4h EMA50 slope clearly directional
-          - rsi_ok   = 1h RSI in pullback zone (40–48 BUY, 52–60 SELL)
-          - Bear mode: SELL only; recovery mode: BUY only
-          - trend_ok AND rsi_ok AND (rsi_cross OR conf_candle) → PULLBACK entry
-          - trend_ok only (rsi zone miss / low conf) → entry_signal_bounce():
-              Recovery mode: BOTH price above 1h EMA50 AND higher_low (AND gate)
-              Recovery mode: candle confirmation mandatory (15m engulfing or hammer)
-              Recovery mode: SL buffer 0.5×ATR (vs 0.3×ATR other modes)
-          - EMA flat/conflicting → entry_signal_micro_trend()
-
-5. Signal fires → pending queue (waits for entry to be touched)
-6. Entry hit → live trade saved to DB
-7. Trade monitored every 15 min:
-   → 1:1 hit → SL to breakeven (be_activated=True, trail_sl=entry)
-   → 2:1 hit → trail tightens (price - 1.2×risk), BE must already be active
-   → TP1 hit → alert "Close 50%", tp1_hit=True, trail_sl=entry confirmed
-   → TP2 hit → alert "Close 25%, trail rest", status=WIN
-   → trail_sl hit → status=BE_WIN (if BE active) or LOSS
-```
-
----
-
 ## HTF Bias Confluence Thresholds
 
-DI+ vs DI− (4h) is a **mandatory gate** — always required, not scored. The 4 remaining factors are scored:
-1h structure, 4h structure, 1d structure, 1h EMA50 vs EMA200.
+DI+/DI− (4h) is a **mandatory gate** — always required, not scored.
+The 4 remaining factors scored: 1h structure, 4h structure, 1d structure, 1h EMA50 vs EMA200.
 
 | Direction | Condition | Scored factors needed |
 |---|---|---|
 | BUY | Normal vol | DI bull + 3/4 |
 | BUY | HIGH vol | DI bull + 2/4 |
+| BUY | Recovery mode | DI bull + 2/4 |
 | SELL | Normal vol | DI bear + 4/4 (all) |
 | SELL | HIGH vol | DI bear + 3/4 |
-| SELL (bear mode) | Normal vol | DI bear + 3/4 (−1 from SELL baseline) |
-| SELL (bear mode) | HIGH vol | DI bear + 2/4 (−1 from SELL baseline) |
+| SELL | Bear mode | DI bear + 3/4 normal vol, 2/4 HIGH vol (−1 from baseline) |
 
-SELL is one step harder than BUY — mixed/bullish regimes produce false sells.
-Bear mode reduces SELL threshold by 1: 1d structure lags in early crash phases.
+SELL is one step harder — mixed regimes produce false shorts.
+Recovery 2/4: structure is forming, not yet confirmed across all timeframes.
+Bear −1: 1d structure lags in early crash phases.
+
+---
+
+## Key Design Decisions
+
+Non-obvious choices and the reasons behind them. Read before changing thresholds.
+
+**Subprocess isolation (Plans 21-22)**
+Python cannot free imported library RAM. Subprocess exits return pages to OS.
+ccxt (58 MB) replaced with direct REST HTTP — zero marginal cost since requests is already resident.
+Main process stays at ~33 MB; worker's ~73 MB import cost is paid once per scan then freed.
+
+**_RUN_CACHE per-pair eviction (Plan 25)**
+`del df_x` only removes the local reference — `_RUN_CACHE[key]` still holds the DF.
+Without `_RUN_CACHE.pop()` in the `finally` block, all 30×4 DataFrames accumulate during Stage B.
+Fix: pop each pair's 4 TF entries in `finally` immediately after processing.
+
+**Median vol_ma instead of mean (Plan 11)**
+Crash/bounce spikes inflate `rolling(20).mean()` so badly that normal candles show 0.07× vol_ma,
+blocking all volume gates. Median of 20 is immune to up to 9 spike candles — correct for right-skewed data.
+
+**BTC macro gate 1.5% threshold (Plan 24)**
+Hard block at any ema50<ema200 caused zero signals at 0.27% separation ($216 on $78K BTC — noise).
+Now requires `ema50 < ema200 * 0.985`. True bear (2–10%+ below) still blocked.
+
+**Recovery mode HTF 2/4 (Plan 24)**
+3/4 is a fully-trending market requirement. In recovery, price rises but structure hasn't formed
+consistent higher-highs across 1h/4h/1d yet. Pairs correctly score 2/4 (EMA + one TF). 3/4 was impossible.
+
+**BB squeeze AND coil both required (Plan 20)**
+Either alone is weak. Both together confirm compression before the breakout.
+High-vol regime skips both — crash/breakout markets don't consolidate first.
+
+**0.3×ATR minimum breakout distance (Plan 23)**
+Micro tick-above (close > prev_high by 1 tick) is ~80% fakeout. 0.3×ATR = real velocity.
+Consistent with OB bypass threshold (same value). Also used in breakout invalidation check.
+
+**TP1 capped at 2.0×ATR (Plan 23)**
+Structural TP1 at 2.5–3R meant the trade consumed all momentum reaching 1:1 and BE activated —
+then had 1.5–2R more to travel before any partial close. 48 BE wins from this pattern.
+2.0×ATR cap = only 1 ATR remaining after 1:1 BE → achievable. Original swing becomes TP2.
+
+**1:1 BE activation (Plan 15)**
+Code documented "1:1 → breakeven" but originally only set BE at TP1. INJ case: MFE=1.2R,
+price crossed 1:1 then reversed to full LOSS at 1.78h. BE at 1:1 converts this to BE_WIN.
+
+**SL minimum 0.5×ATR (Plan 15)**
+Below this = sub-noise stop. Standard floor across all entry types (trend, reversal, bounce).
+
+**Confidence floor 55/65 (Plan 20)**
+Low-confidence signals fired at 1% risk but hit SL at high rates — wrong.
+Floor prevents them from being sent at all. Off-peak (08-17 UTC) raises to 65.
+
+**Position sizing from confidence (Plan 18)**
+conf/100 × 2% scales base risk. Stars 1–5 = 1%–3% base risk. RR bonus on top. Hard cap 5%.
+
+**Bounce disabled in pullback path (Plan 20)**
+Backtest showed −0.062R expectancy. `elif trend_ok: return None` is intentional.
+
+**Pending expiry 1h trend / 3h bounce (Plan 13)**
+Was 24h — stale signals from dead moves consumed all capacity slots for hours.
 
 ---
 
@@ -770,442 +262,93 @@ Bear mode reduces SELL threshold by 1: 1d structure lags in early crash phases.
 
 | Version | Grade | Key addition |
 |---|---|---|
-| Original | 7.5/10 | Base strategy |
-| After Plan 2–3 | 8.0/10 | Volume-based discovery, stablecoin filter |
-| After Plan 4–5 | 8.8/10 | BB squeeze, tiered TP, adaptive params, mid-cap focus |
-| After Plan 6–7 | 9.0/10 | Futures fixed, backtest engine |
-| After Plan 8 | 9.2/10 | Bear/recovery/normal market mode, sell trend fix, HTF bias bypass |
-| After Plan 12 | 9.4/10 | Support bounce entry, StochRSI OB bypass, median vol_ma, TP2-primary RR gating |
-| After Plan 13 | 9.4/10 | Bounce SL bugs fixed, pullback TP structural, pending expiry 1h |
-| After Plan 14 | 9.5/10 | Recovery bounce: AND gate, wider SL (0.5×ATR), candle mandatory |
-| After Plan 15 | 9.6/10 | 1:1 BE implemented, SL floor 0.5×ATR consistent, ATR cap 3.0 |
-| After Plan 16 | 9.7/10 | BTC 4h EMA50/EMA200 macro gate — BUY trend/reversal blocked in downtrend |
-| After Plan 17 | 9.8/10 | Session gate 20–23 UTC (+0.183R vs −0.092R outside), bounce/range disabled |
-| After Plan 18 | 9.9/10 | Signal confidence score 1–5 stars: position sizing scales with confidence |
-| After Plan 19 | 9.9/10 | KuCoin spot restored, 3-tier session gate, entry_hit bug fix |
-| After Plan 20 | 9.9/10 | Quality gate conf ≥ 55 to fire, BB+coil AND restored, BTC block restored, bounce/micro disabled |
-| After Plan 21 | 9.9/10 | Subprocess isolation: ccxt/pandas/numpy freed after each scan, idle −73% |
-| After Plan 22 | 9.9/10 | ccxt removed from worker (direct HTTP), psycopg2 replaces sqlalchemy: −69% billing |
-| After Plan 23 | 9.9+/10 | Fakeout filter: 0.3×ATR min breakout, TP1 cap 2.0×ATR, breakout-invalidation gate |
+| Plans 1-3 | 8.0/10 | Volume-based discovery, stablecoin filter, $2M gate |
+| Plans 4-5 | 8.8/10 | BB squeeze/coil, tiered TP, adaptive regime params |
+| Plans 6-7 | 9.0/10 | MEXC futures fixed, backtest engine |
+| Plans 8-14 | 9.5/10 | Bear/recovery/normal mode, bounce entry, bounce bug fixes |
+| Plans 15-17 | 9.7/10 | 1:1 BE, ATR cap 3.0, BTC macro gate, session gate |
+| Plans 18-20 | 9.9/10 | Confidence score + quality gate conf≥55, bounce/micro disabled |
+| Plans 21-22 | 9.9/10 | Subprocess isolation (−73% idle RAM), ccxt→HTTP, psycopg2 (−69% billing) |
+| Plan 23 | 9.9+/10 | Fakeout filter 0.3×ATR, TP1 cap 2.0×ATR, breakout-invalidation gate |
+| Plan 24 | 9.9+/10 | BTC gate 1.5% threshold, recovery HTF 2/4 — zero-signal deadlock fixed |
+| Plan 25 | 9.9+/10 | _RUN_CACHE per-pair eviction — peak worker RAM N×4 DFs → ~4 DFs |
 
-**Gap to 10/10:** Live order execution (currently manual alerts), account balance auto-sync, minimum order value check.
+**Gap to 10/10:** Live order execution (currently manual alerts), account balance auto-sync, min order value check.
 
 ---
 
-## Plan 18 — Signal Confidence Score
+## Plan 23 — Fakeout Filter + Tighter TP1
 
-**Goal:** Attach a 1–5 star confidence rating to every signal so the trader can see how much the bot trusts the setup, and track whether high-confidence signals produce better outcomes.
+**Problem:** W:20 BE:48 L:80 (148 trades). Two root causes:
 
-**Changes: `strategy.py`, `performance.py`, `bot.py`**
+1. **80 direct losses (54%)** — trend entries fire when `close > prev_high` by any margin. 1-tick poke = qualifies. These micro-breakouts ~80% fakeout and reverse immediately. Worse: pending entry (`price ≤ entry×1.003`) fires on the way DOWN when a breakout is failing — bot enters a falling knife.
 
-### How confidence is computed (`strategy.py` — `compute_confidence()`)
+2. **48 BE wins** — structural TP1 at 2.5–3R from entry. After 1:1 BE at `entry+risk`, TP1 is still 1.5–2R away. Trade consumed its momentum getting to 1:1, never reached TP1.
 
-Four layers, 25 pts each, total 0–100 → stars:
-
-| Layer | What it measures | Max |
-|---|---|---|
-| Macro | `market_mode` + BTC EMA50/EMA200 alignment with signal direction | 25 |
-| Structure | DI gap in signal direction + HTF factor count (same 4 factors as `get_htf_bias`) | 25 |
-| Entry | ADX excess over adaptive minimum + volume ratio + trade type gate count | 25 |
-| Setup | RR excess over adaptive minimum + TP2 existence + SL distance vs ATR | 25 |
-
-**Star thresholds:** 80+ = ⭐⭐⭐⭐⭐ · 65–79 = ⭐⭐⭐⭐ · 50–64 = ⭐⭐⭐ · 35–49 = ⭐⭐ · <35 = ⭐
-
-No new metrics are introduced — all inputs come from values the bot already computed to fire the signal.
-
-### Position sizing update (`bot.py` — `calc_position_size()`)
-
-Confidence now drives base risk. RR bonus still applies on top:
-
-| Stars | Base risk | RR 2.0 | RR 3.5 |
-|---|---|---|---|
-| ⭐ | 1.0% | 1.0% | 1.2% |
-| ⭐⭐ | 1.5% | 1.5% | 1.7% |
-| ⭐⭐⭐ | 2.0% | 2.0% | 2.2% |
-| ⭐⭐⭐⭐ | 2.5% | 2.5% | 2.8% |
-| ⭐⭐⭐⭐⭐ | 3.0% | 3.0% | 3.2% |
-
-Hard cap remains 5%. Previously only RR drove size (base fixed at 2%).
-
-### Telegram signal format
-
-```
-RR      1 : 3.2
-Conf    ★★★★☆
-```
-
-One line, no breakdown.
-
-### DB schema (`performance.py`)
-
-- `confidence INTEGER` column added to `trades` and `pending_trades` tables via `ALTER TABLE IF NOT EXISTS`
-- Stored as 1–5, passed through `save_trade()` and the pending→live transition in `check_pending_trades()`
-
-### `/stats` tracking
-
-After 5+ closed trades with confidence data, `/stats` appends:
-```
-By confidence:
-  ★★★★★  WR 65%  +0.38R  (n=11)
-  ★★★★   WR 52%  +0.18R  (n=19)
-  ...
-```
-
----
-
-## Plan 19 — Signal Recovery (5 Fixes)
-
-**Problem:** Signal generation had collapsed to near-zero due to compounding over-restriction across Plans 16–17. All-time: W:9 BE:19 L:31 (+0.655R expectancy) — edge exists but bot barely trades.
-
-**Root causes identified:**
-1. Session gate (20–23 UTC only) blocked 83% of the day
-2. BB squeeze AND coil both required — extremely rare simultaneous occurrence  
-3. KuCoin spot silently dropped from `get_pairs()` — half the candidate universe gone
-4. Bounce disabled in pullback path (`elif trend_ok: return None`)
-5. BTC macro gate hard-blocked ALL BUY signals when EMA50 < EMA200
-
----
-
-### Fix 1 — Session gate: 3-tier model (`bot.py`)
-
-**Before:** signals only 20–23 UTC  
-**After:**
-```
-00–07 UTC: blocked (deep Asia, thin liquidity)
-08–17 UTC: filtered — confidence ≥ 60 required (EU/US overlap, quality-gated)
-18–23 UTC: full — all signals (premium window unchanged)
-```
-Sleep interval: 5 min (18–23), 10 min (08–17), 15 min (00–07).
-
----
-
-### Fix 2 — BB squeeze: AND → OR (`strategy.py — entry_signal_trend()`)
-
-**Before:** BB squeeze AND consolidation coil both required  
-**After:** BB squeeze OR consolidation coil (either proves compression before the breakout)
-
-Also updated rejection log to report `"no squeeze/coil"` as a single gate.
-
----
-
-### Fix 3 — KuCoin spot restored (`bot.py — get_pairs()`)
-
-Added KuCoin spot scan (top 50) alongside MEXC futures (top 50). Combined pool scored by momentum, best 30 returned. Spot signals use raw units (no contracts/leverage/funding in message). `entry_hit()` extended to handle pullback/micro/range/fade trade types (were silently returning False — pending trades for these types would expire without ever triggering).
-
----
-
-### Fix 4 — Bounce re-enabled at 2/3 confirmations (`strategy.py`)
-
-**`entry_signal_bounce()` — BUY and SELL:**
-- Before: 1 of 3 confirmations required (candle OR stoch OR MACD)
-- After: `sum([conf_candle, conf_rsi, conf_macd]) >= 2` for BUY; `sum([conf_candle, conf_rsi, conf_macd and stoch_k > 55]) >= 2` for SELL
-
-**`generate_pullback_signal()` — `elif trend_ok` branch:**
-- Before: `return None` (disabled)
-- After: calls `entry_signal_bounce()` with the 2/3 requirement
-
----
-
-### Fix 5 — BTC macro gate: hard block → confidence penalty (`strategy.py`)
-
-**Before:** BTC EMA50 < EMA200 → `reversal = None` + `return None` for all BUY signals  
-**After:** Print log only (`"BTC 4h EMA50<EMA200 (confidence penalized)"`) — no hard block
-
-`compute_confidence()` Layer 1 already gives 0/25 macro points when BTC misaligned with direction (vs 18/25 when aligned), effectively reducing these signals by 1–2 stars and sizing them smaller. The hard block was redundant.
-
----
-
-## Plan 20 — Signal Quality Gate
-
-**Problem:** Plan 19 went in the wrong direction — it increased signal quantity. The actual issue is signal accuracy (W:9 BE:19 L:31 all-time, too many losses).
-
-**Core insight:** The confidence score (0–100) existed only as a sizing tool — a 25-conf signal still fired at 1% risk. That's wrong. Low-confidence signals should not fire at all.
-
-**Changes:**
-
-### Confidence floor — ALL sessions (`bot.py`)
+**Fix 1 — Minimum breakout distance 0.3×ATR** (`strategy.py — entry_signal_trend()`):
 ```python
-if conf < 55:
-    # discard — not enough confluence across macro/structure/entry/setup
-    continue
-if _session_filtered and conf < 65:
-    # off-peak (08-17 UTC): raise bar further
-    continue
-```
-
-### BB squeeze AND coil restored (`strategy.py — entry_signal_trend()`)
-Reverted Plan 19 Fix 2. Both compression signals required — either alone is weaker evidence.
-
-### BTC hard block restored (`strategy.py — generate_filtered_signal()`)
-Reverted Plan 19 Fix 5. `reversal = None` and `return None` both restored. Alts follow BTC down — blocking BUY in confirmed BTC downtrend prevents systematic losses.
-
-### Bounce disabled (`strategy.py — generate_pullback_signal()`)
-Reverted Plan 19 Fix 4. `elif trend_ok: return None` restored. Backtest: −0.062R expectancy.
-
-### Micro trend disabled (`strategy.py — generate_pullback_signal()`)
-Both micro calls removed (ranging-ADX path and EMA-flat path). Micro has 1.2R minimum RR — lowest bar of any entry type. Not aligned with preferred profile (strong ADX, clean structure, RSI mid-range).
-
----
-
-## Plan 21 — Subprocess Memory Isolation
-
-**Problem:** `bot.py` imported ccxt, pandas, numpy, and strategy at startup and kept them in RAM permanently — including during idle periods between scans. Measured idle RSS: ~158 MB constant.
-
-**Root cause:** A single long-running process cannot free library memory between tasks. The OS only reclaims pages on process exit.
-
-**Solution:** Four strategies applied across a full architectural rewrite.
-
-### New files
-
-| File | Role |
-|---|---|
-| `screener_worker.py` | Isolated subprocess: loads heavy libs, runs full scan, writes JSON, exits |
-| `db.py` | Hot-path DB layer — psycopg2/sqlalchemy, no pandas. Used every cycle. |
-
-### Modified files
-
-**`bot.py`** — rewritten as lightweight orchestrator:
-- Imports at startup: `requests`, `psycopg2`, `sqlalchemy` (via db.py), `logger` — no ccxt/pandas/numpy
-- Spawns `screener_worker.py` via `subprocess.run([sys.executable, WORKER_SCRIPT, tmp_path], timeout=240)`
-- Reads JSON result, processes signals, manages pending trades — all without heavy libs
-- `get_price()` replaced with direct `requests.get()` to KuCoin/MEXC REST APIs (Strategy 2)
-
-**`performance.py`** — stripped to stats-only:
-- Removed: `save_trade`, `check_trade_results`, `save_pending_trades`, `load_pending_trades`, `get_daily_losses`, `get_compounded_balance` → all moved to `db.py`
-- Kept: `get_stats_summary()`, `daily_report()` — lazy-imported once daily, acceptable one-time pandas load
-
-### Strategy 1 — Subprocess isolation (`screener_worker.py`)
-- Worker spawned with `subprocess.run()`, timeout=240s
-- `tempfile.mkstemp()` for temp JSON path (not deprecated `mktemp`)
-- `try/finally: os.unlink(tmp_path)` guarantees cleanup on timeout or exception
-- `_NumpyEncoder` handles numpy int/float/ndarray types in JSON output
-
-### Strategy 2 — Replace library calls with HTTP (`bot.py`)
-- `get_price()`: `requests.get()` to KuCoin `/api/v1/market/stats` and MEXC `/api/v1/contract/ticker`
-- Funding rate: `requests.get()` to MEXC `/api/v1/contract/funding_rate/{symbol}`
-- Zero ccxt/pandas in main process idle path
-
-### Strategy 3 — Explicit cleanup inside loops (`screener_worker.py`)
-- Variables initialised to `None` before every `try` block
-- `del df_15m, df_1h, df_4h, df_1d` in `finally` (not just `except`) — runs on `continue`, exception, and normal exit
-- `gc.collect()` every 10 pairs in Phase 1; after worker exit in main process
-- Phase 2 uses `all_data.pop(symbol)` so each pair's DataFrames are freed immediately after processing
-
-### Strategy 4 — Clear cached data after use (`screener_worker.py`)
-- `spot.markets = {}; del spot_raw` after extracting needed fields from `load_markets()`
-- `del tickers` after pool is built in `_get_liquid_active_pool()`
-- `spot_ex.last_response_headers = None` after Phase 1
-- `breadth_data.clear()` after market mode computed
-- `MARKET_DATA.clear(); _RUN_CACHE.clear()` before writing output JSON
-
-### RSS measurements (logged every scan)
-
-```
-[worker] RSS before imports:  8,500 kB
-[worker] RSS after imports:   109,300 kB  (+100,800 kB)
-[worker] RSS after scan:      119,700 kB  (delta +10,400 kB)
-[main]   RSS: 42,000 → 42,200 kB (delta +200 kB after worker exit)
-[main]   RSS idle: 42,100 kB — sleeping 5 min [premium]
-```
-
-**Result:** Main process idle: **42 MB** (was 158 MB). −73% idle RAM.
-
-**Billing model (MB·h/day):**
-- Old bot constant 158 MB: 3,792 MB·h
-- After Plan 21: 1,608 MB·h — **−58%**
-
----
-
-## Plan 22 — ccxt Removal + psycopg2
-
-**Problem:** Worker subprocess still imported ccxt (58 MB) even though ccxt was only used for `fetch_ohlcv` and `fetch_tickers` — thin wrappers around public REST endpoints. Main process used sqlalchemy (19 MB) when psycopg2 (10 MB) covers all its needs.
-
-**Key measurement:** Once a library is imported in a subprocess, Python's allocator does not return those pages to the OS even after `del + gc.collect()`. The only way to reduce RSS is to never import the library in the first place.
-
-### ccxt removed from `screener_worker.py`
-
-Replaced with direct HTTP via `requests` (already resident — zero marginal cost):
-
-| ccxt call | Replacement |
-|---|---|
-| `kucoin.fetch_tickers()` | `GET api.kucoin.com/api/v1/market/allTickers` |
-| `kucoin.fetch_ohlcv(sym, tf)` | `GET api.kucoin.com/api/v1/market/candles` |
-| `mexc.fetch_tickers()` | `GET contract.mexc.com/api/v1/contract/ticker` |
-| `mexc.fetch_ohlcv(sym, tf)` | `GET contract.mexc.com/api/v1/contract/kline/{sym}` |
-
-Rate limiter: separate 120ms gap per exchange (8 req/s each) — well within public endpoint limits. Uses a shared `requests.Session()` to reuse TCP connections.
-
-KuCoin response quirk: columns are `[time_s, open, close, high, low, vol, turnover]` in descending order — reversed and reordered to standard `[ts_ms, open, high, low, close, vol]`.
-
-`load_markets()` also removed — market info (min_qty, contract_size) replaced with hardcoded defaults (`0.001` spot, `1` futures) matching the existing fallback values.
-
-### Breadth + BTC macro: pure-Python EMA
-
-Stage A (market mode) and BTC macro no longer call `apply_indicators()`. Instead:
-
-```python
-def _ema_py(closes, period):
-    k = 2.0 / (period + 1)
-    ema = closes[0]
-    for c in closes[1:]:
-        ema = c * k + ema * (1 - k)
-    return ema
-```
-
-Fetches raw OHLCV (list of lists), extracts close prices, computes EMA50/EMA200, discards the list. No DataFrame allocated. 31 pairs × ~0 MB retained vs 31 `apply_indicators()` calls.
-
-### Two-stage scan structure
-
-- **Stage A (breadth + BTC):** pure Python EMA on raw close lists — no DataFrames, minimal RAM
-- **Stage B (signals):** one pair at a time using `all_data.pop(symbol)` — DataFrames freed after each pair
-
-### psycopg2 replaces sqlalchemy in `db.py` and `bot.py`
-
-- `db.py`: all SQL uses `%(param)s` style; `psycopg2.extras.RealDictCursor` for dict-like row access
-- `bot.py`: `_fetchone`/`_fetchall` rewritten with psycopg2 directly; `from sqlalchemy import text` removed
-- `get_engine()` shim kept in `db.py` for `performance.py`'s `pd.read_sql()` calls
-
-### RSS measurements
-
-```
-Subprocess WITHOUT ccxt:  72,600 kB  (was 109,300 kB — saves 36,700 kB)
-Main process idle:         33,000 kB  (was 42,000 kB — saves 9,000 kB)
-```
-
-**Billing model (MB·h/day):**
-
-| Scenario | MB·h/day | vs original |
-|---|---|---|
-| Old bot (158 MB constant) | 3,792 | — |
-| After Plan 21 (subprocess) | 1,608 | −58% |
-| After Plan 22 (no ccxt + psycopg2) | 1,194 | **−69%** |
-
-Hard floor: subprocess cannot go below ~73 MB while `strategy.py` requires pandas for `apply_indicators()`.
-
----
-
-## Plan 23 — Fakeout Filter + Tighter TP1 (Loss Rate Fix)
-
-**Problem:** All-time W:20 BE:48 L:80 (148 trades). Two root causes identified from the data:
-
-**Root cause 1 — 80 direct losses (54%):** Trend entries fire when `close > prev_high` by ANY margin. A 1-tick poke above qualifies. These micro-breakouts are ~80% fakeouts that immediately reverse. Worse: the pending entry (`price ≤ entry × 1.003`) fires on the way DOWN when a breakout is failing — the bot enters a falling knife.
-
-**Root cause 2 — 48 BE wins (71% of 1:1 hits never completing):** TP1 was the nearest 1h structural swing level, typically 2.5–3R from entry. After 1:1 BE activates at `entry + risk`, TP1 is still 1.5–2R away. At risk = 1.0 ATR, that's 1.5–2 more ATR needed from 1:1 — too far for most moves. The trade has already consumed its momentum to get to 1:1.
-
-Expectancy math confirmed: avg win = 3.7R (edge exists), but 54% of trades never reach 1:1 at all.
-
-**Changes: `strategy.py`, `screener_worker.py`, `bot.py`**
-
-### Fix 1 — Minimum breakout distance: 0.3×ATR (`strategy.py — entry_signal_trend()`)
-
-```python
-# BUY: added after last['close'] > prev['high'] check
 if (last['close'] - prev['high']) < 0.3 * atr:
-    return None   # marginal tick-above — fakeout
-
-# SELL: added after last['close'] < prev['low'] check
+    return None   # BUY fakeout
 if (prev['low'] - last['close']) < 0.3 * atr:
-    return None
+    return None   # SELL fakeout
 ```
 
-0.3×ATR = the same threshold already used in the OB bypass check (empirically: momentum that exceeds this shows real velocity). Applied universally. OB bypass simplified since breakout distance is now guaranteed.
-
-### Fix 2 — TP1 at 2.0×ATR cap, fires at 2.0R (`strategy.py — entry_signal_trend()`)
-
+**Fix 2 — TP1 capped at 2.0×ATR** (`strategy.py`):
 ```python
 _ATR_TP_MULT = 2.0   # was 2.5
 _ATR_CAP_RR  = 2.0   # was 3.0
 ```
+When cap fires, TP2 = next swing BEYOND the original structural target (not the structural target itself).
+TP2 rescue floor: `rr < 1.2` (was 1.5) — ATR-capped TP1 is intentionally tighter than rr_min.
 
-Effect at typical risk = 1.0 ATR:
-- 1:1 BE: entry + 1.0 ATR
-- TP1 (capped): entry + 2.0 ATR → only **1.0 ATR more** after BE → very achievable
-- Was: TP1 (structural) at 2.5–3R → 1.5–2R after BE → usually reversed before reaching it
+**Fix 3 — Breakout invalidation gate** (`screener_worker.py`, `bot.py`):
+Worker records `entry_valid_above` (prev_high for BUY) / `entry_valid_below` (prev_low for SELL).
+`check_pending_trades()` removes BUY if `price < entry_valid_above × 0.997` — failed breakout.
 
-When cap fires, TP2 is set to `second_resistance(df_1h, structural_tp1)` (the level BEYOND the original structural target), not the structural target itself — this preserves a runner target at the right distance.
+---
 
-TP2 rescue floor relaxed: `rr < 1.5` → `rr < 1.2` (trend entries only), because ATR-capped TP1 is intentionally tighter than rr_min; the structural TP2 provides the full R target.
+## Plan 24 — Signal Unblocking
 
-### Fix 3 — Breakout invalidation gate (`screener_worker.py`, `bot.py`)
+**Problem:** Zero signals for days. Balance $15.00 → $8.27.
 
-`screener_worker.py`: For trend signals, records the breakout level (`prev['high']` for BUY, `prev['low']` for SELL) as `entry_valid_above`/`entry_valid_below` in the signal JSON.
+**Root cause 1 — BTC gate blocked 100% of BUY at 0.27% separation**
+`BTC 4h: EMA50=77963 EMA200=78179 (bearish sep=0.27%)` → hard block on all BUY signals.
+NEAR (ADX 80.9), HYPE (ADX 76.7), WLD (ADX 71.4), LLYSTOCK (ADX 82.8) all blocked by $216 gap on $78K BTC.
 
-`bot.py — check_pending_trades()`: Before entry trigger check:
+**Fix** (`screener_worker.py — _check_btc_macro()`):
 ```python
-if eva and trade["signal"] == "BUY" and price < eva * 0.997:
-    # Price has fallen >0.3% below the breakout level — breakout failed.
-    # Remove signal; entering here = buying a failed breakout on the way down.
-    continue   # not added to updated → expired
+downtrend = ema50 < ema200 * 0.985   # >1.5% below required (was: any gap)
 ```
 
-This is the "falling knife" fix: pending BUY entries that would have triggered as price falls through the entry level (failed breakout) are now removed instead of filled.
+**Root cause 2 — RECOVERY mode required 3/4 HTF, max achievable was 2/4**
+Pairs scored: DI=bull (mandatory) + EMA50>200 (+1) + one bullish structure TF (+1) = 2/4.
+Failed the 3/4 gate that requires a fully-trending market.
 
-### Expected impact
-
-| Metric | Before | After (estimated) |
-|---|---|---|
-| Direct losses (54%) | 80 | 45–55 (-30–40%) |
-| BE wins | 48 | 30–35 (more converting to TP1 hits) |
-| Win rate | 45.9% | 50–55% |
-| Expectancy | +0.363R | +0.5–0.7R |
-
-Estimation basis: 0.3×ATR gate filters ~30–40% of the fakeout breakouts; tighter TP1 converts the "correct direction but too far to complete" BE trades into TP1 hits.
-
----
-
-## Plan 24 — Signal Unblocking (BTC Gate Threshold + Recovery Confluence)
-
-**Root causes identified from live logs (2026-05-22):**
-
-Zero signals generated for 2+ hours straight. Two stacked filters created a deadlock:
-
-**Root cause 1 — BTC gate blocking 100% of BUY signals at 0.27% separation**
-`BTC 4h: EMA50=77963 EMA200=78179 (bearish sep=0.27%)` — only 0.27% difference triggered a hard block on every single BUY signal. NEAR (ADX 80.9), HYPE (ADX 76.7), WLD (ADX 71.4), LLYSTOCK (ADX 82.8), and 10+ more strong setups were all blocked by less than $220 gap on a $78K Bitcoin. This is market noise, not a confirmed downtrend.
-
-**Root cause 2 — RECOVERY mode requires 3/4 HTF confluence, max achievable is 2/4**
-Pairs that passed BTC gate still failed "HTF bias DI=bull, score <3/4 [RECOVERY]". In recovery phase, price is rising but structure hasn't formed consistent higher-highs across all 3 timeframes yet — that's the definition of recovery. Pairs with `DI=bull` and `ema50>ema200` were scoring 2/4 (EMA +1, one structure TF +1) and failing a 3/4 gate that was designed for a fully-trending market.
-
-**Result: balance $15.00 → $8.27 while the bot generates zero signals for days.**
-
----
-
-### Fix 1 — BTC macro gate: add 1.5% threshold (`screener_worker.py`)
-
+**Fix** (`strategy.py — get_htf_bias()`):
 ```python
-# Before:
-return {"downtrend": ema50 < ema200, ...}
-
-# After:
-downtrend = ema50 < ema200 * 0.985   # only confirmed downtrend when >1.5% below
-return {"downtrend": downtrend, ...}
-```
-
-0.27% → not downtrend → BUY signals unblocked.
-True bear market (BTC EMA50 2-10%+ below EMA200) → still blocked.
-
----
-
-### Fix 2 — HTF confluence: recovery mode BUY threshold 3/4 → 2/4 (`strategy.py`)
-
-```python
-# Before:
-buy_threshold = 2 if params and params.get("high_vol") else 3
-
-# After:
 if params and params.get("high_vol"):
     buy_threshold = 2
 elif market_mode == "recovery":
-    buy_threshold = 2   # structure forming, not yet fully confirmed
+    buy_threshold = 2   # structure forming, not confirmed
 else:
     buy_threshold = 3
 ```
 
-In recovery: DI=bull (mandatory) + EMA50>EMA200 + one structure timeframe bullish = 2/4 → sufficient.
-
 ---
 
-### Expected outcome
+## Plan 25 — _RUN_CACHE Per-Pair Eviction
 
-Pairs like INTCSTOCK, FILECOIN, UNI, ORCLSTOCK that had `DI=bull, score <3/4` will now pass HTF gate. Pairs like NEAR, HYPE, WLD, ONDO that were blocked by BTC macro will now proceed through the full signal pipeline.
+**Problem:** `del df_15m, df_1h, df_4h, df_1d` in Stage B `finally` block only removes local references.
+`_RUN_CACHE[key]` still holds each DataFrame — all 30 pairs × 4 TFs accumulate simultaneously.
+Peak worker RAM: N×4 DataFrames held at once instead of ~4.
 
-Bot rating: 9.9+/10 — no change to signal quality, removing a false blocking condition.
+**Fix** (`screener_worker.py — Stage B finally block`):
+```python
+finally:
+    del df_15m, df_1h, df_4h, df_1d
+    for _tf in ("15m", "1h", "4h", "1d"):
+        _RUN_CACHE.pop(f"{symbol}_{_tf}_{market_type}", None)
+```
+
+Each pair's DataFrames are now eligible for GC immediately after processing.
+`_RUN_CACHE.clear()` at end of Stage B retained as a safety net.
