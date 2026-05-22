@@ -23,9 +23,10 @@ backtest.py          — Walk-forward validation engine (runs locally, not on Ra
 ```
 
 ### RAM Profile
-- Main process idle: ~33 MB (no ccxt/pandas/numpy)
+- Main process idle: ~42 MB before first daily_report; ~105 MB after (pandas loaded by
+  daily_report on first startup cycle and never unloaded — Python does not unload modules)
 - Worker at import: ~73 MB | after scan: ~83 MB | freed fully on exit
-- Billing: ~1,194 MB·h/day (was 3,792 MB·h — **−69%**)
+- Billing: ~1,480 MB·h/day (was 3,792 MB·h — **−61%**)
 
 ### Running
 
