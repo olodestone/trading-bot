@@ -14,9 +14,10 @@ from datetime import datetime
 import psycopg2
 import psycopg2.extras
 
-DATABASE_URL  = os.getenv("DATABASE_URL", "")
-TRADES_TABLE  = "trades"
-PENDING_TABLE = "pending_trades"
+DATABASE_URL      = os.getenv("DATABASE_URL", "")
+TRADES_TABLE      = "trades"
+PENDING_TABLE     = "pending_trades"
+SIGNAL_LOG_TABLE  = "signal_log"
 
 
 def _conn():
@@ -82,7 +83,11 @@ def ensure_tables():
                     trade_type TEXT, atr FLOAT, queued_at TEXT, confidence INTEGER
                 )
             """)
-            for col, typedef in [("tp2", "FLOAT"), ("confidence", "INTEGER")]:
+            for col, typedef in [
+                ("tp2",           "FLOAT"),
+                ("confidence",    "INTEGER"),
+                ("signal_log_id", "INTEGER"),
+            ]:
                 try:
                     cur.execute(
                         f"ALTER TABLE {PENDING_TABLE} "
@@ -141,24 +146,26 @@ def save_pending_trades(pending_trades):
                 cur.execute(f"""
                     INSERT INTO {PENDING_TABLE}
                       (pair, signal, entry, sl, tp, tp2, rr, market_type,
-                       trade_type, atr, queued_at, confidence)
+                       trade_type, atr, queued_at, confidence, signal_log_id)
                     VALUES
                       (%(pair)s, %(signal)s, %(entry)s, %(sl)s, %(tp)s,
                        %(tp2)s, %(rr)s, %(market_type)s,
-                       %(trade_type)s, %(atr)s, %(queued_at)s, %(confidence)s)
+                       %(trade_type)s, %(atr)s, %(queued_at)s, %(confidence)s,
+                       %(signal_log_id)s)
                 """, {
-                    "pair":       t["pair"],
-                    "signal":     t["signal"],
-                    "entry":      t["entry"],
-                    "sl":         t["sl"],
-                    "tp":         t["tp"],
-                    "tp2":        round(tp2, 8) if tp2 is not None else None,
-                    "rr":         t["rr"],
-                    "market_type": t["market_type"],
-                    "trade_type": t.get("trade_type", "trend"),
-                    "atr":        float(t.get("atr", 0.0)),
-                    "queued_at":  t["time"].isoformat(),
-                    "confidence": int(t.get("confidence", 50)),
+                    "pair":          t["pair"],
+                    "signal":        t["signal"],
+                    "entry":         t["entry"],
+                    "sl":            t["sl"],
+                    "tp":            t["tp"],
+                    "tp2":           round(tp2, 8) if tp2 is not None else None,
+                    "rr":            t["rr"],
+                    "market_type":   t["market_type"],
+                    "trade_type":    t.get("trade_type", "trend"),
+                    "atr":           float(t.get("atr", 0.0)),
+                    "queued_at":     t["time"].isoformat(),
+                    "confidence":    int(t.get("confidence", 50)),
+                    "signal_log_id": t.get("signal_log_id"),
                 })
         conn.commit()
 
@@ -181,19 +188,21 @@ def load_pending_trades():
             queued_at = datetime.utcnow()
         tp2_raw  = row.get("tp2")
         conf_raw = row.get("confidence")
+        slid_raw = row.get("signal_log_id")
         trades.append({
-            "pair":       row["pair"],
-            "signal":     row["signal"],
-            "entry":      float(row["entry"]),
-            "sl":         float(row["sl"]),
-            "tp":         float(row["tp"]),
-            "tp2":        float(tp2_raw) if tp2_raw is not None else None,
-            "rr":         row["rr"],
-            "market_type": row["market_type"],
-            "trade_type": row["trade_type"],
-            "atr":        float(row["atr"]),
-            "time":       queued_at,
-            "confidence": int(conf_raw) if conf_raw is not None else 50,
+            "pair":          row["pair"],
+            "signal":        row["signal"],
+            "entry":         float(row["entry"]),
+            "sl":            float(row["sl"]),
+            "tp":            float(row["tp"]),
+            "tp2":           float(tp2_raw) if tp2_raw is not None else None,
+            "rr":            row["rr"],
+            "market_type":   row["market_type"],
+            "trade_type":    row["trade_type"],
+            "atr":           float(row["atr"]),
+            "time":          queued_at,
+            "confidence":    int(conf_raw) if conf_raw is not None else 50,
+            "signal_log_id": int(slid_raw) if slid_raw is not None else None,
         })
     return trades
 
@@ -413,3 +422,281 @@ def check_trade_results(get_price_func, send_telegram):
                         {**chg, "t": row_time, "p": row_pair}
                     )
             conn.commit()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SIGNAL LOG  (Plan 28 — full funnel tracking + direction accuracy)
+#
+# stage values:
+#   queued      — added to pending_trades (non-bounce signals)
+#   filled      — entry triggered (queued→filled) OR bounce (immediate fill)
+#   expired     — pending signal timed out before entry
+#   invalidated — breakout failed / late-entry guard / breakdown invalidated
+#   cancelled   — user /cancel'd the signal
+#
+# direction accuracy: dir_4h / dir_24h — was price higher (BUY) or lower (SELL)
+# than price_at_gen after 4h / 24h?  True = correct call.
+#
+# setup outcome (computed retroactively from OHLCV in report_worker):
+#   entry_reached  — did price reach the entry level (any candle's high/low)?
+#   tp1_reached    — did TP1 get hit after entry (before SL)?
+#   sl_reached     — did SL get hit after entry?
+#   setup_outcome  — 'win'|'loss'|'no_entry'|'ambiguous'|'open'|'executed'
+#                    'executed' = trade was filled (outcome tracked in trades table)
+#
+# trade_time links back to trades.time for filled signals (informational; no FK
+# because trades has no PK — query by pair + approximate timestamp if needed).
+# ──────────────────────────────────────────────────────────────────────────────
+def ensure_signal_log():
+    """Create signal_log table and indexes; add any missing columns via ALTER."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {SIGNAL_LOG_TABLE} (
+                    id            SERIAL PRIMARY KEY,
+                    generated_at  TEXT NOT NULL,
+                    pair          TEXT,
+                    signal        TEXT,
+                    trade_type    TEXT,
+                    entry         FLOAT,
+                    sl            FLOAT,
+                    tp            FLOAT,
+                    tp2           FLOAT,
+                    rr            FLOAT,
+                    atr           FLOAT,
+                    confidence    INTEGER,
+                    market_type   TEXT,
+                    session       TEXT,
+                    market_mode   TEXT,
+                    btc_downtrend BOOLEAN,
+                    stage         TEXT DEFAULT 'queued',
+                    price_at_gen  FLOAT,
+                    snap_4h       FLOAT,
+                    dir_4h        BOOLEAN,
+                    snap_24h      FLOAT,
+                    dir_24h       BOOLEAN,
+                    trade_time    TEXT,
+                    entry_reached BOOLEAN,
+                    tp1_reached   BOOLEAN,
+                    sl_reached    BOOLEAN,
+                    setup_outcome TEXT
+                )
+            """)
+            # Migrate existing tables: add new columns if missing
+            for col, typedef in [
+                ("entry_reached", "BOOLEAN"),
+                ("tp1_reached",   "BOOLEAN"),
+                ("sl_reached",    "BOOLEAN"),
+                ("setup_outcome", "TEXT"),
+            ]:
+                try:
+                    cur.execute(
+                        f"ALTER TABLE {SIGNAL_LOG_TABLE} "
+                        f"ADD COLUMN IF NOT EXISTS {col} {typedef}"
+                    )
+                except Exception:
+                    pass
+            cur.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_siglog_gen "
+                f"ON {SIGNAL_LOG_TABLE}(generated_at)"
+            )
+            cur.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_siglog_pair "
+                f"ON {SIGNAL_LOG_TABLE}(pair)"
+            )
+        conn.commit()
+
+
+def log_signal(pair, signal, trade_type, entry, sl, tp, tp2, rr, atr,
+               confidence, market_type, session, market_mode, btc_downtrend,
+               stage="queued", price_at_gen=None, trade_time=None):
+    """
+    Insert a signal into signal_log. Returns the new row id (int) or None.
+
+    stage='queued'  for signals added to pending_trades.
+    stage='filled'  for bounce signals (immediate fill, never queued).
+    """
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    INSERT INTO {SIGNAL_LOG_TABLE}
+                      (generated_at, pair, signal, trade_type,
+                       entry, sl, tp, tp2, rr, atr, confidence,
+                       market_type, session, market_mode, btc_downtrend,
+                       stage, price_at_gen, trade_time)
+                    VALUES
+                      (%(t)s, %(pair)s, %(sig)s, %(tt)s,
+                       %(entry)s, %(sl)s, %(tp)s, %(tp2)s,
+                       %(rr)s, %(atr)s, %(conf)s,
+                       %(mt)s, %(sess)s, %(mode)s, %(btc)s,
+                       %(stage)s, %(pgen)s, %(ttime)s)
+                    RETURNING id
+                """, {
+                    "t":     str(datetime.utcnow()),
+                    "pair":  pair,
+                    "sig":   signal,
+                    "tt":    trade_type,
+                    "entry": round(entry, 8),
+                    "sl":    round(sl, 8),
+                    "tp":    round(tp, 8),
+                    "tp2":   round(tp2, 8) if tp2 is not None else None,
+                    "rr":    float(rr),
+                    "atr":   float(atr),
+                    "conf":  int(confidence),
+                    "mt":    market_type,
+                    "sess":  session,
+                    "mode":  market_mode,
+                    "btc":   bool(btc_downtrend) if btc_downtrend is not None else None,
+                    "stage": stage,
+                    "pgen":  round(float(price_at_gen), 8) if price_at_gen else None,
+                    "ttime": trade_time,
+                })
+                row = cur.fetchone()
+            conn.commit()
+        return dict(row)["id"] if row else None
+    except Exception as e:
+        print(f"log_signal error: {e}")
+        return None
+
+
+def update_signal_stage(signal_log_id, stage, trade_time=None):
+    """Update stage (and optionally trade_time) for a logged signal."""
+    if signal_log_id is None:
+        return
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                if trade_time:
+                    cur.execute(
+                        f"UPDATE {SIGNAL_LOG_TABLE} "
+                        f"SET stage=%s, trade_time=%s WHERE id=%s",
+                        (stage, str(trade_time), int(signal_log_id))
+                    )
+                else:
+                    cur.execute(
+                        f"UPDATE {SIGNAL_LOG_TABLE} SET stage=%s WHERE id=%s",
+                        (stage, int(signal_log_id))
+                    )
+            conn.commit()
+    except Exception as e:
+        print(f"update_signal_stage error: {e}")
+
+
+def get_signals_needing_snapshots():
+    """
+    Return signals where 4h or 24h price snapshots are still outstanding.
+    Uses Python-computed ISO strings for TEXT timestamp comparisons (safe
+    across all PostgreSQL versions — avoids implicit TEXT→TIMESTAMPTZ casts).
+    """
+    from datetime import timedelta
+    cutoff_4h  = (datetime.utcnow() - timedelta(hours=4)).isoformat()
+    cutoff_24h = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    SELECT id, pair, signal, market_type, generated_at,
+                           price_at_gen, snap_4h, snap_24h
+                    FROM   {SIGNAL_LOG_TABLE}
+                    WHERE  price_at_gen IS NOT NULL
+                      AND  (
+                               (snap_4h  IS NULL AND generated_at <= %(c4h)s)
+                            OR (snap_24h IS NULL AND generated_at <= %(c24h)s)
+                           )
+                    ORDER  BY generated_at
+                    LIMIT  30
+                """, {"c4h": cutoff_4h, "c24h": cutoff_24h})
+                return [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print(f"get_signals_needing_snapshots error: {e}")
+        return []
+
+
+def record_price_snapshot(signal_log_id, column, price, sig, price_at_gen):
+    """
+    Record a price snapshot and compute direction correctness.
+
+    column  — 'snap_4h' or 'snap_24h'
+    sig     — 'BUY' or 'SELL'
+    direction_correct: price moved toward TP (up for BUY, down for SELL)
+    """
+    dir_col = column.replace("snap_", "dir_")
+    direction_correct = (
+        (float(price) > float(price_at_gen))
+        if sig == "BUY"
+        else (float(price) < float(price_at_gen))
+    )
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {SIGNAL_LOG_TABLE} "
+                    f"SET {column}=%s, {dir_col}=%s WHERE id=%s",
+                    (round(float(price), 8), direction_correct, int(signal_log_id))
+                )
+            conn.commit()
+    except Exception as e:
+        print(f"record_price_snapshot error: {e}")
+
+
+def get_signals_for_outcome_analysis():
+    """
+    Return signals older than 25h where setup_outcome has not been computed yet.
+
+    25h gives a full 24h window after generation plus 1h buffer.
+    Only fetches unfilled signals (stage != 'filled') — filled signals get their
+    outcome from the trades table directly (via update_signal_outcome with
+    setup_outcome='executed').  Limit 20 per call to bound OHLCV fetch count.
+    """
+    from datetime import timedelta
+    cutoff = (datetime.utcnow() - timedelta(hours=25)).isoformat()
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    SELECT id, pair, signal, market_type, generated_at,
+                           entry, sl, tp, tp2, stage, trade_time
+                    FROM   {SIGNAL_LOG_TABLE}
+                    WHERE  setup_outcome IS NULL
+                      AND  generated_at <= %(cutoff)s
+                    ORDER  BY generated_at
+                    LIMIT  20
+                """, {"cutoff": cutoff})
+                return [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print(f"get_signals_for_outcome_analysis error: {e}")
+        return []
+
+
+def update_signal_outcome(signal_log_id,
+                          entry_reached, tp1_reached, sl_reached, setup_outcome):
+    """
+    Store the retroactively computed setup outcome for a signal_log row.
+
+    entry_reached  — True if price hit the entry level in the 24h OHLCV window
+    tp1_reached    — True if TP1 was reached after entry (None if no entry)
+    sl_reached     — True if SL was reached after entry   (None if no entry)
+    setup_outcome  — 'win'|'loss'|'no_entry'|'ambiguous'|'open'|'executed'
+    """
+    if signal_log_id is None:
+        return
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {SIGNAL_LOG_TABLE} "
+                    f"SET entry_reached=%s, tp1_reached=%s, "
+                    f"    sl_reached=%s, setup_outcome=%s "
+                    f"WHERE id=%s",
+                    (
+                        bool(entry_reached) if entry_reached is not None else None,
+                        bool(tp1_reached)   if tp1_reached  is not None else None,
+                        bool(sl_reached)    if sl_reached   is not None else None,
+                        setup_outcome,
+                        int(signal_log_id),
+                    )
+                )
+            conn.commit()
+    except Exception as e:
+        print(f"update_signal_outcome error: {e}")

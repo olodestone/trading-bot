@@ -1,7 +1,7 @@
 # Claude Trading Bot — Development Log
 
 Railway worker process. KuCoin (spot) + MEXC (futures).
-Current plan: **27** | Rating: **9.9+/10** | Mode: **PAPER TRADING ($100)**
+Current plan: **28** | Rating: **9.9+/10** | Mode: **PAPER TRADING ($100)**
 
 ---
 
@@ -100,7 +100,13 @@ SESSION GATE
 
 **trades:** `time, pair, signal, entry, sl, tp, tp2, rr, status, market_type, atr, be_activated, trail_sl, tp1_hit, confidence, plan`
 
-**pending_trades:** `pair, signal, entry, sl, tp, tp2, rr, market_type, trade_type, atr, queued_at, confidence`
+**pending_trades:** `pair, signal, entry, sl, tp, tp2, rr, market_type, trade_type, atr, queued_at, confidence, signal_log_id`
+
+**signal_log:** `id (PK), generated_at, pair, signal, trade_type, entry, sl, tp, tp2, rr, atr, confidence, market_type, session, market_mode, btc_downtrend, stage, price_at_gen, snap_4h, dir_4h, snap_24h, dir_24h, trade_time, entry_reached, tp1_reached, sl_reached, setup_outcome`
+  - stage: `queued` | `filled` | `expired` | `invalidated` | `cancelled`
+  - dir_4h/dir_24h: TRUE = price moved in predicted direction after 4h/24h
+  - entry_reached/tp1_reached/sl_reached: computed retroactively via 1h OHLCV
+  - setup_outcome: `win`|`loss`|`no_entry`|`ambiguous`|`open`|`executed`
 
 Status: `OPEN`, `WIN`, `BE_WIN`, `LOSS`
 
@@ -113,6 +119,13 @@ Status: `OPEN`, `WIN`, `BE_WIN`, `LOSS`
 | `/status` | Open + pending trades with entry/RR |
 | `/stats` | Win rate, expectancy, per-plan and per-confidence breakdown |
 | `/cancel SYMBOL` | Remove a pending signal |
+| `/edge` | Signal funnel + direction accuracy @ 4h (last 30d) |
+| `/edge dir` | Direction accuracy by BUY/SELL |
+| `/edge session` | Breakdown by trading session |
+| `/edge regime` | Breakdown by market regime |
+| `/edge conf` | Breakdown by confidence band |
+| `/edge type` | Breakdown by trade type |
+| `/edge pair SYMBOL` | Pair-specific funnel + accuracy |
 | `/help` | Command list |
 
 ---
@@ -209,5 +222,7 @@ Plan 24: BTC gate 1.5% threshold, recovery HTF 2/4 — zero-signal deadlock fixe
 Plan 25: _RUN_CACHE per-pair eviction — peak worker RAM N×4 DFs → ~4 DFs.
 Plan 26: paper trading ($100, MAX_CONCURRENT 5), stock filter, BB/coil OR, bounce re-enabled.
 Plan 27: report_worker subprocess — pandas out of main process, 42 MB permanent (−66%).
+Plan 28: signal_log table — full funnel tracking (queued→filled/expired/invalidated/cancelled),
+         price snapshots at 4h+24h for direction accuracy, /edge Telegram commands.
 
 **Gap to 10/10:** Live order execution, account balance auto-sync, min order value check.

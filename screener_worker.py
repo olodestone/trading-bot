@@ -576,6 +576,14 @@ def main(output_path):
             else:
                 mkt_info = {"min_qty": 1, "contract_size": 1}
 
+            # Last 15m close = current market price at scan time.
+            # Used as direction-accuracy baseline in signal_log (price_at_gen).
+            # No extra HTTP call — df_15m is already in scope.
+            try:
+                price_at_scan = float(df_15m.iloc[-1]["close"])
+            except Exception:
+                price_at_scan = None
+
             signals.append({
                 "pair":              symbol,
                 "market_type":       market_type,
@@ -591,6 +599,7 @@ def main(output_path):
                 "market_info":       mkt_info,
                 "entry_valid_above": entry_valid_above,
                 "entry_valid_below": entry_valid_below,
+                "price_at_scan":     price_at_scan,
             })
             print(f"  SIGNAL: {symbol} {sig} [{trade_type}] conf={conf}", flush=True)
 

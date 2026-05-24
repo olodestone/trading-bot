@@ -27,9 +27,11 @@ import requests
 
 from db import (
     TRADES_TABLE, PENDING_TABLE,
-    ensure_tables,
+    ensure_tables, ensure_signal_log,
     save_trade, load_pending_trades, save_pending_trades,
     get_daily_losses, get_compounded_balance, check_trade_results,
+    log_signal, update_signal_stage,
+    get_signals_needing_snapshots, record_price_snapshot,
 )
 from logger import send_telegram, TOKEN, CHAT_ID
 
@@ -76,14 +78,15 @@ REPORT_SCRIPT  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "repor
 # ──────────────────────────────────────────────────────────────────────────────
 # MODULE STATE
 # ──────────────────────────────────────────────────────────────────────────────
-pending_trades       = []
-last_signals         = {}   # "pair_signal" → datetime — dedup cooldown
+pending_trades        = []
+last_signals          = {}   # "pair_signal" → datetime — dedup cooldown
 
-_bear_mode_scans     = 0
-_recovery_scans      = 0
-_market_mode         = "normal"
-_btc_downtrend       = False
-_btc_downtrend_prev  = False
+_bear_mode_scans      = 0
+_recovery_scans       = 0
+_market_mode          = "normal"
+_btc_downtrend        = False
+_btc_downtrend_prev   = False
+_last_direction_check = 0.0   # epoch seconds — rate-limits _check_direction_outcomes()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -109,6 +112,18 @@ def _fetchall(sql, params=None):
         with conn.cursor() as cur:
             cur.execute(sql, params or {})
             return [dict(r) for r in cur.fetchall()]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SESSION HELPER
+# ──────────────────────────────────────────────────────────────────────────────
+def _get_session():
+    hour = datetime.utcnow().hour
+    if 18 <= hour <= 23:
+        return "premium"
+    if 8 <= hour <= 17:
+        return "filtered"
+    return "blocked"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -287,6 +302,65 @@ def _fmt_price(p):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# DIRECTION ACCURACY SNAPSHOTS  (Plan 28)
+# ──────────────────────────────────────────────────────────────────────────────
+def _check_direction_outcomes():
+    """
+    Snapshot prices at 4h and 24h for direction-accuracy tracking.
+
+    Rate-limited to once per 30 min — snapshots don't need sub-5-min precision
+    and this avoids holding up the Telegram poller on a busy run.
+    Prices are cached per pair within the call to minimise HTTP calls.
+    """
+    global _last_direction_check
+    if time.time() - _last_direction_check < 1800:
+        return
+    _last_direction_check = time.time()
+
+    try:
+        rows = get_signals_needing_snapshots()
+        if not rows:
+            return
+        price_cache: dict = {}
+        now = datetime.utcnow()
+        for row in rows:
+            try:
+                gen_at = datetime.fromisoformat(
+                    str(row["generated_at"]).replace(" ", "T")
+                )
+            except Exception:
+                continue
+            elapsed_min = (now - gen_at.replace(tzinfo=None)).total_seconds() / 60
+            price_gen   = row.get("price_at_gen")
+            if not price_gen:
+                continue
+
+            pair = row["pair"]
+            mt   = row["market_type"]
+            sig  = row["signal"]
+
+            cache_key = f"{pair}_{mt}"
+            if cache_key not in price_cache:
+                price_cache[cache_key] = get_price(pair, mt)
+            current = price_cache[cache_key]
+            if current is None:
+                continue
+
+            slid = row["id"]
+            if row.get("snap_4h") is None and elapsed_min >= 240:
+                record_price_snapshot(slid, "snap_4h", current, sig, price_gen)
+                print(
+                    f"[edge] 4h snapshot {pair} {sig}: "
+                    f"{price_gen:.6g}→{current:.6g} "
+                    f"({'✓' if (current > price_gen if sig == 'BUY' else current < price_gen) else '✗'})"
+                )
+            if row.get("snap_24h") is None and elapsed_min >= 1440:
+                record_price_snapshot(slid, "snap_24h", current, sig, price_gen)
+    except Exception as e:
+        print(f"_check_direction_outcomes error: {e}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # PENDING TRADE MANAGEMENT
 # ──────────────────────────────────────────────────────────────────────────────
 def check_pending_trades():
@@ -295,10 +369,12 @@ def check_pending_trades():
     for trade in pending_trades:
         symbol      = trade["pair"]
         market_type = trade["market_type"]
+        slid        = trade.get("signal_log_id")   # Plan 28 — stage tracking
 
         expiry_hours = 3 if trade.get("trade_type") == "bounce" else 1
         if datetime.now() - trade["time"] > timedelta(hours=expiry_hours):
             print(f"Expired ({expiry_hours}h): {symbol}")
+            update_signal_stage(slid, "expired")
             continue
 
         price = get_price(symbol, market_type)
@@ -311,9 +387,11 @@ def check_pending_trades():
         if price is not None:
             if eva and trade["signal"] == "BUY" and price < eva * 0.997:
                 print(f"Breakout invalidated: {symbol} price {price:.6f} < breakout level {eva:.6f} — removed")
+                update_signal_stage(slid, "invalidated")
                 continue
             if evb and trade["signal"] == "SELL" and price > evb * 1.003:
                 print(f"Breakdown invalidated: {symbol} price {price:.6f} > breakdown level {evb:.6f} — removed")
+                update_signal_stage(slid, "invalidated")
                 continue
 
         if not _check_entry_hit(price, trade["entry"], trade["signal"],
@@ -324,6 +402,7 @@ def check_pending_trades():
         # Late-entry guard: price must be within 1.5% of queued entry
         if price and abs(price - trade["entry"]) / trade["entry"] > 0.015:
             print(f"Late entry skipped: {symbol}")
+            update_signal_stage(slid, "invalidated")
             continue
 
         print(f"ENTRY HIT: {symbol}")
@@ -346,6 +425,8 @@ def check_pending_trades():
         _rd, _, _, _ = calc_position_size(
             trade["entry"], trade["sl"], trade.get("rr", 0.0), conf=_conf
         )
+        _fill_time = str(datetime.utcnow())
+        update_signal_stage(slid, "filled", trade_time=_fill_time)   # Plan 28
         save_trade(
             trade["pair"], trade["signal"], trade["entry"],
             trade["sl"], trade["tp"], tp2, trade["rr"],
@@ -517,6 +598,11 @@ def _process_scan_results(scan_data):
     hour_utc         = datetime.utcnow().hour
     session_filtered = 8 <= hour_utc <= 17
 
+    # Plan 28: capture scan-level context once — used in log_signal() per signal
+    _session_str = _get_session()
+    _scan_mode   = scan_data.get("market_mode", "normal")
+    _scan_btc    = scan_data.get("btc_downtrend")
+
     for s in scan_data.get("signals", []):
         symbol      = s["pair"]
         market_type = s["market_type"]
@@ -628,6 +714,16 @@ def _process_scan_results(scan_data):
             )
             print(msg)
             send_telegram(msg)
+            _bounce_time = str(datetime.utcnow())
+            # Plan 28: log bounce as immediately filled (no pending queue)
+            log_signal(
+                pair=symbol, signal=sig, trade_type=trade_type,
+                entry=entry, sl=sl, tp=tp, tp2=tp2, rr=rr, atr=float(atr),
+                confidence=conf, market_type=market_type,
+                session=_session_str, market_mode=_scan_mode, btc_downtrend=_scan_btc,
+                stage="filled", price_at_gen=s.get("price_at_scan"),
+                trade_time=_bounce_time,
+            )
             save_trade(symbol, sig, entry, sl, tp, tp2, rr, market_type,
                        float(atr), risk_dollars, confidence=conf, plan=BOT_PLAN)
         else:
@@ -645,6 +741,14 @@ def _process_scan_results(scan_data):
             )
             print(msg)
             send_telegram(msg)
+            # Plan 28: log before appending to pending so we can link signal_log_id
+            _slid = log_signal(
+                pair=symbol, signal=sig, trade_type=trade_type,
+                entry=entry, sl=sl, tp=tp, tp2=tp2, rr=rr, atr=float(atr),
+                confidence=conf, market_type=market_type,
+                session=_session_str, market_mode=_scan_mode, btc_downtrend=_scan_btc,
+                stage="queued", price_at_gen=s.get("price_at_scan"),
+            )
             pending_trades.append({
                 "pair":              symbol,
                 "signal":            sig,
@@ -660,6 +764,7 @@ def _process_scan_results(scan_data):
                 "confidence":        conf,
                 "entry_valid_above": s.get("entry_valid_above"),
                 "entry_valid_below": s.get("entry_valid_below"),
+                "signal_log_id":     _slid,
             })
 
     check_pending_trades()
@@ -693,10 +798,23 @@ def check_telegram_commands():
                 "/status -- open & pending trades\n"
                 "/stats  -- win rate, expectancy, all-time edge\n"
                 "/cancel SYMBOL -- remove pending signal\n"
+                "/edge -- funnel + direction accuracy (30d)\n"
+                "/edge dir|session|regime|conf|type -- slice breakdown\n"
+                "/edge pair SYMBOL -- pair-specific analysis\n"
                 "/help -- this message"
             )
         elif text_msg.startswith("/cancel "):
             _handle_cancel(text_msg.split(" ", 1)[1].strip().upper())
+        elif text_msg.startswith("/edge"):
+            parts      = text_msg.strip().split(maxsplit=2)
+            subcommand = parts[1] if len(parts) > 1 else ""
+            arg        = parts[2].strip() if len(parts) > 2 else ""
+            if subcommand == "pair" and arg:
+                _run_report(f"edge_pair_{arg}")
+            elif subcommand:
+                _run_report(f"edge_{subcommand}")
+            else:
+                _run_report("edge")
 
 
 def _handle_status():
@@ -720,6 +838,10 @@ def _handle_status():
 def _handle_cancel(symbol):
     global pending_trades
     before = len(pending_trades)
+    # Mark as cancelled in signal_log before removing from in-memory list
+    for t in pending_trades:
+        if t["pair"] == symbol:
+            update_signal_stage(t.get("signal_log_id"), "cancelled")
     pending_trades = [t for t in pending_trades if t["pair"] != symbol]
     if len(pending_trades) < before:
         save_pending_trades(pending_trades)
@@ -735,6 +857,7 @@ def main():
     global pending_trades, ACCOUNT_BALANCE
 
     ensure_tables()
+    ensure_signal_log()     # Plan 28 — creates signal_log table if not exists
     pending_trades = load_pending_trades()
     _restore_last_signals()
     print(f"Loaded {len(pending_trades)} pending trade(s) from DB")
@@ -776,6 +899,7 @@ def main():
                         gc.collect()   # strategy 3: explicit GC after scan results processed
 
             check_trade_results(get_price, send_telegram)
+            _check_direction_outcomes()   # Plan 28 — 30-min rate-limited
 
             today = datetime.now().date()
             if last_report_day != today:
