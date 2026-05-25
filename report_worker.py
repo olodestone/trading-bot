@@ -31,6 +31,9 @@ if mode == "daily":
 elif mode == "stats":
     from performance import get_stats_summary
     send_telegram(get_stats_summary())
+elif mode == "diagnose":
+    from performance import get_diagnose_report
+    send_telegram(get_diagnose_report())
 elif mode.startswith("edge"):
     from performance import get_edge_report
     send_telegram(get_edge_report(mode))

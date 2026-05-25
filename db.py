@@ -68,6 +68,9 @@ def ensure_tables():
                 ("time_to_mfe", "FLOAT"), ("time_to_mae", "FLOAT"),
                 ("confidence", "INTEGER"),
                 ("plan", "INTEGER"),
+                # post_be_tp1: did price return to TP1 after the BE stop was hit?
+                # NULL = not yet checked, True/False = result of retroactive OHLCV check.
+                ("post_be_tp1", "BOOLEAN"),
             ]:
                 try:
                     cur.execute(
@@ -667,6 +670,49 @@ def get_signals_for_outcome_analysis():
     except Exception as e:
         print(f"get_signals_for_outcome_analysis error: {e}")
         return []
+
+
+def get_be_wins_without_check():
+    """
+    Return BE_WIN trades where post_be_tp1 has not been computed yet.
+    Returns rows with: time, pair, signal, entry, tp, market_type
+    Only fetches trades older than 48h (needs a 48h OHLCV window after close).
+    """
+    from datetime import timedelta
+    cutoff = (datetime.utcnow() - timedelta(hours=48)).isoformat()
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT time, pair, signal, entry, tp, market_type "
+                    f"FROM {TRADES_TABLE} "
+                    f"WHERE status = 'BE_WIN' "
+                    f"  AND post_be_tp1 IS NULL "
+                    f"  AND time <= %(cutoff)s "
+                    f"ORDER BY time "
+                    f"LIMIT 20",
+                    {"cutoff": cutoff}
+                )
+                return [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print(f"get_be_wins_without_check error: {e}")
+        return []
+
+
+def record_post_be_tp1(trade_time, pair, value):
+    """Store the retroactive post-BE TP1 result for a trade (True/False)."""
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {TRADES_TABLE} "
+                    f"SET post_be_tp1 = %s "
+                    f"WHERE time = %s AND pair = %s",
+                    (bool(value), str(trade_time), pair)
+                )
+            conn.commit()
+    except Exception as e:
+        print(f"record_post_be_tp1 error: {e}")
 
 
 def update_signal_outcome(signal_log_id,

@@ -23,7 +23,8 @@ import os
 import sys
 
 # ── exact strategy functions, zero duplication ──────────────────────────────
-from strategy import apply_indicators, generate_pullback_signal
+from strategy import (apply_indicators,
+                      generate_filtered_signal, generate_pullback_signal)
 
 # ============================================================
 # CONFIG
@@ -221,6 +222,43 @@ def simulate_trade(df_15m, signal_idx, sig, entry, sl, tp1, tp2):
 
 
 # ============================================================
+# SETUP QUALITY CHECK  (extended 72h window — for expired signals)
+# ============================================================
+def check_setup_quality(df_15m, signal_idx, sig, entry, sl, tp1, window=288):
+    """
+    Check if entry was hit and TP1 reached within `window` candles (default 72h).
+
+    Used to analyse EXPIRED signals — would the setup have worked if the bot
+    had waited longer?  Returns (entry_reached: bool, tp1_hit: bool|None).
+    tp1_hit is None when entry was reached but neither SL nor TP1 hit in window.
+    """
+    end = min(signal_idx + window + 1, len(df_15m) - 1)
+    entry_hit_idx = None
+
+    for i in range(signal_idx + 1, end):
+        c = df_15m.iloc[i]
+        if sig == "BUY"  and c["low"]  <= entry * 1.003:
+            entry_hit_idx = i; break
+        if sig == "SELL" and c["high"] >= entry * 0.997:
+            entry_hit_idx = i; break
+
+    if entry_hit_idx is None:
+        return False, None
+
+    # Walk forward from entry up to 48h (192 candles) for resolution
+    for i in range(entry_hit_idx, min(entry_hit_idx + 193, end)):
+        c = df_15m.iloc[i]
+        if sig == "BUY":
+            if c["high"] >= tp1: return True, True
+            if c["low"]  <= sl:  return True, False
+        else:
+            if c["low"]  <= tp1: return True, True
+            if c["high"] >= sl:  return True, False
+
+    return True, None   # entry reached but unresolved within window
+
+
+# ============================================================
 # SYMBOL DATA FETCH
 # ============================================================
 def fetch_symbol_data(exchange, symbol, market_type, days):
@@ -336,7 +374,13 @@ def compute_mode_timeline(symbol_data):
 def run_symbol_backtest(symbol, data, mode_by_ts):
     """
     Run the signal generation + trade simulation loop for one symbol.
-    mode_by_ts: {15m_timestamp_ms → mode_string} — looked up at each candle.
+
+    Returns (trades, all_signals):
+      trades      — list of completed trade dicts (WIN/BE_WIN/LOSS)
+      all_signals — list of every signal attempt, including expired, with:
+                    dir_correct  (bool)  — price moved in predicted direction 4h later
+                    entry_reached (bool) — entry level hit within 72h
+                    tp1_hit       (bool|None) — TP1 hit after entry (None = unresolved)
     """
     df_15m = data["df_15m"]
     df_1h  = data["df_1h"]
@@ -347,7 +391,8 @@ def run_symbol_backtest(symbol, data, mode_by_ts):
     map_1d = data["map_1d"]
 
     trades       = []
-    active_until = -1   # skip candles while a trade is running
+    all_signals  = []
+    active_until = -1
 
     for i in range(WARMUP_CANDLES, len(df_15m) - 1):
         if i <= active_until:
@@ -356,7 +401,6 @@ def run_symbol_backtest(symbol, data, mode_by_ts):
         ts          = int(df_15m.iloc[i]["time"])
         market_mode = mode_by_ts.get(ts, "normal")
 
-        # Slice to current candle — simulate "we only know up to now"
         s15 = df_15m.iloc[: i + 1]
         s1h = df_1h.iloc[: map_1h[i] + 1]
         s4h = df_4h.iloc[: map_4h[i] + 1]
@@ -365,15 +409,53 @@ def run_symbol_backtest(symbol, data, mode_by_ts):
         if any(len(x) < 50 for x in [s15, s1h, s4h, s1d]):
             continue
 
-        result = generate_pullback_signal(s15, s1h, s4h, s1d, symbol=symbol, market_mode=market_mode)
+        # Try generate_filtered_signal first (trend/reversal), fall back to pullback
+        result = generate_filtered_signal(
+            s15, s1h, s4h, s1d,
+            symbol=symbol, market_mode=market_mode, btc_downtrend=False
+        )
+        if not result:
+            result = generate_pullback_signal(
+                s15, s1h, s4h, s1d,
+                symbol=symbol, market_mode=market_mode
+            )
         if not result:
             continue
 
         sig, entry, sl, tp1, tp2, rr, atr, trade_type = result
 
+        # ── Direction accuracy: price 4h (16 × 15m candles) after signal ─────
+        dir_idx     = min(i + 16, len(df_15m) - 1)
+        price_now   = float(df_15m.iloc[i]["close"])
+        price_4h    = float(df_15m.iloc[dir_idx]["close"])
+        dir_correct = (price_4h > price_now) if sig == "BUY" else (price_4h < price_now)
+
+        # ── Setup quality: entry + TP1 within 72h (regardless of fill) ───────
+        entry_reached, tp1_hit_sq = check_setup_quality(
+            df_15m, i, sig, entry, sl, tp1, window=288
+        )
+
+        hour_utc = pd.Timestamp(ts, unit="ms").hour
+        session  = "premium" if 18 <= hour_utc <= 23 else ("filtered" if 8 <= hour_utc <= 17 else "blocked")
+
+        sig_record = {
+            "symbol":        symbol,
+            "signal":        sig,
+            "trade_type":    trade_type,
+            "rr_signal":     rr,
+            "signal_time":   pd.Timestamp(df_15m.iloc[i]["time"], unit="ms"),
+            "market_mode":   market_mode,
+            "session":       session,
+            "dir_correct":   dir_correct,
+            "entry_reached": entry_reached,
+            "tp1_hit_sq":    tp1_hit_sq,   # setup quality TP1 hit (72h window)
+        }
+
         trade = simulate_trade(df_15m, i, sig, entry, sl, tp1, tp2)
         if not trade or trade["result"] in ("EXPIRED", "TIMEOUT"):
-            active_until = i + trade["end_bar"] if trade else i + 10
+            sig_record["result"] = trade["result"] if trade else "NO_SIGNAL"
+            all_signals.append(sig_record)
+            active_until = i + (trade["end_bar"] if trade else 10)
             continue
 
         trade.update({
@@ -383,22 +465,99 @@ def run_symbol_backtest(symbol, data, mode_by_ts):
             "rr_signal":   rr,
             "signal_time": pd.Timestamp(df_15m.iloc[i]["time"], unit="ms"),
             "market_mode": market_mode,
+            "session":     session,
+            "dir_correct": dir_correct,
         })
         trades.append(trade)
+        sig_record["result"] = trade["result"]
+        all_signals.append(sig_record)
 
-        # Advance past this trade so signals don't fire mid-trade
         active_until = i + trade["end_bar"] + 2
 
-    print(f"  ✅ {symbol}: {len(trades)} trades")
-    return trades
+    expired_ct = sum(1 for s in all_signals if s.get("result") in ("EXPIRED", "TIMEOUT"))
+    print(f"  ✅ {symbol}: {len(trades)} trades  |  {expired_ct} expired  |  {len(all_signals)} total signals")
+    return trades, all_signals
 
 
 # ============================================================
 # REPORT
 # ============================================================
-def generate_report(all_trades, days, symbols, mode_label="DYNAMIC"):
+def generate_report(all_trades, all_signals, days, symbols, mode_label="DYNAMIC"):
     sep  = "─" * 34
     sep2 = "═" * 34
+
+    # ── FUNNEL & EDGE METRICS  (mirrors /edge output for direct comparison) ───
+    df_sig = pd.DataFrame(all_signals) if all_signals else pd.DataFrame()
+    total_sigs = len(df_sig)
+
+    if not df_sig.empty:
+        expired_ct    = df_sig["result"].isin(["EXPIRED", "TIMEOUT"]).sum()
+        filled_ct     = (~df_sig["result"].isin(["EXPIRED", "TIMEOUT", "NO_SIGNAL"])).sum()
+        fill_rate     = filled_ct / total_sigs * 100 if total_sigs > 0 else 0.0
+        no_entry_ct   = df_sig[~df_sig["entry_reached"].isna() & (df_sig["entry_reached"] == False)].shape[0]
+        entry_hit_ct  = df_sig[df_sig["entry_reached"] == True].shape[0]
+        no_entry_rate = no_entry_ct / total_sigs * 100 if total_sigs > 0 else 0.0
+
+        # Direction accuracy @ 4h
+        dir_df    = df_sig[df_sig["dir_correct"].notna()]
+        dir_all   = dir_df["dir_correct"].mean() * 100 if len(dir_df) > 0 else None
+        buy_dir   = dir_df[dir_df["signal"] == "BUY"]
+        sell_dir  = dir_df[dir_df["signal"] == "SELL"]
+        b_acc     = buy_dir["dir_correct"].mean()  * 100 if len(buy_dir)  > 0 else None
+        s_acc     = sell_dir["dir_correct"].mean() * 100 if len(sell_dir) > 0 else None
+
+        # Setup quality — unfilled signals that had entry hit
+        unfilled  = df_sig[df_sig["result"].isin(["EXPIRED", "TIMEOUT"])]
+        uf_hit    = unfilled[unfilled["entry_reached"] == True]
+        uf_wins   = uf_hit[uf_hit["tp1_hit_sq"] == True]
+        uf_losses = uf_hit[uf_hit["tp1_hit_sq"] == False]
+        wwh       = len(uf_wins) / len(uf_hit) * 100 if len(uf_hit) > 0 else None
+
+        print(f"\n{sep2}")
+        print(f"  FUNNEL & EDGE METRICS  (mirrors /edge — compare with Telegram /edge)")
+        print(sep)
+        print(f"  Total signals          {total_sigs}")
+        print(f"  Filled (trade ran)     {filled_ct}  ({fill_rate:.0f}%)")
+        print(f"  Expired/timeout        {expired_ct}  ({expired_ct/total_sigs*100:.0f}%)")
+        print(f"  No-entry rate          {no_entry_rate:.0f}%  of all signals")
+        print(f"  Entry reached (72h)    {entry_hit_ct}  ({entry_hit_ct/total_sigs*100:.0f}%)")
+
+        print(f"\n  Direction @ 4h (N={len(dir_df)})")
+        if dir_all is not None:
+            dm = "✓" if dir_all >= 55 else ("⚠" if dir_all >= 45 else "✗")
+            print(f"    All    {dir_all:.0f}%  {dm}")
+        if b_acc is not None:
+            bm = "✓" if b_acc >= 55 else ("⚠" if b_acc >= 45 else "✗")
+            print(f"    BUY    {b_acc:.0f}%  {bm}  (N={len(buy_dir)})")
+        if s_acc is not None:
+            sm = "✓" if s_acc >= 55 else ("⚠" if s_acc >= 45 else "✗")
+            print(f"    SELL   {s_acc:.0f}%  {sm}  (N={len(sell_dir)})")
+
+        print(f"\n  Setup quality — unfilled signals (N={len(unfilled)})")
+        print(f"    Entry hit rate  {len(uf_hit)/len(unfilled)*100:.0f}%  ({len(uf_hit)}/{len(unfilled)})")
+        if wwh is not None:
+            wm = "✓" if wwh >= 55 else ("⚠" if wwh >= 40 else "✗")
+            print(f"    Win when hit    {wwh:.0f}%  (W:{len(uf_wins)} L:{len(uf_losses)})  {wm}")
+
+        # By session
+        if "session" in df_sig.columns:
+            print(f"\n  Direction @ 4h by session:")
+            for sess in sorted(df_sig["session"].dropna().unique()):
+                sub = dir_df[dir_df["session"] == sess]
+                if len(sub) < 3: continue
+                a = sub["dir_correct"].mean() * 100
+                m = "✓" if a >= 55 else ("⚠" if a >= 45 else "✗")
+                print(f"    {sess:<10}  {a:.0f}%  {m}  (N={len(sub)})")
+
+        # By market mode
+        if "market_mode" in df_sig.columns:
+            print(f"\n  Direction @ 4h by market mode:")
+            for mode in sorted(df_sig["market_mode"].dropna().unique()):
+                sub = dir_df[dir_df["market_mode"] == mode]
+                if len(sub) < 3: continue
+                a = sub["dir_correct"].mean() * 100
+                m = "✓" if a >= 55 else ("⚠" if a >= 45 else "✗")
+                print(f"    {mode:<10}  {a:.0f}%  {m}  (N={len(sub)})")
 
     if not all_trades:
         print(f"\n{sep2}")
@@ -611,6 +770,11 @@ def main():
         help="Market mode: 'dynamic' (default) computes mode from breadth at each step, "
              "or force a fixed mode for targeted testing."
     )
+    parser.add_argument(
+        "--be", type=float, default=1.0,
+        help="Breakeven activation threshold in R (default 1.0 = 1:1). "
+             "Try --be 1.3 to test delayed BE activation."
+    )
     args = parser.parse_args()
 
     if args.futures:
@@ -638,7 +802,7 @@ def main():
     print(f"  Symbols  : {', '.join(args.symbols)}")
     print(f"  Period   : {args.days} days")
     print(f"  Mode     : {mode_label}")
-    print(f"  Mgmt     : TP1=1R  TP2=2.5R  BE after TP1")
+    print(f"  Mgmt     : TP1=1R  TP2=2.5R  BE@{args.be}R")
     print(f"  Warmup   : {WARMUP_CANDLES} candles (skipped)")
     print(f"{'─'*34}")
 
@@ -683,18 +847,21 @@ def main():
 
     # ── Phase 3: run per-symbol signal loops ────────────────────────────────
     print(f"\n{'─'*34}")
-    all_trades = []
+    all_trades  = []
+    all_signals = []
     for symbol, data in symbol_data.items():
         try:
-            trades = run_symbol_backtest(symbol, data, mode_by_ts)
+            trades, signals = run_symbol_backtest(symbol, data, mode_by_ts)
             all_trades.extend(trades)
+            all_signals.extend(signals)
         except KeyboardInterrupt:
             print("\n  ⏹  Interrupted — generating partial report...")
             break
         except Exception as e:
             print(f"  ❌ {symbol} error: {e}")
 
-    generate_report(all_trades, args.days, list(symbol_data.keys()), mode_label=mode_label)
+    generate_report(all_trades, all_signals, args.days,
+                    list(symbol_data.keys()), mode_label=mode_label)
 
 
 if __name__ == "__main__":

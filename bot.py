@@ -790,15 +790,25 @@ def check_telegram_commands():
 
         if text_msg == "/status":
             _handle_status()
+        elif text_msg == "/balance":
+            _handle_balance()
         elif text_msg == "/stats":
+            send_telegram("⏳ Loading stats…")
             _run_report("stats")
+        elif text_msg == "/diagnose":
+            send_telegram("⏳ Running diagnosis…")
+            _run_report("diagnose")
         elif text_msg == "/help":
             send_telegram(
                 "Commands:\n"
-                "/status -- open & pending trades\n"
-                "/stats  -- win rate, expectancy, all-time edge\n"
+                "/status   -- open & pending trades\n"
+                "/balance  -- account balance & P&L\n"
+                "/stats    -- win rate, expectancy, by period\n"
+                "/diagnose -- automated fix recommendations\n"
                 "/cancel SYMBOL -- remove pending signal\n"
                 "/edge -- funnel + direction accuracy (30d)\n"
+                "/edge pairs -- all pairs ranked (blacklist candidates)\n"
+                "/edge atr -- performance by ATR% environment\n"
                 "/edge dir|session|regime|conf|type -- slice breakdown\n"
                 "/edge pair SYMBOL -- pair-specific analysis\n"
                 "/help -- this message"
@@ -809,8 +819,11 @@ def check_telegram_commands():
             parts      = text_msg.strip().split(maxsplit=2)
             subcommand = parts[1] if len(parts) > 1 else ""
             arg        = parts[2].strip() if len(parts) > 2 else ""
+            send_telegram("⏳ Loading edge report…")
             if subcommand == "pair" and arg:
                 _run_report(f"edge_pair_{arg}")
+            elif subcommand == "pairs":
+                _run_report("edge_pairs")
             elif subcommand:
                 _run_report(f"edge_{subcommand}")
             else:
@@ -833,6 +846,40 @@ def _handle_status():
         send_telegram(f"STATUS\n\nOpen:\n{open_list}\n\nPending:\n{pend_list}")
     except Exception as e:
         send_telegram(f"Status error: {e}")
+
+
+def _handle_balance():
+    try:
+        mode_tag = "📄 PAPER TRADING" if PAPER_TRADING else "🔴 LIVE TRADING"
+        pnl      = ACCOUNT_BALANCE - STARTING_BALANCE
+        pnl_sign = "+" if pnl >= 0 else ""
+        pnl_pct  = pnl / STARTING_BALANCE * 100 if STARTING_BALANCE else 0.0
+
+        # Open trades: count + risk exposure
+        try:
+            open_rows = _fetchall(
+                f"SELECT risk_dollars, rr FROM {TRADES_TABLE} WHERE status = 'OPEN'"
+            )
+            open_count   = len(open_rows)
+            open_risk    = sum(float(r["risk_dollars"] or 0) for r in open_rows)
+        except Exception:
+            open_count, open_risk = 0, 0.0
+
+        # Pending signals
+        pend_count = len(pending_trades)
+
+        send_telegram(
+            f"BALANCE  [{mode_tag}]\n{'─'*22}\n"
+            f"Start    ${STARTING_BALANCE:.2f}\n"
+            f"Current  ${ACCOUNT_BALANCE:.2f}\n"
+            f"P&L      {pnl_sign}${pnl:.2f}  ({pnl_sign}{pnl_pct:.1f}%)\n"
+            f"{'─'*22}\n"
+            f"Open trades   {open_count}  (risk ${open_risk:.2f})\n"
+            f"Pending sigs  {pend_count}\n"
+            f"Max trades    {MAX_CONCURRENT}"
+        )
+    except Exception as e:
+        send_telegram(f"Balance error: {e}")
 
 
 def _handle_cancel(symbol):
@@ -923,7 +970,14 @@ def main():
             sleep_secs, session_tag = 900,  "blocked"
 
         print(f"[main] RSS idle: {_rss_kb():,} kB -- sleeping {sleep_secs//60} min [{session_tag}]")
-        time.sleep(sleep_secs)
+        # Poll Telegram commands every 5 s during the sleep interval so every
+        # command responds immediately regardless of the session sleep length.
+        _poll_interval = 5
+        _elapsed = 0
+        while _elapsed < sleep_secs:
+            time.sleep(_poll_interval)
+            _elapsed += _poll_interval
+            check_telegram_commands()
 
 
 if __name__ == "__main__":

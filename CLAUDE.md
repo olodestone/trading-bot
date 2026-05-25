@@ -120,6 +120,7 @@ Status: `OPEN`, `WIN`, `BE_WIN`, `LOSS`
 | `/stats` | Win rate, expectancy, per-plan and per-confidence breakdown |
 | `/cancel SYMBOL` | Remove a pending signal |
 | `/edge` | Signal funnel + direction accuracy @ 4h (last 30d) |
+| `/edge atr` | Funnel + direction accuracy split by ATR% environment (<2%, 2-5%, >5%) |
 | `/edge dir` | Direction accuracy by BUY/SELL |
 | `/edge session` | Breakdown by trading session |
 | `/edge regime` | Breakdown by market regime |
@@ -224,5 +225,8 @@ Plan 26: paper trading ($100, MAX_CONCURRENT 5), stock filter, BB/coil OR, bounc
 Plan 27: report_worker subprocess — pandas out of main process, 42 MB permanent (−66%).
 Plan 28: signal_log table — full funnel tracking (queued→filled/expired/invalidated/cancelled),
          price snapshots at 4h+24h for direction accuracy, /edge Telegram commands.
+Plan 29: Analytics framework — /balance, /diagnose (4-layer ✓/⚠/✗ + N-gates), /edge pairs
+         (blacklist flagging), /edge atr (ATR% environment split), post_be_tp1 column,
+         tracking.json (user-defined periods), backtest funnel metrics, /stats by period.
 
 **Gap to 10/10:** Live order execution, account balance auto-sync, min order value check.
