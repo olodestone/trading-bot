@@ -218,7 +218,8 @@ def get_stats_summary():
 
     at_sorted = all_closed.copy()
     if "time" in at_sorted.columns:
-        at_sorted = at_sorted.sort_values(pd.to_datetime(at_sorted["time"], errors="coerce"))
+        at_sorted["_time_sort"] = pd.to_datetime(at_sorted["time"], errors="coerce")
+        at_sorted = at_sorted.sort_values("_time_sort").drop(columns=["_time_sort"])
     at_results = at_sorted["status"].apply(
         lambda s: "W" if s in ("WIN", "BE_WIN") else "L"
     ).tolist()
