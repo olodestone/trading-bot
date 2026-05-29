@@ -1050,7 +1050,9 @@ def get_edge_report(mode="edge"):
         )
 
     df_sig["generated_at"] = pd.to_datetime(df_sig["generated_at"], errors="coerce")
-    cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=30)
+    # utcnow() is tz-aware; DB datetimes come back tz-naive (datetime64[ns]).
+    # Strip tz so the comparison stays naive-vs-naive (both are UTC wall-clock).
+    cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=30)
     df = df_sig[df_sig["generated_at"] >= cutoff].copy()
 
     if mode == "edge":
@@ -1129,7 +1131,9 @@ def get_diagnose_report():
     except Exception as e:
         print(f"[diagnose] _populate_post_be_outcomes error: {e}")
 
-    cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=30)
+    # utcnow() is tz-aware; DB datetimes come back tz-naive (datetime64[ns]).
+    # Strip tz so the comparison stays naive-vs-naive (both are UTC wall-clock).
+    cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=30)
 
     try:
         df_sig = pd.read_sql(f"SELECT * FROM {SIGNAL_LOG_TABLE}", engine)
